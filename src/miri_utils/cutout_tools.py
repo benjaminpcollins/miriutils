@@ -30,6 +30,7 @@ from astropy.io import fits
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.nddata import Cutout2D
+from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch, PercentileInterval
 from scipy.ndimage import rotate
 
 # Suppress common WCS-related warnings that don't affect functionality
@@ -193,10 +194,14 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     for fits_file in fits_files:
         with fits.open(fits_file) as hdul:
             # Use extension 1 as the reference for WCS and field coverage check
-            ref_data = hdul[0].data
-            ref_header = hdul[0].header
+            ref_data = hdul[1].data
+            ref_header = hdul[1].header
             ref_wcs = WCS(ref_header)
 
+            # Get statistics from the whole mosaic/reference image
+            global_median = np.nanmedian(ref_data)
+            global_std = np.nanstd(ref_data)
+            
             # Process each galaxy from the catalogue
             for i in range(total):
                 # Create SkyCoord object for the target position
@@ -258,21 +263,26 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     
                     # Calculate angle of rotation for NE cross
                     angle = calculate_angle(fits_file)  
+                    print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
-                    plt.figure(figsize=(6, 6))                   
+                    plt.figure(figsize=(6, 6))      
+
+                    interval = ZScaleInterval()
+                    vmin, vmax = interval.get_limits(preview_data)
+                    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
                     plt.imshow(preview_data, origin="lower", cmap="gray")
                     plt.title(filter)
                     
                     # Draw North/East compass
                     ax = plt.gca()
-                    draw_NE_cross(ax, angle_deg=angle, size=50, offset=20)
+                    draw_compass(ax, angle_deg=angle)
                     
-                    png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_cutout_{survey_name}{obs}{suffix}.png")
+                    png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.png")
                     plt.savefig(png_filename)
                     plt.close()
 
                     # Save multi-extension FITS cutout
-                    fits_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_cutout_{survey_name}{obs}{suffix}.fits")
+                    fits_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.fits")
                     cutout_hdul.writeto(fits_filename, overwrite=True)
                     counts += 1
 
@@ -280,81 +290,103 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
 
 
-def draw_NE_cross(ax, angle_deg, size=40, offset=10, colour="white", lw=2):
+def draw_compass(ax, angle_deg, size_pct=0.15):
     """
     Draw a North-East direction cross in the top-right corner of an image.
-
+    
     Parameters
     ----------
-    ax : matplotlib.axes.Axes
-        Axis on which to draw.
-    angle_deg : float
-        Rotation of the image relative to North (in degrees).
-    size : float
-        Length of the N/E arrows (pixels).
-    offset : float
-        Distance from the border (pixels).
-    colour : str
-        Colour of the lines/text.
-    lw : float
-        Line width.
+    size_pct : float
+        Arrow length as a fraction of the cutout width (e.g. 0.15 = 15%).
+    offset_pct : float
+        Padding from the top-right corner as a fraction of the cutout width.
     """
+    # 1. Get current axis limits (cutout size)
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
+    width = abs(x_max - x_min)
+    
+    # 2. Scale size and offset relative to the actual cutout dimensions
+    cross_size = width * size_pct
+    size = cross_size / 2
+    offset = 1.8 * size  # Padding from the corner
 
-    angle = np.deg2rad(angle_deg)
-    east_angle = angle + np.pi/2
-
-    # Get image dimensions from axis limits
-    x_max = ax.get_xlim()[1]
-    y_max = ax.get_ylim()[1]
-
-    # Origin of the compass (top-right corner, moved inward by offset)
+    # 3. Set Origin (Top-Right, pushed INWARD)
+    # We subtract the offset so it doesn't overlap the border
     x0 = x_max - offset
     y0 = y_max - offset
 
-    # North arrow endpoint
-    xN = x0 + size * np.sin(angle)     # sin(angle) because image coords increase upward
-    yN = y0 + size * np.cos(angle)
+    # 4. Math for Vectors
+    # Note: DS9 North usually points towards higher Dec.
+    # angle_deg should be the angle of North relative to the +Y axis.
+    angle_rad = np.deg2rad(angle_deg)
+    
+    # North vector: sin/cos based on angle from Y-axis
+    # We subtract the components because the origin is at the top-right; 
+    # to stay inside the box, the vectors generally need to point 'down' or 'left'
+    # but the math handles this if we just use the angle correctly.
+    xN = x0 + size * np.sin(angle_rad)
+    yN = y0 + size * np.cos(angle_rad)
 
-    # East arrow endpoint (90° CCW)
-    xE = x0 + size * np.sin(east_angle)
-    yE = y0 + size * np.cos(east_angle)
+    # East is typically +90 degrees from North in the coordinate system
+    # but in most FITS images, East is LEFT when North is UP.
+    east_angle_rad = angle_rad + np.pi/2
+    xE = x0 - size * np.sin(east_angle_rad)
+    yE = y0 - size * np.cos(east_angle_rad)
 
-    # Draw arrows
-    ax.plot([x0, xN], [y0, yN], colour, lw=lw)
-    ax.plot([x0, xE], [y0, yE], colour, lw=lw)
+    # 5. Draw N/E-lines
+    ax.plot([x0, xN], [y0, yN], color="yellow", lw=1.5, solid_capstyle='round')
+    ax.plot([x0, xE], [y0, yE], color="yellow", lw=1.5, solid_capstyle='round')
 
-    # Labels
-    ax.text(xN, yN, "N", color=colour, fontsize=12, ha="center", va="center")
-    ax.text(xE, yE, "E", color=colour, fontsize=12, ha="center", va="center")
+    # 6. Labels with slight padding so they don't touch the lines
+    ax.text(xN + (size*0.3 * np.sin(angle_rad)), 
+            yN + (size*0.3 * np.cos(angle_rad)), 
+            "N", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
+    
+    ax.text(xE - (size*0.3 * np.sin(east_angle_rad)), 
+            yE - (size*0.3 * np.cos(east_angle_rad)), 
+            "E", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
+
+    # 7 Draw X/Y-lines
+    xX = x0 + size
+    yX = y0 # X only points to the right
+    
+    xY = x0 # Y only points up
+    yY = y0 + size
+
+    ax.plot([x0, xX], [y0, yX], color="cyan", lw=1.5, solid_capstyle='round')
+    ax.plot([x0, xY], [y0, yY], color="cyan", lw=1.5, solid_capstyle='round')
+
+    # 8. Labels with slight padding so they don't touch the lines
+    ax.text(xX + (size*0.2), 
+            yX, 
+            "X", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
+    
+    ax.text(xY, 
+            yY + (size*0.2), 
+            "Y", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
 
 
 def calculate_angle(fits_file):
-    """A function that reads in the header of a .fits file and extracts the information
-        about the rotation of the image with respect to the N and E directions.
-
-    Args:
-        fits_file (string): The .fits file to be rotated in the next steps
-    """
     with fits.open(fits_file) as hdul:
-        header = hdul[1].header
+        # Check for SCI extension or Primary
+        ext = 'SCI' if 'SCI' in hdul else 0
+        header = hdul[ext].header
+        w = WCS(header)
 
-        # Extract rotation angle from PC matrix
-        if 'PC1_1' in header and 'PC2_2' in header:
-            cost = header['PC1_1'] 
-            sint = header['PC2_1']
-            
-            # 180 - angle takes care of X-axis flipping in sky coordinates!
-            angle = 180 - np.arccos(cost) * 180 / np.pi
-            
-            # Restore quadrant information since cos is symmetric
-            if sint < 0:
-                angle = -angle
-            
-            #print(f"The image {fits_file} is rotated by {angle:.2f} degrees with respect to North")        
-        else:
-            print("No PC matrix found, assuming no rotation")
-            angle = 0
-        
+    # 1. Get the 'North' direction in pixel space
+    # We look at how the sky coordinates change at the center of the image
+    res = w.pixel_scale_matrix
+    
+    # The 'CD' or 'PC' matrix components
+    # cd[1,1] is change in Dec with Y, cd[0,1] is change in RA with Y
+    # This is the most robust way to find "Up" in celestial terms
+    cd = res
+    
+    # Calculate the angle of North relative to the Y-axis (Up)
+    # This automatically handles the PC matrix, scaling, and parity
+    angle = np.degrees(np.arctan2(cd[0, 1], cd[1, 1]))
+    
     return angle
 
         
