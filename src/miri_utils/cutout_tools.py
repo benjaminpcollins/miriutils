@@ -30,6 +30,7 @@ from astropy.io import fits
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.nddata import Cutout2D
+from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch, PercentileInterval
 from scipy.ndimage import rotate
 
 # Suppress common WCS-related warnings that don't affect functionality
@@ -197,6 +198,10 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
             ref_header = hdul[1].header
             ref_wcs = WCS(ref_header)
 
+            # Get statistics from the whole mosaic/reference image
+            global_median = np.nanmedian(ref_data)
+            global_std = np.nanstd(ref_data)
+            
             # Process each galaxy from the catalogue
             for i in range(total):
                 # Create SkyCoord object for the target position
@@ -260,7 +265,11 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     angle = calculate_angle(fits_file)  
                     print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
-                    plt.figure(figsize=(6, 6))                   
+                    plt.figure(figsize=(6, 6))      
+
+                    interval = ZScaleInterval()
+                    vmin, vmax = interval.get_limits(preview_data)
+                    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
                     plt.imshow(preview_data, origin="lower", cmap="gray")
                     plt.title(filter)
                     
@@ -268,12 +277,12 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     ax = plt.gca()
                     draw_compass(ax, angle_deg=angle)
                     
-                    png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_cutout_{survey_name}{obs}{suffix}.png")
+                    png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.png")
                     plt.savefig(png_filename)
                     plt.close()
 
                     # Save multi-extension FITS cutout
-                    fits_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_cutout_{survey_name}{obs}{suffix}.fits")
+                    fits_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.fits")
                     cutout_hdul.writeto(fits_filename, overwrite=True)
                     counts += 1
 
