@@ -193,8 +193,8 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     for fits_file in fits_files:
         with fits.open(fits_file) as hdul:
             # Use extension 1 as the reference for WCS and field coverage check
-            ref_data = hdul[0].data
-            ref_header = hdul[0].header
+            ref_data = hdul[1].data
+            ref_header = hdul[1].header
             ref_wcs = WCS(ref_header)
 
             # Process each galaxy from the catalogue
@@ -258,6 +258,7 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     
                     # Calculate angle of rotation for NE cross
                     angle = calculate_angle(fits_file)  
+                    print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
                     plt.figure(figsize=(6, 6))                   
                     plt.imshow(preview_data, origin="lower", cmap="gray")
@@ -328,33 +329,27 @@ def draw_NE_cross(ax, angle_deg, size=40, offset=10, colour="white", lw=2):
     ax.text(xE, yE, "E", color=colour, fontsize=12, ha="center", va="center")
 
 
+
 def calculate_angle(fits_file):
-    """A function that reads in the header of a .fits file and extracts the information
-        about the rotation of the image with respect to the N and E directions.
-
-    Args:
-        fits_file (string): The .fits file to be rotated in the next steps
-    """
     with fits.open(fits_file) as hdul:
-        header = hdul[1].header
+        # Check for SCI extension or Primary
+        ext = 'SCI' if 'SCI' in hdul else 0
+        header = hdul[ext].header
+        w = WCS(header)
 
-        # Extract rotation angle from PC matrix
-        if 'PC1_1' in header and 'PC2_2' in header:
-            cost = header['PC1_1'] 
-            sint = header['PC2_1']
-            
-            # 180 - angle takes care of X-axis flipping in sky coordinates!
-            angle = 180 - np.arccos(cost) * 180 / np.pi
-            
-            # Restore quadrant information since cos is symmetric
-            if sint < 0:
-                angle = -angle
-            
-            #print(f"The image {fits_file} is rotated by {angle:.2f} degrees with respect to North")        
-        else:
-            print("No PC matrix found, assuming no rotation")
-            angle = 0
-        
+    # 1. Get the 'North' direction in pixel space
+    # We look at how the sky coordinates change at the center of the image
+    res = w.pixel_scale_matrix
+    
+    # The 'CD' or 'PC' matrix components
+    # cd[1,1] is change in Dec with Y, cd[0,1] is change in RA with Y
+    # This is the most robust way to find "Up" in celestial terms
+    cd = res
+    
+    # Calculate the angle of North relative to the Y-axis (Up)
+    # This automatically handles the PC matrix, scaling, and parity
+    angle = np.degrees(np.arctan2(cd[0, 1], cd[1, 1]))
+    
     return angle
 
         
