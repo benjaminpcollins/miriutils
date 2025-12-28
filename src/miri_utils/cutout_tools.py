@@ -266,7 +266,7 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     
                     # Draw North/East compass
                     ax = plt.gca()
-                    draw_NE_cross(ax, angle_deg=angle, size_pct=0.1)
+                    draw_compass(ax, angle_deg=angle)
                     
                     png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_cutout_{survey_name}{obs}{suffix}.png")
                     plt.savefig(png_filename)
@@ -281,14 +281,14 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
 
 
-def draw_NE_cross(ax, angle_deg, size_pct=0.1, offset_pct=0.25, colour="white", lw=1.5):
+def draw_compass(ax, angle_deg, size_pct=0.15):
     """
     Draw a North-East direction cross in the top-right corner of an image.
     
     Parameters
     ----------
     size_pct : float
-        Arrow length as a fraction of the cutout width (e.g., 0.15 = 15%).
+        Arrow length as a fraction of the cutout width (e.g. 0.15 = 15%).
     offset_pct : float
         Padding from the top-right corner as a fraction of the cutout width.
     """
@@ -298,8 +298,9 @@ def draw_NE_cross(ax, angle_deg, size_pct=0.1, offset_pct=0.25, colour="white", 
     width = abs(x_max - x_min)
     
     # 2. Scale size and offset relative to the actual cutout dimensions
-    size = width * size_pct
-    offset = width * offset_pct
+    cross_size = width * size_pct
+    size = cross_size / 2
+    offset = 1.8 * size  # Padding from the corner
 
     # 3. Set Origin (Top-Right, pushed INWARD)
     # We subtract the offset so it doesn't overlap the border
@@ -324,19 +325,37 @@ def draw_NE_cross(ax, angle_deg, size_pct=0.1, offset_pct=0.25, colour="white", 
     xE = x0 - size * np.sin(east_angle_rad)
     yE = y0 - size * np.cos(east_angle_rad)
 
-    # 5. Draw the lines
-    ax.plot([x0, xN], [y0, yN], color=colour, lw=lw, solid_capstyle='round')
-    ax.plot([x0, xE], [y0, yE], color=colour, lw=lw, solid_capstyle='round')
+    # 5. Draw N/E-lines
+    ax.plot([x0, xN], [y0, yN], color="yellow", lw=1.5, solid_capstyle='round')
+    ax.plot([x0, xE], [y0, yE], color="yellow", lw=1.5, solid_capstyle='round')
 
     # 6. Labels with slight padding so they don't touch the lines
-    ax.text(xN + (size*0.2 * np.sin(angle_rad)), 
-            yN + (size*0.2 * np.cos(angle_rad)), 
-            "N", color=colour, fontsize=10, ha="center", va="center", fontweight='bold')
+    ax.text(xN + (size*0.3 * np.sin(angle_rad)), 
+            yN + (size*0.3 * np.cos(angle_rad)), 
+            "N", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
     
-    ax.text(xE - (size*0.2 * np.sin(east_angle_rad)), 
-            yE - (size*0.2 * np.cos(east_angle_rad)), 
-            "E", color=colour, fontsize=10, ha="center", va="center", fontweight='bold')
+    ax.text(xE - (size*0.3 * np.sin(east_angle_rad)), 
+            yE - (size*0.3 * np.cos(east_angle_rad)), 
+            "E", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
 
+    # 7 Draw X/Y-lines
+    xX = x0 + size
+    yX = y0 # X only points to the right
+    
+    xY = x0 # Y only points up
+    yY = y0 + size
+
+    ax.plot([x0, xX], [y0, yX], color="cyan", lw=1.5, solid_capstyle='round')
+    ax.plot([x0, xY], [y0, yY], color="cyan", lw=1.5, solid_capstyle='round')
+
+    # 8. Labels with slight padding so they don't touch the lines
+    ax.text(xX + (size*0.2), 
+            yX, 
+            "X", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
+    
+    ax.text(xY, 
+            yY + (size*0.2), 
+            "Y", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
 
 
 def calculate_angle(fits_file):
