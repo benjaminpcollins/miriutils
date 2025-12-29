@@ -5,7 +5,7 @@ MIRI Utils Astronomical Image Cutout Generator
 ==============================================
 
 This script creates cutout images from astronomical FITS files based on catalogue coordinates.
-It extracts regions of interest around the specified celestial coordinates and preserves all
+It produces square-shaped cutouts around the specified celestial coordinates and preserves all
 data extensions of the original FITS files. The script also generates preview PNG images
 for quick visual inspection of the cutouts.
 
@@ -13,9 +13,11 @@ Dependencies:
     - astropy: For FITS file handling, WCS transformations, and coordinate operations
     - matplotlib: For generating preview images
     - numpy: For array operations and numerical calculations
-
+    - scipy: For image rotation and manipulation
+    - glob, os, warnings: For file handling and warning management
+    
 Author: Benjamin P. Collins
-Date: Nov 21, 2025
+Date: Dec 29, 2025
 Version: 3.0
 """
 
@@ -30,7 +32,7 @@ from astropy.io import fits
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.nddata import Cutout2D
-from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch, PercentileInterval
+from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch
 from scipy.ndimage import rotate
 
 # Suppress common WCS-related warnings that don't affect functionality
@@ -100,7 +102,7 @@ def resample_cutout(indir, num_pixels):
             fits.writeto(out_path, resampled_data, header, overwrite=True)
             print(f"Saved resampled file to: {out_path}")
 
-def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, preview=False):
+def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, png=False):
     """
     Produces cutout images from astronomical FITS files centred on catalogue positions.
     
@@ -130,7 +132,7 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, previe
         Maximum allowed fraction of NaN values in a cutout (default: 0.4).
         Cutouts with more NaNs than this threshold will be discarded.
     
-    preview: bool, optional
+    png: bool, optional
         If True, generates PNG preview images for each cutout. Defaults to False.
     
     Returns
@@ -269,7 +271,7 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, previe
                         png_dir = os.path.join(output_dir, "png")
                         os.makedirs(png_dir, exist_ok=True)
                         
-                        png_filename = os.path.join(png_dir, f"{ids[i]}_{filter}.png")
+                        png_filename = os.path.join(png_dir, f"{ids[i]}_{filter_l}.png")
                         plt.savefig(png_filename)
                         plt.close()
 
@@ -278,7 +280,7 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, previe
                     os.makedirs(fits_dir, exist_ok=True)
                     
                     # Save multi-extension FITS cutout
-                    fits_filename = os.path.join(fits_dir, f"{ids[i]}_{filter}.fits")
+                    fits_filename = os.path.join(fits_dir, f"{ids[i]}_{filter_l}.fits")
                     cutout_hdul.writeto(fits_filename, overwrite=True)
                     counts += 1
                     
