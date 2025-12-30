@@ -28,6 +28,7 @@ Requirements
 - astropy
 - numpy
 - scipy
+- pandas
 
 Usage
 -----
@@ -48,6 +49,7 @@ import scipy
 import os
 import json
 import warnings
+import pandas as pd
 
 from astropy.io import fits
 from matplotlib import pyplot as plt
@@ -62,7 +64,15 @@ from matplotlib.patches import Circle
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
-
+def get_path(template, **kwargs):
+    """
+    Fills in a template string with variables.
+    Example template: "cutouts/{survey}/{id}_{filter}.fits"
+    """
+    try:
+        return template.format(**kwargs)
+    except KeyError:
+        return None
 
 def compute_centroid(cutout, smooth_sigma, good_frac_cutout, smooth_miri):
     """Compute the centroid of a given cutout image using quadratic fitting.
@@ -98,7 +108,7 @@ def compute_centroid(cutout, smooth_sigma, good_frac_cutout, smooth_miri):
 
     return cutout.wcs.pixel_to_world(centroid_pix[0], centroid_pix[1]) if not np.isnan(centroid_pix).any() else None
 
-def save_alignment_figure(g, cutout_nircam, cutout_miri, centroid_nircam, centroid_miri, output_dir, survey, filter):
+def save_alignment_figure(g, cutout_nircam, cutout_miri, centroid_nircam, centroid_miri, output_dir, filter):
     """Save a side-by-side comparison of NIRCam and MIRI cutouts, with centroids marked.
     
     Parameters:
@@ -116,51 +126,74 @@ def save_alignment_figure(g, cutout_nircam, cutout_miri, centroid_nircam, centro
 
     axs[0].imshow(scipy.ndimage.gaussian_filter(cutout_nircam.data, 1.0), origin='lower')
     axs[0].plot(*cutout_nircam.wcs.world_to_pixel(centroid_nircam), 'x', color='red')
-    axs[0].set(title=f"NIRCam F444W Reference {g['id']}")
+    axs[0].set(title=f"{g['id']} - NIRCam/F444W")
 
     axs[1].imshow(scipy.ndimage.gaussian_filter(cutout_miri.data, 1.0), origin='lower')
     axs[1].plot(*cutout_miri.wcs.world_to_pixel(centroid_miri), 'o', color='orange')
-    axs[1].set(title=f"MIRI {filter} Cutout {g['id']}")
+    axs[1].set(title=f"{g['id']} - MIRI/{filter}")
     
     # show expected position of the centroid
     expected_position_pix = cutout_miri.wcs.world_to_pixel(centroid_nircam)
     axs[1].plot(expected_position_pix[0], expected_position_pix[1], 'x', color='red')
 
-    output_path = os.path.join(output_dir, f"{g['id']}_{filter}_offset_{survey}.pdf")
+    output_path = os.path.join(output_dir, f"{g['id']}_{filter}.png")
     os.makedirs(output_dir, exist_ok=True)
     fig.savefig(output_path)
     plt.close()
+    
+    
 
-    #print(f"Saved figure: {output_path}")
-
-
-def compute_offset(cutout_folder, output_folder, cat, survey, filter, obs="", save_fig=True, smooth_miri=True, use_filters=False):
+def compute_offset(cat, survey, filter, output_base, miri_template, nircam_template, save_fig=True, smooth_miri=True):
     """Computes the astrometric offset between NIRCam and MIRI for each galaxy."""
     
-    for i, g in enumerate(cat):
-        #print(f"Processing galaxy {g['id']}...")
+    # Create organizational folders
+    survey_dir = os.path.join(output_base, survey)
+    plot_dir = os.path.join(survey_dir, "diagnostic_plots")
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    # Extract survey name and observation number from the survey parameter
+    if survey[-1].isdigit():
+        survey_name = survey[:-1]  # "primer"
+        obs = survey[-1]           # "1"
+    else:
+        survey_name = survey
+        obs = ''
+    
+    filter_l = filter.lower()
+    
+    # 1. Initialise an empty list to store the offsets for each survey
+    offset_results = []
+    
+    # Loop through all galaxies
+    for i, gal in enumerate(cat):
+        
+        # 1. Generate paths using the templates
+        m_path = get_path(miri_template, id=gal['id'], survey_name=survey_name, obs=obs, filter=filter_l)
+        n_path = get_path(nircam_template, id=gal['id'])
 
-        ref_position = SkyCoord(ra=g['ra'], dec=g['dec'], unit=u.deg)
+        # 2. Safety check: only process if files exist
+        if not (os.path.exists(m_path) and os.path.exists(n_path)):
+            continue
+
+        ref_position = SkyCoord(ra=gal['ra'], dec=gal['dec'], unit=u.deg)
         cutout_size = (2.5 * u.arcsec, 2.5 * u.arcsec)
         smooth_sigma, good_frac_cutout = 1.0, 0.7
 
-        if g['id'] == 21451: # exclude bright source nearby
+        if gal['id'] == 21451: # exclude bright source nearby
             good_frac_cutout = 0.4
-        if g['id'] == 9986: # exclude bright source nearby
+        if gal['id'] == 9986: # exclude bright source nearby
             good_frac_cutout = 0.4
-        if g['id'] == 11451: # exclude bright source nearby
+        if gal['id'] == 11451: # exclude bright source nearby
             good_frac_cutout = 0.4
         
         # Load MIRI cutout
-        cutout_miri_path = os.path.join(cutout_folder, f"{g['id']}_{filter}_cutout_{survey}{obs}.fits")
-        miri_data, miri_wcs = load_cutout(cutout_miri_path)
+        miri_data, miri_wcs = load_cutout(m_path)
         if miri_data is None:
             continue
         cutout_miri = Cutout2D(miri_data, ref_position, cutout_size, wcs=miri_wcs)
 
         # Load NIRCam cutout
-        nircam_path = f"/home/bpc/University/master/Red_Cardinal/NIRCam/F444W_cutouts/{g['id']}_F444W_cutout.fits"
-        nircam_data, nircam_wcs = load_cutout(nircam_path)
+        nircam_data, nircam_wcs = load_cutout(n_path)
         if nircam_data is None:
             continue
         cutout_nircam = Cutout2D(nircam_data, ref_position, cutout_size, wcs=nircam_wcs)
@@ -170,26 +203,27 @@ def compute_offset(cutout_folder, output_folder, cat, survey, filter, obs="", sa
         centroid_miri = compute_centroid(cutout_miri, smooth_sigma, good_frac_cutout, smooth_miri)
 
         if centroid_nircam is None or centroid_miri is None:
-            print("Centroid not found for one or both cutouts. Skipping.")
+            print(f"{gal['id']}: Centroid not found - Skipping...")
             continue
         
         if save_fig == True:
             # Save alignment figure
-            output_dir = os.path.join(output_folder, f"{survey}{obs}/")
-            os.makedirs(output_dir, exist_ok=True)
-            save_alignment_figure(g, cutout_nircam, cutout_miri, centroid_nircam, centroid_miri, output_dir, survey, filter)
-
-        if use_filters == True:
-            filter_l = '_' + filter.lower()
-        else:
-            filter_l = ''
+            save_alignment_figure(gal, cutout_nircam, cutout_miri, centroid_nircam, centroid_miri, plot_dir, filter)
         
         # Compute offsets
         dra, ddec = centroid_nircam.spherical_offsets_to(centroid_miri)
-        cat[f'{survey}{obs}{filter_l}_dra'][i] = dra.to(u.arcsec).value
-        cat[f'{survey}{obs}{filter_l}_ddec'][i] = ddec.to(u.arcsec).value
-
-        #print(f"Offset: ΔRA = {dra.to(u.arcsec)}, ΔDec = {ddec.to(u.arcsec)}")
+        
+        # 2. Append a dictionary for each galaxy
+        offset_results.append({
+            'galaxy_id': gal['id'],
+            'dra_arcsec': dra.to(u.arcsec).value,
+            'ddec_arcsec': ddec.to(u.arcsec).value
+        })
+        
+        # 3. Create a fresh DataFrame and save to CSV
+        df_offsets = pd.DataFrame(offset_results)
+        csv_path = os.path.join(output_base, f"{survey}/{survey}_offsets.csv")
+        df_offsets.to_csv(csv_path, index=False)
 
 
 
