@@ -252,7 +252,7 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, nan_thresh=0.4, png=Fa
                     print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
                     # Create output directory if it doesn't exist
-                    output_dir = os.path.join("/Users/benjamincollins/University/Master/Red_Cardinal/", f"cutouts_{survey_name}")
+                    output_dir = f"/Users/benjamincollins/University/Master/Red_Cardinal/cutouts/{survey_name}"
                     os.makedirs(output_dir, exist_ok=True)
                     
                     if png:
