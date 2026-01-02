@@ -47,7 +47,7 @@ Version: 3.0
 import numpy as np
 import scipy
 import os
-import json
+import glob
 import warnings
 import pandas as pd
 from pathlib import Path
@@ -60,18 +60,31 @@ import astropy.units as u
 from astropy.nddata import Cutout2D
 from photutils import centroids
 from .cutout_tools import load_cutout
+import shutil
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
 def get_path(template, **kwargs):
     """
-    Fills in a template string with variables.
-    Example template: "cutouts/{survey}/{id}_{filter}.fits"
+    Formats a template and searches for a matching file on disk.
+    Supports wildcards (*).
     """
     try:
-        return template.format(**kwargs)
-    except KeyError:
+        # 1. Fill in the variables (id, survey_name, filter, etc.)
+        target_pattern = template.format(**kwargs)
+        
+        # 2. Use glob to find files matching the pattern
+        # This handles the messy MAST names automatically
+        matches = glob.glob(target_pattern)
+        
+        if matches:
+            # Return the first match (usually there's only one i2d per filter)
+            return matches[0]
+        else:
+            return None
+    except KeyError as e:
+        print(f"Missing variable for template: {e}")
         return None
 
 def compute_centroid(cutout, smooth_sigma, good_frac_cutout, smooth_miri):
@@ -181,11 +194,15 @@ def compute_offset(cat, survey, filter_name, output_base, miri_template, nircam_
         # 1. Generate paths using the templates
         m_path = get_path(miri_template, id=gal['id'], survey_name=survey_name, obs=obs, filter=filter_l)
         n_path = get_path(nircam_template, id=gal['id'])
-
-        # 2. Safety check: only process if files exist
-        if not (os.path.exists(m_path) and os.path.exists(n_path)):
+        
+        # 2. Safety check: Ensure both paths were successfully found AND exist on disk
+        if m_path is None or n_path is None:
+            # Optional: print(f"File missing for ID {gal['id']}")
             continue
 
+        if not (os.path.exists(m_path) and os.path.exists(n_path)):
+            continue    
+        
         ref_position = SkyCoord(ra=gal['ra'], dec=gal['dec'], unit=u.deg)
         cutout_size = (2.5 * u.arcsec, 2.5 * u.arcsec)
         smooth_sigma, good_frac_cutout = 1.0, 0.7
@@ -347,3 +364,44 @@ def generate_master_summary(output_base, survey_config):
     # Save it for your paper/thesis
     summary_df.to_csv(Path(output_base) / "astrometry_summary.csv", index=False)
     return summary_df
+
+def apply_wcs_shift(input_file, dra_arcsec, ddec_arcsec, output_file=None):
+    """
+    Applies an astrometric shift to a FITS file.
+    
+    Args:
+        input_file (str): Path to original FITS.
+        dra_arcsec (float): RA shift (arcsec).
+        ddec_arcsec (float): Dec shift (arcsec).
+        output_file (str, optional): If provided, saves a copy here. 
+                                     If None, updates input_file in-place.
+    """
+    # 1. Handle File Copying if necessary
+    target_file = input_file
+    if output_file and output_file != input_file:
+        shutil.copy2(input_file, output_file)
+        target_file = output_file
+
+    # 2. Open and Update
+    with fits.open(target_file, mode='update') as hdul:
+        # Most JWST data has WCS in the 'SCI' extension
+        header = hdul[0].header
+        if 'CRVAL1' not in header and len(hdul) > 1:
+            header = hdul['SCI'].header
+
+        wcs = WCS(header)
+        if not wcs.has_celestial:
+            print(f"⚠️ No celestial WCS in {target_file}")
+            return
+
+        # Apply shift (degrees)
+        header['CRVAL1'] -= dra_arcsec / 3600.0
+        header['CRVAL2'] -= ddec_arcsec / 3600.0
+
+        # 3. Add Metadata (Crucial for Package Users!)
+        header['HISTORY'] = f"Astrometry corrected: dRA={dra_arcsec:.4f}\", dDec={ddec_arcsec:.4f}\""
+        header['ASTRO_CORR'] = True # Custom keyword for easy filtering
+        
+        hdul.flush() 
+    
+    print(f"✅ {'Updated' if not output_file else 'Created'} {target_file}")
