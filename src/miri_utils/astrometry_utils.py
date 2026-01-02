@@ -1,5 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "astropy",
+#     "matplotlib",
+#     "numpy",
+#     "scipy",
+#     "photutils",
+#     "seaborn",
+# ]
+# ///
 """
 MIRI Utils: Astrometric Calibration & Alignment Module
 ======================================================
@@ -209,8 +220,8 @@ def compute_offset(cat, survey, filter_name, output_base, miri_template, nircam_
     
     # 2. Extract survey name and observation number
     if survey[-1].isdigit():
-        survey_name = survey[:-1]  # e.g., "primer"
-        obs = survey[-1]           # e.g., "1"
+        survey_name = survey[:-1]  # e.g. "primer"
+        obs = survey[-1]           # e.g. "1"
     else:
         survey_name = survey
         obs = ''
@@ -365,15 +376,33 @@ def get_survey_stats(output_base, survey, filter_name):
         if df_clean.empty: return None
         
         # Compute Statistics
+        dra_med = df_clean['dra_arcsec'].median()
+        ddec_med = df_clean['ddec_arcsec'].median()
+
+        # Calculate MAD: median(|x - median(x)|)
+        # We use 1.4826 to make it comparable to a standard Gaussian sigma
+        dra_mad = np.median(np.abs(df_clean['dra_arcsec'] - dra_med)) * 1.4826
+        ddec_mad = np.median(np.abs(df_clean['ddec_arcsec'] - ddec_med)) * 1.4826
+
         return {
             'survey': survey,
             'filter': filter_name,
             'n_sources': len(df_clean),
+            
+            # RA Statistics
             'dra_mean': df_clean['dra_arcsec'].mean(),
             'dra_std': df_clean['dra_arcsec'].std(),
+            'dra_med': dra_med,
+            'dra_mad': dra_mad,  # Robust spread
+            
+            # Dec Statistics
             'ddec_mean': df_clean['ddec_arcsec'].mean(),
             'ddec_std': df_clean['ddec_arcsec'].std(),
-            'total_mag': np.sqrt(df_clean['dra_arcsec'].mean()**2 + df_clean['ddec_arcsec'].mean()**2)
+            'ddec_med': ddec_med,
+            'ddec_mad': ddec_mad,  # Robust spread
+            
+            # Combined Magnitude (using medians for a more robust total shift)
+            'total_shift_med': np.sqrt(dra_med**2 + ddec_med**2)
         }
             
     except Exception as e:
