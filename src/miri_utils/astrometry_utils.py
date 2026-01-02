@@ -206,13 +206,6 @@ def compute_offset(cat, survey, filter_name, output_base, miri_template, nircam_
         ref_position = SkyCoord(ra=gal['ra'], dec=gal['dec'], unit=u.deg)
         cutout_size = (2.5 * u.arcsec, 2.5 * u.arcsec)
         smooth_sigma, good_frac_cutout = 1.0, 0.7
-
-        if gal['id'] == 21451: # exclude bright source nearby
-            good_frac_cutout = 0.4
-        if gal['id'] == 9986: # exclude bright source nearby
-            good_frac_cutout = 0.4
-        if gal['id'] == 11451: # exclude bright source nearby
-            good_frac_cutout = 0.4
         
         # Load MIRI cutout
         miri_data, miri_wcs = load_cutout(m_path)
