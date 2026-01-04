@@ -1,40 +1,51 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "astropy",
+#     "matplotlib",
+#     "numpy",
+#     "scipy",
+# ]
+# ///
 """
-MIRI Utils Astronomical Image Cutout Generator
+MIRI Utils: Astronomical Image Cutout Generator
 ==============================================
 
-This script creates cutout images from astronomical FITS files based on catalogue coordinates.
-It extracts regions of interest around the specified celestial coordinates and preserves all
-data extensions of the original FITS files. The script also generates preview PNG images
-for quick visual inspection of the cutouts.
+A robust utility for extracting multi-extension FITS cutouts from JWST/MIRI 
+mosaics. This module handles coordinate transformations using WCS, manages 
+complex JWST file structures, and generates orientation-aware preview images 
+with North-East compass overlays.
 
-Dependencies:
-    - astropy: For FITS file handling, WCS transformations, and coordinate operations
-    - matplotlib: For generating preview images
-    - numpy: For array operations and numerical calculations
+Core Functionalities:
+---------------------
+* Multi-extension FITS cutout generation preserving original SCI/ERR/DQ layers.
+* Local background estimation using Sigma-Clipped statistics for PNG previews.
+* Dynamic directory management (Survey/Filter/fits hierarchy).
+* WCS-derived rotation calculations for DS9-style N-E compasses.
 
 Author: Benjamin P. Collins
-Date: Nov 21, 2025
-Version: 3.0
+Date: Jan 2026
+Version: 3.1
 """
 
-import astropy.units as u
-import matplotlib.pyplot as plt
-import numpy as np
 import os
 import glob
 import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import astropy.units as u
 
 from astropy.io import fits
-from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS, FITSFixedWarning
+from astropy.coordinates import SkyCoord
 from astropy.nddata import Cutout2D
-from astropy.visualization import ZScaleInterval, ImageNormalize, AsinhStretch, PercentileInterval
-from scipy.ndimage import rotate
+from astropy.visualization import ImageNormalize, AsinhStretch, ZScaleInterval
 
-# Suppress common WCS-related warnings that don't affect functionality
+# Suppress annoying WCS warnings from JWST headers that don't impact cutout accuracy
 warnings.simplefilter("ignore", category=FITSFixedWarning)
+
 
 
 def load_cutout(file_path, index=1):
@@ -100,7 +111,7 @@ def resample_cutout(indir, num_pixels):
             fits.writeto(out_path, resampled_data, header, overwrite=True)
             print(f"Saved resampled file to: {out_path}")
 
-def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh=0.4, suffix='', preview=False):
+def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0.4, png=False):
     """
     Produces cutout images from astronomical FITS files centred on catalogue positions.
     
@@ -117,9 +128,6 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     indir : str
         Directory containing input FITS files to process.
     
-    output_dir : str
-        Directory where output cutout files will be saved. Created if it doesn't exist.
-    
     survey : str
         Name of the survey. Used for naming output files and plot titles.
     
@@ -129,14 +137,14 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     filter : str
         Filter name to select FITS files (e.g., 'F770W'). Will be used in filename matching.
     
+    base_dir : str
+        Base directory for the cutouts folder
+        
     nan_thresh : float, optional
         Maximum allowed fraction of NaN values in a cutout (default: 0.4).
         Cutouts with more NaNs than this threshold will be discarded.
     
-    suffix : str, optional
-        Additional string to append to output filenames.
-    
-    preview: bool, optional
+    png: bool, optional
         If True, generates PNG preview images for each cutout. Defaults to False.
     
     Returns
@@ -151,15 +159,26 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     """
 
     # Extract survey name and observation number from the survey parameter
-    if '1' in survey:
-        survey_name = survey[:-1]
-        obs = '1'
-    elif '2' in survey:
-        survey_name = survey[:-1]
-        obs = '2'
+    # 2. Extract survey name and observation number
+    if survey[-1].isdigit():
+        survey_name = survey[:-1]  # e.g. "primer"
+        obs = survey[-1]           # e.g. "1"
     else:
         survey_name = survey
         obs = ''
+    
+    # 1. Build the nested path: base/folder_name/survey/filter/
+    # This creates: cutouts/primer1/F1800W/
+    filter_dir = os.path.join(base_dir, survey, filter.upper())
+    
+    # 2. Define specific subfolders for types
+    fits_dir = os.path.join(filter_dir, 'fits')
+    png_dir = os.path.join(filter_dir, 'png')
+    
+    # 3. Create all directories at once
+    os.makedirs(fits_dir, exist_ok=True)
+    if png:
+        os.makedirs(png_dir, exist_ok=True)
     
     # Load target catalogue with object IDs and coordinates
     with fits.open(cat) as catalog_hdul:
@@ -175,15 +194,10 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
     print("Processing:")
     for f in fits_files:
         print(f"{f}")
-
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Files will be saved to {output_dir}.")
     
     # Initialise counter for successful cutouts
     counts = 0
     total = len(ra)
-    suffx = '_' + suffix
     
     # Calculate cutout size in pixels based on MIRI instrument scale
     miri_scale = 0.11092  # arcsec per pixel
@@ -198,10 +212,6 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
             ref_header = hdul[1].header
             ref_wcs = WCS(ref_header)
 
-            # Get statistics from the whole mosaic/reference image
-            global_median = np.nanmedian(ref_data)
-            global_std = np.nanstd(ref_data)
-            
             # Process each galaxy from the catalogue
             for i in range(total):
                 # Create SkyCoord object for the target position
@@ -222,7 +232,6 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                 cutout_hdul = fits.HDUList()
                 cutout_hdul.append(fits.PrimaryHDU(header=hdul[0].header))
 
-                valid_cutout = True
                 max_nan_ratio = 0.0
 
                 # Process each extension in the input FITS file
@@ -265,26 +274,29 @@ def produce_cutouts(cat, indir, output_dir, survey, x_arcsec, filter, nan_thresh
                     angle = calculate_angle(fits_file)  
                     print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
-                    plt.figure(figsize=(6, 6))      
+                    if png:
+                        plt.figure(figsize=(6, 6))      
 
-                    interval = ZScaleInterval()
-                    vmin, vmax = interval.get_limits(preview_data)
-                    norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
-                    plt.imshow(preview_data, origin="lower", cmap="gray")
-                    plt.title(filter)
+                        interval = ZScaleInterval()
+                        vmin, vmax = interval.get_limits(preview_data)
+                        norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
+                        plt.imshow(preview_data, origin="lower", cmap="gray")
+                        plt.title(filter)
+                        
+                        # Draw North/East compass
+                        ax = plt.gca()
+                        draw_compass(ax, angle_deg=angle)
+                        
+                        png_filename = os.path.join(png_dir, f"{ids[i]}_{filter_l}_{survey}.png")
+                        plt.savefig(png_filename)
+                        plt.close()
                     
-                    # Draw North/East compass
-                    ax = plt.gca()
-                    draw_compass(ax, angle_deg=angle)
-                    
-                    png_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.png")
-                    plt.savefig(png_filename)
-                    plt.close()
-
                     # Save multi-extension FITS cutout
-                    fits_filename = os.path.join(output_dir, f"{ids[i]}_{filter}_{survey_name}{obs}{suffix}.fits")
+                    fits_filename = os.path.join(fits_dir, f"{ids[i]}_{filter_l}_{survey}.fits")
                     cutout_hdul.writeto(fits_filename, overwrite=True)
                     counts += 1
+                    
+                    print(f"Files were successfully saved to {filter_dir}.")
 
     # Report completion statistics
     print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
