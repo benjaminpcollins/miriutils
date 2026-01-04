@@ -41,7 +41,7 @@ from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
 from astropy.coordinates import SkyCoord
 from astropy.nddata import Cutout2D
-from astropy.visualization import ImageNormalize, AsinhStretch
+from astropy.visualization import ImageNormalize, AsinhStretch, ZScaleInterval
 
 # Suppress annoying WCS warnings from JWST headers that don't impact cutout accuracy
 warnings.simplefilter("ignore", category=FITSFixedWarning)
