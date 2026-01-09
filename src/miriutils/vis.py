@@ -150,27 +150,25 @@ class RGBComposer:
         ref_path = recipe['B']
         if not ref_path:
             raise ValueError("Recipe must have at least one valid FITS path.")
-
+        
+        # 2. Pull the pre-centered sky coordinates from the Reference File
         with fits.open(ref_path) as hdul:
-            # We get the sky coordinates of the middle of the existing cutout
-            orig_wcs = WCS(hdul['SCI'].header)
-            ny, nx = hdul['SCI'].data.shape
-            sky_center = orig_wcs.pixel_to_world(nx/2, ny/2) # RA and Dec of the center
+            ref_wcs = WCS(hdul['SCI'].header, naxis=2)
+            # This is the RA/Dec of the galaxy you pinned earlier
+            sky_center = ref_wcs.wcs.crval
             
-            # Determine pixel scale from the reference image
-            pix_scale_deg = np.mean(np.abs(orig_wcs.pixel_scale_matrix.diagonal()))
+            pix_scale_deg = np.sqrt(np.abs(np.linalg.det(ref_wcs.pixel_scale_matrix)))
             pix_scale_arcsec = pix_scale_deg * 3600.0
-            print(f"Debug: Using reference pixel scale of {pix_scale_arcsec:.4f} arcsec/pix")
             
-        # 2. Define the output grid dimensions
+        # 3. Define the 3x3" Output Grid
         crop_pix = int(crop_size_arcsec / pix_scale_arcsec)
-        # Use center as CRPIX (0.5 offset is standard FITS convention for center of pixel)
-        center_f = (crop_pix / 2) - 0.5 
+        # Precise center for CRPIX (0-based center of the new box)
+        center_f = (crop_pix - 1) / 2.0 
 
-        # 3. Create a brand new Target WCS from scratch
+        # 4. Build Target WCS
         target_wcs = WCS(naxis=2)
-        target_wcs.wcs.crval = [sky_center.ra.deg, sky_center.dec.deg]
-        target_wcs.wcs.crpix = [center_f, center_f]
+        target_wcs.wcs.crval = sky_center      # Pin galaxy RA/Dec to...
+        target_wcs.wcs.crpix = [center_f + 1, center_f + 1] # ...the center of the box
         target_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
         
         if rotate_north:
@@ -180,7 +178,7 @@ class RGBComposer:
         else:
             # If not rotating, copy the original PC matrix to keep the same angle
             target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
-            target_wcs.wcs.pc = orig_wcs.wcs.pc
+            target_wcs.wcs.pc = ref_wcs.wcs.pc
 
         processed_arrays = {}
 
