@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MIRI Utils Colour Image Processing Module
+MIRI Utils: Colour Image Processing Module
 =========================================
 
 This module provides utilities for creating colour-composite images from FITS data
@@ -38,6 +38,7 @@ Version: 1.0
 """
 
 import os
+import re
 import glob
 import numpy as np
 from astropy.io import fits
@@ -45,6 +46,200 @@ from matplotlib import pyplot as plt
 from astropy.table import Table
 from astropy.stats import sigma_clipped_stats
 from collections import defaultdict
+from reproject import reproject_interp
+
+from astropy.wcs import WCS
+import trilogy
+
+class RGBComposer:
+    def __init__(self, cutout_dir, nircam_dir, output_dir):
+        self.cutout_dir = cutout_dir
+        self.nircam_dir = nircam_dir
+        self.output_dir = output_dir
+        
+        # Define our filter "anchor"
+        self.nircam_anchor = 'F444W'
+        self.miri_pattern = re.compile(r'F\d{3,4}W')
+
+    def get_filter_wavelength(self, filter_name):
+        """Extracts numeric wavelength, e.g., 'F2100W' -> 2100"""
+        match = re.search(r'\d+', filter_name)
+        return int(match.group()) if match else 0
+
+    def find_files_for_galaxy(self, gid):
+        """
+        Scans directories to see what FITS files actually exist for this ID.
+        Returns a dictionary: {filter_name: path_to_file}
+        """
+        available = {}
+        
+        # 1. Check NIRCam dir for F444W
+        nircam_match = glob.glob(os.path.join(self.nircam_dir, f"{gid}_{self.nircam_anchor}*.fits"))
+        if nircam_match:
+            available[self.nircam_anchor] = nircam_match[0]
+            
+        # 2. Search MIRI directory recursively
+        # We look for the ID and the specific f[digits]w pattern
+        miri_pattern = os.path.join(self.cutout_dir, "**", f"fits/{gid}_f*w*.fits")
+        miri_matches = glob.glob(miri_pattern, recursive=True)
+        
+        for path in miri_matches:
+            fname = os.path.basename(path)
+            # Find the filter part (e.g., F2100W)
+            match = self.miri_pattern.search(fname.upper())
+            if match:
+                filter_name = match.group()
+                available[filter_name] = path
+            
+        return available
+
+    def determine_recipe(self, available_files):
+        """
+        Applies your logic to map available files to R, G, B channels.
+        """
+        # Separate MIRI filters and sort by wavelength
+        miri_filters = sorted(
+            [f for f in available_files.keys() if f != self.nircam_anchor],
+            key=self.get_filter_wavelength
+        )                
+                
+        nircam_path = available_files.get(self.nircam_anchor)
+        count = len(miri_filters)
+        
+        recipe = {'R': None, 'G': None, 'B': None}
+
+        if count == 0:
+            return None # No MIRI, no party
+            
+        if count == 1:
+            # 1 MIRI: Red=MIRI, Green=None, Blue=F444W
+            recipe['R'] = available_files[miri_filters[0]]
+            recipe['B'] = nircam_path
+            
+        elif count == 2:
+            # 2 MIRI: Red=Long MIRI, Green=Short MIRI, Blue=F444W
+            recipe['R'] = available_files[miri_filters[0]]
+            recipe['G'] = available_files[miri_filters[1]]
+            recipe['B'] = nircam_path
+            
+        elif count == 3:
+            # 3+ MIRI: Use only MIRI (Shortest=B, Middle=G, Longest=R)
+            recipe['R'] = available_files[miri_filters[0]]
+            recipe['G'] = available_files[miri_filters[1]]
+            recipe['B'] = available_files[miri_filters[-1]]
+        
+        elif count == 4:
+            # 4+ MIRI: Use 1st, 3rd, and last for better color separation
+            recipe['B'] = available_files[miri_filters[0]]
+            recipe['G'] = available_files[miri_filters[1]]
+            recipe['R'] = available_files[miri_filters[-1]]
+        
+        else:
+            # More than 4 MIRI: Just take first, third and last for simplicity
+            recipe['B'] = available_files[miri_filters[0]]
+            recipe['G'] = available_files[miri_filters[2]]
+            recipe['R'] = available_files[miri_filters[-1]]
+            
+        return recipe
+    
+    def process_and_align(self, recipe, rotate_north=True, crop_size_arcsec=3.0):
+        """
+        Aligns all channels in the recipe to a common grid and crops to a specific size.
+        """
+        # 1. Pick a reference file (Red if available, else Blue)
+        ref_path = recipe['B']
+        if not ref_path:
+            raise ValueError("Recipe must have at least one valid FITS path.")
+
+        with fits.open(ref_path) as hdul:
+            # We get the sky coordinates of the middle of the existing cutout
+            orig_wcs = WCS(hdul['SCI'].header)
+            ny, nx = hdul['SCI'].data.shape
+            sky_center = orig_wcs.pixel_to_world(nx/2, ny/2) # RA and Dec of the center
+            
+            # Determine pixel scale from the reference image
+            pix_scale_deg = np.mean(np.abs(orig_wcs.pixel_scale_matrix.diagonal()))
+            pix_scale_arcsec = pix_scale_deg * 3600.0
+            print(f"Debug: Using reference pixel scale of {pix_scale_arcsec:.4f} arcsec/pix")
+            
+        # 2. Define the output grid dimensions
+        crop_pix = int(crop_size_arcsec / pix_scale_arcsec)
+        # Use center as CRPIX (0.5 offset is standard FITS convention for center of pixel)
+        center_f = (crop_pix / 2) - 0.5 
+
+        # 3. Create a brand new Target WCS from scratch
+        target_wcs = WCS(naxis=2)
+        target_wcs.wcs.crval = [sky_center.ra.deg, sky_center.dec.deg]
+        target_wcs.wcs.crpix = [center_f, center_f]
+        target_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        
+        if rotate_north:
+            # Standard North-up: CDELT1 is negative (RA increases to the left)
+            target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
+            target_wcs.wcs.pc = [[1, 0], [0, 1]]
+        else:
+            # If not rotating, copy the original PC matrix to keep the same angle
+            target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
+            target_wcs.wcs.pc = orig_wcs.wcs.pc
+
+        processed_arrays = {}
+
+        # 4. Reproject directly into the small 3x3" box
+        for chan in ['R', 'G', 'B']:
+            if recipe[chan] is None:
+                processed_arrays[chan] = np.zeros((crop_pix, crop_pix))
+                continue
+                
+            with fits.open(recipe[chan]) as h:
+                # Passing h['SCI'] gives reproject the data + its WCS
+                data, footprint = reproject_interp(
+                    h['SCI'], 
+                    target_wcs, 
+                    shape_out=(crop_pix, crop_pix)
+                )
+                processed_arrays[chan] = np.nan_to_num(data)
+        
+        return processed_arrays, target_wcs
+
+    def make_rgb(self, arrays, method='astropy'):
+        if method == 'trilogy':
+            try:
+                import trilogy
+                return self.create_rgb_trilogy(arrays)
+            except ImportError:
+                print("Trilogy not found. Falling back to Astropy.")
+                return self.create_rgb_astropy(arrays)
+        else:
+            return self.create_rgb_astropy(arrays)
+
+    def create_rgb_trilogy(self, processed_arrays, output_name):
+        """
+        Uses Trilogy to scale and combine the aligned arrays.
+        """
+        # Trilogy expects a list of arrays for R, G, and B
+        # You can pass multiple filters per channel, but here we use 1 per channel
+        images = [
+            processed_arrays['R'], 
+            processed_arrays['G'], 
+            processed_arrays['B']
+        ]
+        
+        # We can define 'Scaling' parameters similar to your original ones
+        # Trilogy uses a 'noise' or 'sat' based approach
+        obj = trilogy.Trilogy(images)
+        
+        # This will create the RGB array internally
+        obj.run() 
+        
+        # Return the 8-bit image data ready for saving
+        return obj.img
+
+
+
+
+
+
+
 
 def normalise_image(img, stretch='asinh', Q=10, alpha=1, weight=1.0):
     """
