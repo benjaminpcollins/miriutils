@@ -189,10 +189,10 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0
 
     # Find all FITS files matching the requested filter
     filter_l = filter.lower()
-    fits_files = glob.glob(os.path.join(indir, f"*{filter_l}*.fits"))
-    print(f"Found {len(fits_files)} FITS files from the {survey_name} survey with filter {filter}.")
+    large_mosaics = glob.glob(os.path.join(indir, f"*{filter_l}*.fits"))
+    print(f"Found {len(large_mosaics)} FITS files from the {survey_name} survey with filter {filter}.")
     print("Processing:")
-    for f in fits_files:
+    for f in large_mosaics:
         print(f"{f}")
     
     # Initialise counter for successful cutouts
@@ -205,11 +205,11 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0
     cutout_size = (x_pixels, x_pixels)
 
     # Process each FITS file
-    for fits_file in fits_files:
-        with fits.open(fits_file) as hdul:
+    for mosaic_file in large_mosaics:
+        with fits.open(mosaic_file) as hdul:
             # Use extension 1 as the reference for WCS and field coverage check
-            ref_data = hdul[1].data
-            ref_header = hdul[1].header
+            ref_data = hdul['SCI'].data
+            ref_header = hdul['SCI'].header
             ref_wcs = WCS(ref_header)
 
             # Process each galaxy from the catalogue
@@ -234,30 +234,42 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0
 
                 max_nan_ratio = 0.0
 
-                # Process each extension in the input FITS file
                 for ext in range(1, len(hdul)):
                     hdu = hdul[ext]
-                    # Skip non-image or 1D extensions
                     if hdu.data is None or hdu.data.ndim != 2:
-                        continue  # Skip non-image or 1D extensions
+                        continue
 
-                    # Create cutout from this extension
+                    # Process just the SCI extension
                     try:
-                        # Try using WCS from this extension (preferred method)
-                        wcs = WCS(hdu.header)
-                        cutout = Cutout2D(hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
-                        cutout_header = cutout.wcs.to_header()
-                    except Exception:
-                        # Fallback to pixel coordinates if WCS fails
-                        cutout = Cutout2D(hdu.data, (x, y), cutout_size, mode="partial")
-                        cutout_header = hdu.header.copy()
+                        # 1. Grab the SCI extension (Index 1 in JWST files)
+                        sci_hdu = hdul['SCI']
+                        wcs = WCS(sci_hdu.header, naxis=2)
+
+                        # 2. Create the cutout
+                        cutout = Cutout2D(sci_hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
+
+                        # 3. Create the "Centered" Header
+                        new_wcs = cutout.wcs
+                        # Center pixel (0-based)
+                        center_f = (cutout.data.shape[0] - 1) / 2.0 
+                        # Update WCS keywords
+                        new_wcs.wcs.crpix = [center_f + 1, center_f + 1] # +1 for FITS standard
+                        new_wcs.wcs.crval = [target_coord.ra.deg, target_coord.dec.deg]
+
+                        # 4. Build the final Header
+                        # We copy the SCI header so we keep things like 'FILTER' and 'PHOTMJSR'
+                        new_header = sci_hdu.header.copy()
+                        new_header.update(new_wcs.to_header())
+                        
+                    except Exception as e:
+                        print(f"Error creating cutout for {ids[i]}: {e}")
 
                     # Calculate fraction of NaN values in the cutout
                     nan_ratio = np.isnan(cutout.data).sum() / cutout.data.size
                     max_nan_ratio = max(max_nan_ratio, nan_ratio)
 
                     # Create output HDU with original extension name preserved
-                    cutout_hdu = fits.ImageHDU(data=cutout.data, header=cutout_header)
+                    cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
                     if 'EXTNAME' in hdu.header:
                         cutout_hdu.name = hdu.header['EXTNAME']
                     
@@ -271,7 +283,7 @@ def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0
                     preview_data = cutout_hdul[1].data
                     
                     # Calculate angle of rotation for NE cross
-                    angle = calculate_angle(fits_file)  
+                    angle = calculate_angle(mosaic_file)  
                     print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
                     
                     if png:
