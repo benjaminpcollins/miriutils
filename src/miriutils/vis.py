@@ -1,5 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "astropy",
+#     "matplotlib",
+#     "numpy",
+#     "reproject",
+#     "scipy",
+# ]
+# ///
 """
 MIRI Utils: Visualisation & RGB Composition Module
 =================================================
