@@ -1,55 +1,55 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-MIRI Utils: Colour Image Processing Module
-=========================================
+MIRI Utils: Visualisation & RGB Composition Module
+=================================================
 
-This module provides utilities for creating colour-composite images from FITS data
-obtained from JWST MIRI and NIRCam instruments. It includes functions for resampling,
-normalising, and combining image data to create scientifically informative and
-visually appealing colour images.
+This module provides the RGBComposer class, designed to automate the creation 
+of 3-color composite stamps from multi-instrument JWST data (MIRI & NIRCam). 
+It handles spatial alignment via reprojection, North-up rotation, asinh scaling, 
+and automated labeling with filter legends and scale bars.
 
-Functions
----------
-    - resample_nircam: Resamples NIRCam images to a specified pixel size
-    - normalise_image: Applies various stretches to normalise image data
-    - preprocess_fits_image: Loads and preprocesses FITS images with background handling
-    - make_stamp: Creates RGB composite images from multiple FITS files
+Classes
+-------
+    - RGBComposer: The main engine for finding, aligning, and rendering RGB stamps.
+
+Key Capabilities
+----------------
+    - Automatic filter-to-channel mapping (Recipe generation).
+    - Sub-pixel alignment using Astropy Reproject.
+    - Publication-ready plotting with color-coded legends.
 
 Example usage
 -------------
-    from miri_utils.color_utils import resample_nircam, make_stamp
+    from miri_utils.vis import RGBComposer
 
-    # Resample all NIRCam files in directory
-    resample_nircam("./data", 1024)
+    # Initialise the composer
+    composer = RGBComposer(miri_dir="./miri_fits", 
+                           nircam_dir="./nircam_fits", 
+                           output_dir="./stamps")
 
-    # Create color composite
-    image_dict = {
-        'R': ['image_F1800W.fits[0]'],
-        'G': ['image_F770W.fits[0]'],
-        'B': ['image_F444W.fits[0]']
-    }
-    make_stamp(image_dict, 10, 0.05, 1.0, 10, 0.05, 1.0, 10, 0.05, 1.0, 
-            stretch='asinh', outfile='my_color_image.pdf')
+    # Process a specific galaxy
+    files = composer.find_files_for_galaxy("18332")
+    recipe = composer.determine_recipe(files)
+    
+    if recipe:
+        arrays, target_wcs = composer.process_and_align(recipe, rotate_north=True)
+        rgb_data = composer.create_rgb(arrays, stretch=0.5)
+        composer.save_stamp("18332", rgb_data, recipe)
 
 Author: Benjamin P. Collins
-Date: May 15, 2025
-Version: 1.0
+Date: January 10, 2026
+Version: 3.1
 """
 
 import os
 import re
 import glob
 import numpy as np
-import tempfile
 from astropy.io import fits
-from matplotlib import pyplot as plt
+import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from astropy.table import Table
-from astropy.stats import sigma_clipped_stats
-from collections import defaultdict
 from reproject import reproject_interp
-from PIL import Image
 from astropy.wcs import WCS
 from astropy.visualization import (AsinhStretch, LinearStretch, 
                                    ManualInterval, PercentileInterval, 
@@ -153,7 +153,7 @@ class RGBComposer:
         Aligns all channels in the recipe to a common grid and crops to a specific size.
         """
         # 1. Pick a reference file (Red if available, else Blue)
-        ref_path = recipe['B']['path']
+        ref_path = recipe['R']['path']
         if not ref_path:
             raise ValueError("Recipe must have at least one valid FITS path.")
         
@@ -272,8 +272,27 @@ class RGBComposer:
         # Use tight_layout instead of manual subplots_adjust to prevent clipping
         fig.tight_layout(pad=0)
         
+        # Calculate how many pixels wide 1 arcsecond is
+        ref_path = recipe['R']['path']
+        if not ref_path:
+            raise ValueError("Recipe must have at least one valid FITS path.")
+        
+        # 2. Pull the pre-centered sky coordinates from the Reference File
+        with fits.open(ref_path) as hdul:
+            ref_wcs = WCS(hdul['SCI'].header, naxis=2)
+            pix_scale_deg = np.sqrt(np.abs(np.linalg.det(ref_wcs.pixel_scale_matrix)))
+            pix_scale_arcsec = pix_scale_deg * 3600.0
+        
+        bar_length_arcsec = 0.5  # Changed to half-arcsec
+        final_bar_length = (bar_length_arcsec / pix_scale_arcsec) / rgb_array.shape[1]
+
+        # Draw a simple white line for 1 arcsecond
+        ax.plot([0.8, 0.8 + final_bar_length], [0.05, 0.05], 
+                transform=ax.transAxes, color='white', lw=2)
+        ax.text(0.8, 0.07, '0.5"', transform=ax.transAxes, color='white', ha='center')
+        
         # Save the result
-        output_path = os.path.join(self.output_dir, f"{galaxy_id}_rgb.png")
+        output_path = os.path.join(self.output_dir, output_name if output_name else f"{galaxy_id}_rgb.png")        
         
         # IMPORTANT: bbox_extra_artists ensures the legend is included in the save
         plt.savefig(output_path, 
