@@ -57,19 +57,156 @@ from photutils.aperture import (
     EllipticalAperture,
     aperture_photometry,
 )
+from pathlib import Path
+
+from astropy.wcs import WCS
+
 from photutils.centroids import centroid_com
 from photutils.segmentation import SegmentationImage, detect_sources
-from PIL import Image
 
 from .cutout_tools import load_cutout
+
+class MIRIPipeline:
+    def __init__(self, cutouts_dir, output_dir):
+        self.cutouts_dir = cutouts_dir
+        self.output_dir = output_dir
+        
+        # Internal storage for results
+        self.raw_results = [] 
+        
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def find_files(self, gid, priority=['primer', 'cweb', 'cos3d']):
+        """
+        Finds one file per filter using the directory structure as the source of truth.
+        Structure: .../survey_obs/FILTER/fits/12345_f770w_obs.fits
+        """
+        # 1. Search recursively using Pathlib
+        root = Path(self.cutouts_dir)
+        # This finds all FITS files starting with the galaxy ID
+        all_paths = list(root.rglob(f"{gid}_*.fits"))
+        
+        # 2. Group by the folder name (the parent of the parent)
+        # path.parent is 'fits', path.parent.parent is 'F1000W'
+        files_by_filter = {}
+        for p in all_paths:
+            filter_name = p.parent.parent.name.upper() # e.g., "F1000W"
+            files_by_filter.setdefault(filter_name, []).append(p)
+        
+        selected_files = []
+
+        # 3. For each filter, pick the best file based on priority
+        for filter_name, path_list in files_by_filter.items():
+            best_file_for_filter = None
+            
+            # This loop enforces the priority: 
+            # It checks for 'primer' across ALL files in this filter first.
+            # Only if no 'primer' is found does it move to 'cweb'.
+            for p_key in priority:
+                matches = [p for p in path_list if p_key.lower() in str(p).lower()]
+                
+                if matches:
+                    # We found a match for the highest available priority!
+                    # If there's more than one (like primer1 and primer2), matches[0] is fine
+                    best_file_for_filter = str(matches[0])
+                    break # Stop looking for lower priorities (cweb/cos3d) for this filter
+            
+            if best_file_for_filter:
+                selected_files.append(best_file_for_filter)
+                
+        return selected_files
+    
+    def prepare_aperture(self, file_path, rescale=True):
+        """
+        1. Parse Metadata
+        2. Load FITS/WCS
+        3. Match with Master Catalogue
+        4. Project NIRCam coords -> MIRI pixels
+        5. Apply Rotation and Rescaling
+        """
+        meta = self.parse_path_metadata(file_path)
+        gid = int(meta['gid'])
+
+        # --- 1. Load Master Aperture ---
+        # Assuming self.master_table is already loaded in __init__
+        matches = self.master_table[self.master_table["ID"] == gid]
+        if len(matches) == 0:
+            print(f"Warning: Galaxy {gid} not in catalogue.")
+            return None
+        row = matches[0]
+
+        # --- 2. Load MIRI and NIRCam WCS ---
+        with fits.open(file_path) as hdu_miri:
+            wcs_miri = WCS(hdu_miri[0].header)
+            data_miri = hdu_miri[0].data
+            # Get rotation directly from header logic
+            miri_rotation = wcs_miri.to_header().get('ORIENTAT', 0.0)
+
+        nircam_path = os.path.join(self.nircam_dir, f"{gid}_F444W_cutout.fits")
+        with fits.open(nircam_path) as hdu_ni:
+            wcs_ni = WCS(hdu_ni[0].header)
+            ni_rotation = wcs_ni.to_header().get('ORIENTAT', 0.0)
+
+        # --- 3. Coordinate Transformation ---
+        # Project NIRCam pixel center to World (RA/Dec) then to MIRI pixels
+        sky_coord = wcs_ni.pixel_to_world(row["Apr_Xcenter"], row["Apr_Ycenter"])
+        miri_x, miri_y = wcs_miri.world_to_pixel(sky_coord)
+
+        # --- 4. Rotation Logic ---
+        # The change in rotation between the two images
+        delta_rot = miri_rotation - ni_rotation
+        new_theta = (row["Apr_Theta"] + delta_rot) % 180
+
+        # --- 5. Rescaling Logic ---
+        scale_factor = self.get_scale_factor(gid, rescale)
+        # Convert NIRCam pix scale to MIRI pix scale
+        # (Assuming standard JWST scales if headers vary)
+        pixel_ratio = 0.03 / 0.11092 
+        total_scale = pixel_ratio * scale_factor
+
+        return {
+            "id": gid,
+            "x": miri_x,
+            "y": miri_y,
+            "a": row["Apr_A"] * total_scale,
+            "b": row["Apr_B"] * total_scale,
+            "theta": new_theta,
+            "data": data_miri, # Pass data along for background/flux steps
+            "meta": meta
+        }
+
+    def run_photometry(self, filter_name, apply_aper_corr=False):
+        """
+        Wraps the 1300-line logic but keeps it organized.
+        """
+        files = self.select_files(filter_name)
+        filter_results = []
+        
+        for fits_path in files:
+            # 1. Adjust apertures to MIRI
+            # 2. Background estimation
+            # 3. Flux measurement
+            # 4. Correction factor
+            
+            # This is where your dictionary construction happens
+            res = self._process_single_file(fits_path, filter_name, apply_aper_corr)
+            filter_results.append(res)
+            
+        return filter_results
+
+    def _process_single_file(self, fits_path, filter_name, apply_aper_corr):
+        # Internal helper: contains your measurement logic
+        # returns the dictionary you shared in your prompt
+        pass
+
+
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
 
 def adjust_aperture(
-    galaxy_id, filter, survey, obs, output_folder, mask_folder=None, rescale=True
-):
+    galaxy_id, filter, survey, obs, output_folder, mask_folder=None, rescale=True):
     # --- Load the FITS table ---
     table_path = "/Users/benjamincollins/University/master/Red_Cardinal/photometry/phot_tables/Flux_Aperture_PSFMatched_AperCorr_old.fits"
     aperture_table = Table.read(table_path)
