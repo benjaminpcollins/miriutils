@@ -41,15 +41,19 @@ import os
 import re
 import glob
 import numpy as np
+import tempfile
 from astropy.io import fits
 from matplotlib import pyplot as plt
+import matplotlib.patches as mpatches
 from astropy.table import Table
 from astropy.stats import sigma_clipped_stats
 from collections import defaultdict
 from reproject import reproject_interp
-
+from PIL import Image
 from astropy.wcs import WCS
-import trilogy
+from astropy.visualization import (AsinhStretch, LinearStretch, 
+                                   ManualInterval, PercentileInterval, 
+                                   make_rgb)
 
 class RGBComposer:
     def __init__(self, cutout_dir, nircam_dir, output_dir):
@@ -106,39 +110,41 @@ class RGBComposer:
         nircam_path = available_files.get(self.nircam_anchor)
         count = len(miri_filters)
         
-        recipe = {'R': None, 'G': None, 'B': None}
+        # Helper to create a channel entry
+        def get_chan(f_name, files_dict):
+            if f_name is None or f_name not in files_dict:
+                return {'path': None, 'name': 'N/A'}
+            return {'path': files_dict[f_name], 'name': f_name}
+
+        recipe = {
+            'R': {'path': None, 'name': 'N/A'},
+            'G': {'path': None, 'name': 'N/A'},
+            'B': {'path': None, 'name': 'N/A'}
+        }
 
         if count == 0:
-            return None # No MIRI, no party
+            return None 
             
         if count == 1:
-            # 1 MIRI: Red=MIRI, Green=None, Blue=F444W
-            recipe['R'] = available_files[miri_filters[0]]
-            recipe['B'] = nircam_path
+            recipe['R'] = get_chan(miri_filters[0], available_files)
+            recipe['B'] = get_chan(self.nircam_anchor, available_files)
             
         elif count == 2:
-            # 2 MIRI: Red=Long MIRI, Green=Short MIRI, Blue=F444W
-            recipe['R'] = available_files[miri_filters[0]]
-            recipe['G'] = available_files[miri_filters[1]]
-            recipe['B'] = nircam_path
+            # Longest MIRI -> Red, Shortest MIRI -> Green, NIRCam -> Blue
+            recipe['R'] = get_chan(miri_filters[1], available_files)
+            recipe['G'] = get_chan(miri_filters[0], available_files)
+            recipe['B'] = get_chan(self.nircam_anchor, available_files)
             
         elif count == 3:
-            # 3+ MIRI: Use only MIRI (Shortest=B, Middle=G, Longest=R)
-            recipe['R'] = available_files[miri_filters[0]]
-            recipe['G'] = available_files[miri_filters[1]]
-            recipe['B'] = available_files[miri_filters[-1]]
-        
-        elif count == 4:
-            # 4+ MIRI: Use 1st, 3rd, and last for better color separation
-            recipe['B'] = available_files[miri_filters[0]]
-            recipe['G'] = available_files[miri_filters[1]]
-            recipe['R'] = available_files[miri_filters[-1]]
+            recipe['R'] = get_chan(miri_filters[2], available_files)
+            recipe['G'] = get_chan(miri_filters[1], available_files)
+            recipe['B'] = get_chan(miri_filters[0], available_files)
         
         else:
-            # More than 4 MIRI: Just take first, third and last for simplicity
-            recipe['B'] = available_files[miri_filters[0]]
-            recipe['G'] = available_files[miri_filters[2]]
-            recipe['R'] = available_files[miri_filters[-1]]
+            # Pick the spread for 4+ filters
+            recipe['R'] = get_chan(miri_filters[-1], available_files)
+            recipe['G'] = get_chan(miri_filters[len(miri_filters)//2], available_files)
+            recipe['B'] = get_chan(miri_filters[0], available_files)
             
         return recipe
     
@@ -147,7 +153,7 @@ class RGBComposer:
         Aligns all channels in the recipe to a common grid and crops to a specific size.
         """
         # 1. Pick a reference file (Red if available, else Blue)
-        ref_path = recipe['B']
+        ref_path = recipe['B']['path']
         if not ref_path:
             raise ValueError("Recipe must have at least one valid FITS path.")
         
@@ -184,11 +190,12 @@ class RGBComposer:
 
         # 4. Reproject directly into the small 3x3" box
         for chan in ['R', 'G', 'B']:
-            if recipe[chan] is None:
+            chan_info = recipe[chan]
+            if chan_info['path'] is None:
                 processed_arrays[chan] = np.zeros((crop_pix, crop_pix))
                 continue
-                
-            with fits.open(recipe[chan]) as h:
+            
+            with fits.open(chan_info['path']) as h:
                 # Passing h['SCI'] gives reproject the data + its WCS
                 data, footprint = reproject_interp(
                     h['SCI'], 
@@ -198,41 +205,87 @@ class RGBComposer:
                 processed_arrays[chan] = np.nan_to_num(data)
         
         return processed_arrays, target_wcs
-
-    def make_rgb(self, arrays, method='astropy'):
-        if method == 'trilogy':
-            try:
-                import trilogy
-                return self.create_rgb_trilogy(arrays)
-            except ImportError:
-                print("Trilogy not found. Falling back to Astropy.")
-                return self.create_rgb_astropy(arrays)
-        else:
-            return self.create_rgb_astropy(arrays)
-
-    def create_rgb_trilogy(self, processed_arrays, output_name):
+    
+    def create_rgb(self, processed_arrays, stretch=0.5):
         """
-        Uses Trilogy to scale and combine the aligned arrays.
+        Uses Astropy's visualisation tools to scale and combine arrays.
         """
-        # Trilogy expects a list of arrays for R, G, and B
-        # You can pass multiple filters per channel, but here we use 1 per channel
-        images = [
-            processed_arrays['R'], 
-            processed_arrays['G'], 
-            processed_arrays['B']
+        # 1. Select the channels
+        r = processed_arrays['R']
+        g = processed_arrays['G']
+        b = processed_arrays['B']
+
+        # 2. Define the interval (Scaling/Clipping)
+        # PercentileInterval(99.5) automatically finds the saturation point
+        # Like Trilogy's 'sat' parameter
+        interval = PercentileInterval(99.5)
+        
+        # 3. Define the stretch (The Math)
+        # Asinh is the standard for JWST to see faint arms and bright cores
+        # 'a' is the stretch parameter (non-linearity)
+        stretch_func = AsinhStretch(a=stretch)
+
+        # 4. Use Astropy's make_rgb to combine and scale to 8-bit
+        # This handles the normalization and stacking in one go
+        rgb_image = make_rgb(r, g, b, 
+                            interval=interval, 
+                            stretch=stretch_func)
+        
+        return rgb_image
+
+    
+    def save_stamp(self, galaxy_id, rgb_array, recipe, output_name=None):
+        """
+        Plots the RGB image and adds a legend based on the filters used.
+        """
+        fig, ax = plt.subplots(figsize=(8, 8), facecolor="black")
+        
+        # Display the image
+        ax.imshow(rgb_array, origin='lower')
+        
+        # Create custom legend handles
+        # We use the keys from your recipe to pull the filter names
+        #legend_text = f"R: {recipe['R']['name']}\nG: {recipe['G']['name']}\nB: {recipe['B']['name']}"
+        legend_elements = [
+            mpatches.Patch(color='red', label=f"R: {recipe['R']['name']}"),
+            mpatches.Patch(color='lime', label=f"G: {recipe['G']['name']}"),
+            mpatches.Patch(color='blue', label=f"B: {recipe['B']['name']}")
         ]
         
-        # We can define 'Scaling' parameters similar to your original ones
-        # Trilogy uses a 'noise' or 'sat' based approach
-        obj = trilogy.Trilogy(images)
+        # Add the legend
+        # We use a semi-transparent black background.
+        leg = ax.legend(handles=legend_elements, 
+                loc='upper left', 
+                fontsize=12, 
+                frameon=True, 
+                facecolor='black', 
+                edgecolor='none', 
+                labelcolor='white',
+                handlelength=0.7, # Makes the patches square
+                borderpad=1.2,
+                handletextpad=0.5)
         
-        # This will create the RGB array internally
-        obj.run() 
+        # 5. Clean up and Save
+        ax.axis('off')
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
         
-        # Return the 8-bit image data ready for saving
-        return obj.img
-
-
+        # Use tight_layout instead of manual subplots_adjust to prevent clipping
+        fig.tight_layout(pad=0)
+        
+        # Save the result
+        output_path = os.path.join(self.output_dir, f"{galaxy_id}_rgb.png")
+        
+        # IMPORTANT: bbox_extra_artists ensures the legend is included in the save
+        plt.savefig(output_path, 
+                    bbox_inches='tight', 
+                    pad_inches=0, 
+                    dpi=150, 
+                    facecolor='black',
+                    bbox_extra_artists=(leg,))        
+        
+        plt.close()
+        
+        print(f"Saved labeled stamp to {output_path}")
 
 
 
