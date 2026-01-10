@@ -162,43 +162,46 @@ class RGBComposer:
         """
         Aligns all channels in the recipe to a common grid and crops to a specific size.
         """
-        # 1. Pick a reference file (Red if available, else Blue)
+        # Pick a reference file (Red if available, else Blue)
         ref_path = recipe['R']['path']
         if not ref_path:
             raise ValueError("Recipe must have at least one valid FITS path.")
         
-        # 2. Pull the pre-centered sky coordinates from the Reference File
+        # Pull the pre-centered sky coordinates from the Reference File
         with fits.open(ref_path) as hdul:
+            # load WCS from SCI extension of a reference MIRI cutout
             ref_wcs = WCS(hdul['SCI'].header, naxis=2)
-            # This is the RA/Dec of the galaxy you pinned earlier
+            
+            # This is the RA/Dec of the galaxy (anchored by the produce_cutouts function)
             sky_center = ref_wcs.wcs.crval
             
+            # Define pixel scale of the final images
             pix_scale_deg = np.sqrt(np.abs(np.linalg.det(ref_wcs.pixel_scale_matrix)))
             pix_scale_arcsec = pix_scale_deg * 3600.0
             
-        # 3. Define the 3x3" Output Grid
+        # Define the size of the final RGB image
         crop_pix = int(crop_size_arcsec / pix_scale_arcsec)
-        # Precise center for CRPIX (0-based center of the new box)
+        
+        # Define the centre for CRPIX (0-based centre of the new box)
+        # Attention: FITS images start with CRPIX=1 at the first pixel
         center_f = (crop_pix - 1) / 2.0 
 
-        # 4. Build Target WCS
+        # Build Target WCS from scratch and provide the necessary information
         target_wcs = WCS(naxis=2)
         target_wcs.wcs.crval = sky_center      # Pin galaxy RA/Dec to...
-        target_wcs.wcs.crpix = [center_f + 1, center_f + 1] # ...the center of the box
+        target_wcs.wcs.crpix = [center_f + 1, center_f + 1] # ...the center of the box (accounting for 1-based)
         target_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
         
-        if rotate_north:
-            # Standard North-up: CDELT1 is negative (RA increases to the left)
-            target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
-            target_wcs.wcs.pc = [[1, 0], [0, 1]]
-        else:
-            # If not rotating, copy the original PC matrix to keep the same angle
-            target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
-            target_wcs.wcs.pc = ref_wcs.wcs.pc
+        # Standard North-up: CDELT1 is negative (RA increases to the left)
+        target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
+        
+        # Manually make the image point North-up
+        # If not rotating, copy the original PC matrix to keep the same angle
+        target_wcs.wcs.pc = [[1, 0], [0, 1]] if rotate_north else ref_wcs.wcs.pc
 
         processed_arrays = {}
 
-        # 4. Reproject directly into the small 3x3" box
+        # Reproject directly into the small 3x3" box
         for chan in ['R', 'G', 'B']:
             chan_info = recipe[chan]
             if chan_info['path'] is None:
@@ -212,7 +215,7 @@ class RGBComposer:
                     target_wcs, 
                     shape_out=(crop_pix, crop_pix)
                 )
-                processed_arrays[chan] = np.nan_to_num(data)
+                processed_arrays[chan] = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         
         return processed_arrays, target_wcs
     
