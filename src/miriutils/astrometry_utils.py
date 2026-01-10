@@ -507,7 +507,7 @@ def display_offsets(output_base, summary_df):
             m_color = COLOUR_MAP.get(prog, 'black')
             
             ax1.plot(
-                sub['dra_arcsec'].mean(), sub['ddec_arcsec'].mean(), 
+                sub['dra_arcsec'].median(), sub['ddec_arcsec'].median(), 
                 marker=m_style, color=m_color, markersize=14, 
                 markeredgecolor='white', markeredgewidth=1.5
             )
