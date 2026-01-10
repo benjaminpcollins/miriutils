@@ -46,481 +46,366 @@ from astropy.visualization import ImageNormalize, AsinhStretch, ZScaleInterval
 # Suppress annoying WCS warnings from JWST headers that don't impact cutout accuracy
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
-
-
-def load_cutout(file_path, index=1):
-    """Loads a FITS cutout file and extracts the data, header, and WCS."""
-    try:
-        with fits.open(file_path) as hdu:
-            data = hdu[index].data
-            header = hdu[index].header
-            wcs = WCS(header)
-        return data, wcs
-    except FileNotFoundError:
-        print(f"File not found: {file_path}")
-        return None, None
-
-def resample_cutout(indir, num_pixels):
-    """
-    Resamples NIRCam FITS images to a specified square pixel dimension.
+class CutoutManager:
+    """A tool for generating multi-instrument astronomical cutouts."""
     
-    This function searches for NIRCam FITS files in the provided directory,
-    resamples them to the specified number of pixels (square), and updates
-    the WCS information accordingly to maintain astrometric accuracy.
-    
-    Parameters:
-    -----------
-    indir : str
-        Directory containing NIRCam FITS files to process
-    num_pixels : int
-        Target image size in pixels (will create num_pixels × num_pixels images)
+    def __init__(self, base_dir, mosaic_dir, instrument="MIRI"):
+        self.base_dir = base_dir
+        self.instrument = instrument
+        self.mosaic_dir = mosaic_dir
         
-    Returns:
-    --------
-    None
-        Writes resampled images to disk with '_res.fits' suffix
-    """
-    # Open the FITS files
-    fits_files = glob.glob(os.path.join(indir, '*nircam.fits'))
-    for file_path in fits_files:
-        with fits.open(file_path) as hdul:
-            data = hdul[0].data
-            header = hdul[0].header
-            wcs = WCS(header)
-            
-            # Resample the image
-            target_shape = (num_pixels, num_pixels)
-            ny_old, nx_old = data.shape
-            ny_new, nx_new = target_shape
-            zoom_y = ny_new / ny_old
-            zoom_x = nx_new / nx_old
-            resampled_data = zoom(data, (zoom_y, zoom_x), order=1, mode='nearest')
-            
-            # Update WCS information
-            header['NAXIS1'] = nx_new
-            header['NAXIS2'] = ny_new
-            if 'CDELT1' in header and 'CDELT2' in header:
-                header['CDELT1'] /= zoom_x
-                header['CDELT2'] /= zoom_y
-            if 'CD1_1' in header and 'CD2_2' in header:
-                header['CD1_1'] /= zoom_x
-                header['CD2_2'] /= zoom_y
-                
-            # Write new FITS file to the same directory
-            out_path = file_path.replace('.fits', '_res.fits')
-            fits.writeto(out_path, resampled_data, header, overwrite=True)
-            print(f"Saved resampled file to: {out_path}")
+        # Easy to expand for NIRCam or HST later
+        self.scales = {
+            "MIRI": 0.11092,
+            "NIRCAM_LW": 0.063,
+            "NIRCAM_SW": 0.031
+        }
+        self.pixel_scale = self.scales.get(instrument, 0.1)
 
-def produce_cutouts(cat, indir, survey, x_arcsec, filter, base_dir, nan_thresh=0.4, png=False):
-    """
-    Produces cutout images from astronomical FITS files centred on catalogue positions.
-    
-    This function extracts square regions of specified size around the celestial coordinates
-    provided in a catalogue. It processes all FITS files in the input directory that match
-    the specified filter and preserves all image extensions in the output files.
-    
-    Parameters
-    ----------
-    cat : str
-        Path to the FITS catalogue file containing object IDs and coordinates.
-        Expected columns: 'id', 'ra', 'dec'.
-    
-    indir : str
-        Directory containing input FITS files to process.
-    
-    survey : str
-        Name of the survey. Used for naming output files and plot titles.
-    
-    x_arcsec : float
-        Size of the cutout in arcseconds (will be a square with this side length).
-    
-    filter : str
-        Filter name to select FITS files (e.g., 'F770W'). Will be used in filename matching.
-    
-    base_dir : str
-        Base directory for the cutouts folder
+    def _get_paths(self, survey, filter_name):
+        """Standardizes your folder structure across all projects."""
+        filter_dir = os.path.join(self.base_dir, survey, filter_name.upper())
+        paths = {
+            'fits': os.path.join(filter_dir, 'fits'),
+            'png': os.path.join(filter_dir, 'png')
+        }
+        for p in paths.values():
+            os.makedirs(p, exist_ok=True)
+        return paths
+
+    def check_quality(self, data, global_thresh=0.4, inner_thresh=0.05):
+        """The 'Center-Check' logic you requested."""
+        # Global check
+        if np.isnan(data).sum() / data.size > global_thresh:
+            return False
+            
+        # Inner 2x2" check
+        box_pix = int(2.0 / self.pixel_scale)
+        ny, nx = data.shape
+        inner = data[ny//2 - box_pix//2 : ny//2 + box_pix//2, 
+                     nx//2 - box_pix//2 : nx//2 + box_pix//2]
         
-    nan_thresh : float, optional
-        Maximum allowed fraction of NaN values in a cutout (default: 0.4).
-        Cutouts with more NaNs than this threshold will be discarded.
-    
-    png: bool, optional
-        If True, generates PNG preview images for each cutout. Defaults to False.
-    
-    Returns
-    -------
-    None
-        Files are written to disk at the specified output_dir.
-    
-    Notes
-    -----
-    The function assumes MIRI pixel scale of 0.11092 arcsec/pixel for calculating
-    cutout size in pixels. Adjust this value if using data from different instruments.
-    """
+        if (np.isnan(inner).sum() / inner.size) > inner_thresh:
+            return False
+        return True
 
-    # Extract survey name and observation number from the survey parameter
-    # 2. Extract survey name and observation number
-    if survey[-1].isdigit():
-        survey_name = survey[:-1]  # e.g. "primer"
-        obs = survey[-1]           # e.g. "1"
-    else:
-        survey_name = survey
-        obs = ''
-    
-    # 1. Build the nested path: base/folder_name/survey/filter/
-    # This creates: cutouts/primer1/F1800W/
-    filter_dir = os.path.join(base_dir, survey, filter.upper())
-    
-    # 2. Define specific subfolders for types
-    fits_dir = os.path.join(filter_dir, 'fits')
-    png_dir = os.path.join(filter_dir, 'png')
-    
-    # 3. Create all directories at once
-    os.makedirs(fits_dir, exist_ok=True)
-    if png:
-        os.makedirs(png_dir, exist_ok=True)
-    
-    # Load target catalogue with object IDs and coordinates
-    with fits.open(cat) as catalog_hdul:
-        cat_data = catalog_hdul[1].data
-        ids = cat_data['id']
-        ra = cat_data['ra']
-        dec = cat_data['dec']  
+    def run_survey(self, indir, survey_label, filter_name, size_arcsec=8.0, png=True):
+        """The main execution method."""
+        # 1. Create directory structure: base/survey/filter/fits
+        out_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "fits")
+        png_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "png")
+        os.makedirs(out_path, exist_ok=True)
+        if png: os.makedirs(png_path, exist_ok=True)
 
-    # Find all FITS files matching the requested filter
-    filter_l = filter.lower()
-    large_mosaics = glob.glob(os.path.join(indir, f"*{filter_l}*.fits"))
-    print(f"Found {len(large_mosaics)} FITS files from the {survey_name} survey with filter {filter}.")
-    print("Processing:")
-    for f in large_mosaics:
-        print(f"{f}")
-    
-    # Initialise counter for successful cutouts
-    counts = 0
-    total = len(ra)
-    
-    # Calculate cutout size in pixels based on MIRI instrument scale
-    miri_scale = 0.11092  # arcsec per pixel
-    x_pixels = int(np.round(x_arcsec/miri_scale))
-    cutout_size = (x_pixels, x_pixels)
+        # 2. Logic to find mosaics and loop...
+        # [The same logic you have now, but using self.ids, self.ras, etc.]
+        # Use self._check_quality() inside the loop
+        print(f"--- Processing {survey_label} | {filter_name} ---")
+        
+    def produce_cutouts(self, cat, survey, x_arcsec, filter, nan_thresh=0.4, png=False):
+        """
+        Produces cutout images from astronomical FITS files centred on catalogue positions.
+        
+        This function extracts square regions of specified size around the celestial coordinates
+        provided in a catalogue. It processes all FITS files in the input directory that match
+        the specified filter and preserves all image extensions in the output files.
+        
+        Parameters
+        ----------
+        cat : str
+            Path to the FITS catalogue file containing object IDs and coordinates.
+            Expected columns: 'id', 'ra', 'dec'.
+        
+        survey : str
+            Name of the survey. Used for naming output files and plot titles.
+        
+        x_arcsec : float
+            Size of the cutout in arcseconds (will be a square with this side length).
+        
+        filter : str
+            Filter name to select FITS files (e.g., 'F770W'). Will be used in filename matching.
+        
+        nan_thresh : float, optional
+            Maximum allowed fraction of NaN values in a cutout (default: 0.4).
+            Cutouts with more NaNs than this threshold will be discarded.
+        
+        png: bool, optional
+            If True, generates PNG preview images for each cutout. Defaults to False.
+        
+        Returns
+        -------
+        None
+            Files are written to disk at the specified output_dir.
+        """
+        base_dir = self.base_dir
+        indir = self.mosaic_dir
 
-    # Process each FITS file
-    for mosaic_file in large_mosaics:
-        with fits.open(mosaic_file) as hdul:
-            # Use extension 1 as the reference for WCS and field coverage check
-            ref_data = hdul['SCI'].data
-            ref_header = hdul['SCI'].header
-            ref_wcs = WCS(ref_header)
+        # Extract survey name and observation number from the survey parameter
+        # 2. Extract survey name and observation number
+        if survey[-1].isdigit():
+            survey_name = survey[:-1]  # e.g. "primer"
+            obs = survey[-1]           # e.g. "1"
+        else:
+            survey_name = survey
+            obs = ''
+        
+        # 1. Build the nested path: base/folder_name/survey/filter/
+        # This creates: cutouts/primer1/F1800W/
+        filter_dir = os.path.join(base_dir, survey, filter.upper())
+        
+        # 2. Define specific subfolders for types
+        fits_dir = os.path.join(filter_dir, 'fits')
+        png_dir = os.path.join(filter_dir, 'png')
+        
+        # 3. Create all directories at once
+        os.makedirs(fits_dir, exist_ok=True)
+        if png:
+            os.makedirs(png_dir, exist_ok=True)
+        
+        # Load target catalogue with object IDs and coordinates
+        with fits.open(cat) as catalog_hdul:
+            cat_data = catalog_hdul[1].data
+            ids = cat_data['id']
+            ra = cat_data['ra']
+            dec = cat_data['dec']  
 
-            # Process each galaxy from the catalogue
-            for i in range(total):
-                # Create SkyCoord object for the target position
-                target_coord = SkyCoord(ra[i], dec[i], unit=(u.deg, u.deg))
+        # Find all FITS files matching the requested filter
+        filter_l = filter.lower()
+        large_mosaics = glob.glob(os.path.join(indir, f"*{filter_l}*.fits"))
+        print(f"Found {len(large_mosaics)} FITS files from the {survey_name} survey with filter {filter}.")
+        print("Processing:")
+        for f in large_mosaics:
+            print(f"{f}")
+        
+        # Initialise counter for successful cutouts
+        counts = 0
+        total = len(ra)
+        
+        # Calculate cutout size in pixels based on MIRI instrument scale
+        pixel_scale = self.pixel_scale  # arcsec/pixel
+        x_pixels = int(np.round(x_arcsec/pixel_scale))
+        cutout_size = (x_pixels, x_pixels)
 
-                # Check if the target is within the field of view
-                try:
-                    x, y = ref_wcs.world_to_pixel(target_coord)
-                except Exception:
-                    # Skip if coordinate transformation fails
-                    continue
-                
-                # Skip if outside the bounds of the image
-                if not (0 <= x < ref_data.shape[1] and 0 <= y < ref_data.shape[0]):
-                    continue
+        # Process each FITS file
+        for mosaic_file in large_mosaics:
+            with fits.open(mosaic_file) as hdul:
+                # Use extension 1 as the reference for WCS and field coverage check
+                ref_data = hdul['SCI'].data
+                ref_header = hdul['SCI'].header
+                ref_wcs = WCS(ref_header)
 
-                # Initialise multi-extension FITS output file
-                cutout_hdul = fits.HDUList()
-                cutout_hdul.append(fits.PrimaryHDU(header=hdul[0].header))
+                # Process each galaxy from the catalogue
+                for i in range(total):
+                    # Create SkyCoord object for the target position
+                    target_coord = SkyCoord(ra[i], dec[i], unit=(u.deg, u.deg))
 
-                max_nan_ratio = 0.0
-
-                for ext in range(1, len(hdul)):
-                    hdu = hdul[ext]
-                    if hdu.data is None or hdu.data.ndim != 2:
+                    # Check if the target is within the field of view
+                    try:
+                        x, y = ref_wcs.world_to_pixel(target_coord)
+                    except Exception:
+                        # Skip if coordinate transformation fails
+                        continue
+                    
+                    # Skip if outside the bounds of the image
+                    if not (0 <= x < ref_data.shape[1] and 0 <= y < ref_data.shape[0]):
                         continue
 
-                    # Process just the SCI extension
-                    try:
-                        # 1. Grab the SCI extension (Index 1 in JWST files)
-                        sci_hdu = hdul['SCI']
-                        wcs = WCS(sci_hdu.header, naxis=2)
+                    # Initialise multi-extension FITS output file
+                    cutout_hdul = fits.HDUList()
+                    cutout_hdul.append(fits.PrimaryHDU(header=hdul[0].header))
 
-                        # 2. Create the cutout
-                        cutout = Cutout2D(sci_hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
+                    max_nan_ratio = 0.0
 
-                        # 3. Create the "Centered" Header
-                        new_wcs = cutout.wcs
-                        # Center pixel (0-based)
-                        center_f = (cutout.data.shape[0] - 1) / 2.0 
-                        # Update WCS keywords
-                        new_wcs.wcs.crpix = [center_f + 1, center_f + 1] # +1 for FITS standard
-                        new_wcs.wcs.crval = [target_coord.ra.deg, target_coord.dec.deg]
+                    for ext in range(1, len(hdul)):
+                        hdu = hdul[ext]
+                        if hdu.data is None or hdu.data.ndim != 2:
+                            continue
 
-                        # 4. Build the final Header
-                        # We copy the SCI header so we keep things like 'FILTER' and 'PHOTMJSR'
-                        new_header = sci_hdu.header.copy()
-                        new_header.update(new_wcs.to_header())
+                        # Process just the SCI extension
+                        try:
+                            # 1. Grab the SCI extension (Index 1 in JWST files)
+                            sci_hdu = hdul['SCI']
+                            wcs = WCS(sci_hdu.header, naxis=2)
+
+                            # 2. Create the cutout
+                            cutout = Cutout2D(sci_hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
+
+                            # 3. Create the "Centered" Header
+                            new_wcs = cutout.wcs
+                            # Center pixel (0-based)
+                            center_f = (cutout.data.shape[0] - 1) / 2.0 
+                            # Update WCS keywords
+                            new_wcs.wcs.crpix = [center_f + 1, center_f + 1] # +1 for FITS standard
+                            new_wcs.wcs.crval = [target_coord.ra.deg, target_coord.dec.deg]
+
+                            # 4. Build the final Header
+                            # We copy the SCI header so we keep things like 'FILTER' and 'PHOTMJSR'
+                            new_header = sci_hdu.header.copy()
+                            new_header.update(new_wcs.to_header())
+                            
+                        except Exception as e:
+                            print(f"Error creating cutout for {ids[i]}: {e}")
+
+                        # Calculate fraction of NaN values in the cutout
+                        nan_ratio = np.isnan(cutout.data).sum() / cutout.data.size
+                        max_nan_ratio = max(max_nan_ratio, nan_ratio)
+
+                        # Create output HDU with original extension name preserved
+                        cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
+                        if 'EXTNAME' in hdu.header:
+                            cutout_hdu.name = hdu.header['EXTNAME']
                         
-                    except Exception as e:
-                        print(f"Error creating cutout for {ids[i]}: {e}")
-
-                    # Calculate fraction of NaN values in the cutout
-                    nan_ratio = np.isnan(cutout.data).sum() / cutout.data.size
-                    max_nan_ratio = max(max_nan_ratio, nan_ratio)
-
-                    # Create output HDU with original extension name preserved
-                    cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
-                    if 'EXTNAME' in hdu.header:
-                        cutout_hdu.name = hdu.header['EXTNAME']
+                        # Add to output file
+                        cutout_hdul.append(cutout_hdu)
                     
-                    # Add to output file
-                    cutout_hdul.append(cutout_hdu)
-                
-                # Save the cutout if it meets quality criteria (not too many NaNs and has data extensions)
-                if max_nan_ratio < nan_thresh and len(cutout_hdul) > 1:
-                    
-                    # Generate PNG preview from extension 1 data
-                    preview_data = cutout_hdul[1].data
-                    
-                    # Calculate angle of rotation for NE cross
-                    angle = calculate_angle(mosaic_file)  
-                    print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
-                    
-                    if png:
-                        plt.figure(figsize=(6, 6))      
-
-                        interval = ZScaleInterval()
-                        vmin, vmax = interval.get_limits(preview_data)
-                        norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
-                        plt.imshow(preview_data, origin="lower", cmap="gray")
-                        plt.title(filter)
+                    # Save the cutout if it meets quality criteria (not too many NaNs and has data extensions)
+                    if max_nan_ratio < nan_thresh and len(cutout_hdul) > 1:
                         
-                        # Draw North/East compass
-                        ax = plt.gca()
-                        draw_compass(ax, angle_deg=angle)
+                        # Generate PNG preview from extension 1 data
+                        preview_data = cutout_hdul[1].data
                         
-                        png_filename = os.path.join(png_dir, f"{ids[i]}_{filter_l}_{survey}.png")
-                        plt.savefig(png_filename)
-                        plt.close()
-                    
-                    # Save multi-extension FITS cutout
-                    fits_filename = os.path.join(fits_dir, f"{ids[i]}_{filter_l}_{survey}.fits")
-                    cutout_hdul.writeto(fits_filename, overwrite=True)
-                    counts += 1
-                    
-                    print(f"Files were successfully saved to {filter_dir}.")
+                        # Calculate angle of rotation for NE cross
+                        angle = calculate_angle(mosaic_file)  
+                        print(f"Galaxy ID {ids[i]}: angle = {angle:.2f} degrees")
+                        
+                        if png:
+                            plt.figure(figsize=(6, 6))      
 
-    # Report completion statistics
-    print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
+                            interval = ZScaleInterval()
+                            vmin, vmax = interval.get_limits(preview_data)
+                            norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
+                            plt.imshow(preview_data, origin="lower", cmap="gray")
+                            plt.title(filter)
+                            
+                            # Draw North/East compass
+                            ax = plt.gca()
+                            draw_compass(ax, angle_deg=angle)
+                            
+                            png_filename = os.path.join(png_dir, f"{ids[i]}_{filter_l}_{survey}.png")
+                            plt.savefig(png_filename)
+                            plt.close()
+                        
+                        # Save multi-extension FITS cutout
+                        fits_filename = os.path.join(fits_dir, f"{ids[i]}_{filter_l}_{survey}.fits")
+                        cutout_hdul.writeto(fits_filename, overwrite=True)
+                        counts += 1
+                        
+                        print(f"Files were successfully saved to {filter_dir}.")
 
-
-def draw_compass(ax, angle_deg, size_pct=0.15):
-    """
-    Draw a North-East direction cross in the top-right corner of an image.
-    
-    Parameters
-    ----------
-    size_pct : float
-        Arrow length as a fraction of the cutout width (e.g. 0.15 = 15%).
-    offset_pct : float
-        Padding from the top-right corner as a fraction of the cutout width.
-    """
-    # 1. Get current axis limits (cutout size)
-    x_min, x_max = ax.get_xlim()
-    y_min, y_max = ax.get_ylim()
-    width = abs(x_max - x_min)
-    
-    # 2. Scale size and offset relative to the actual cutout dimensions
-    cross_size = width * size_pct
-    size = cross_size / 2
-    offset = 1.8 * size  # Padding from the corner
-
-    # 3. Set Origin (Top-Right, pushed INWARD)
-    # We subtract the offset so it doesn't overlap the border
-    x0 = x_max - offset
-    y0 = y_max - offset
-
-    # 4. Math for Vectors
-    # Note: DS9 North usually points towards higher Dec.
-    # angle_deg should be the angle of North relative to the +Y axis.
-    angle_rad = np.deg2rad(angle_deg)
-    
-    # North vector: sin/cos based on angle from Y-axis
-    # We subtract the components because the origin is at the top-right; 
-    # to stay inside the box, the vectors generally need to point 'down' or 'left'
-    # but the math handles this if we just use the angle correctly.
-    xN = x0 + size * np.sin(angle_rad)
-    yN = y0 + size * np.cos(angle_rad)
-
-    # East is typically +90 degrees from North in the coordinate system
-    # but in most FITS images, East is LEFT when North is UP.
-    east_angle_rad = angle_rad + np.pi/2
-    xE = x0 - size * np.sin(east_angle_rad)
-    yE = y0 - size * np.cos(east_angle_rad)
-
-    # 5. Draw N/E-lines
-    ax.plot([x0, xN], [y0, yN], color="yellow", lw=1.5, solid_capstyle='round')
-    ax.plot([x0, xE], [y0, yE], color="yellow", lw=1.5, solid_capstyle='round')
-
-    # 6. Labels with slight padding so they don't touch the lines
-    ax.text(xN + (size*0.3 * np.sin(angle_rad)), 
-            yN + (size*0.3 * np.cos(angle_rad)), 
-            "N", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
-    
-    ax.text(xE - (size*0.3 * np.sin(east_angle_rad)), 
-            yE - (size*0.3 * np.cos(east_angle_rad)), 
-            "E", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
-
-    # 7 Draw X/Y-lines
-    xX = x0 + size
-    yX = y0 # X only points to the right
-    
-    xY = x0 # Y only points up
-    yY = y0 + size
-
-    ax.plot([x0, xX], [y0, yX], color="cyan", lw=1.5, solid_capstyle='round')
-    ax.plot([x0, xY], [y0, yY], color="cyan", lw=1.5, solid_capstyle='round')
-
-    # 8. Labels with slight padding so they don't touch the lines
-    ax.text(xX + (size*0.2), 
-            yX, 
-            "X", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
-    
-    ax.text(xY, 
-            yY + (size*0.2), 
-            "Y", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
+        # Report completion statistics
+        print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
 
 
-def calculate_angle(fits_file):
-    with fits.open(fits_file) as hdul:
-        # Check for SCI extension or Primary
-        ext = 'SCI' if 'SCI' in hdul else 0
-        header = hdul[ext].header
-        w = WCS(header)
+    @staticmethod
+    def load_cutout(file_path, index=1):
+        """Loads a FITS cutout file and extracts the data, header, and WCS."""
+        try:
+            with fits.open(file_path) as hdu:
+                data = hdu[index].data
+                header = hdu[index].header
+                wcs = WCS(header)
+            return data, wcs
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            return None, None
 
-    # 1. Get the 'North' direction in pixel space
-    # We look at how the sky coordinates change at the center of the image
-    res = w.pixel_scale_matrix
-    
-    # The 'CD' or 'PC' matrix components
-    # cd[1,1] is change in Dec with Y, cd[0,1] is change in RA with Y
-    # This is the most robust way to find "Up" in celestial terms
-    cd = res
-    
-    # Calculate the angle of North relative to the Y-axis (Up)
-    # This automatically handles the PC matrix, scaling, and parity
-    angle = np.degrees(np.arctan2(cd[0, 1], cd[1, 1]))
-    
-    return angle
 
+    @staticmethod
+    def draw_compass(ax, angle_deg, size_pct=0.15):
+        """
+        Draw a North-East direction cross in the top-right corner of an image.
         
-def rotate_cutouts(cutout_dir, output_dir):
-    """Function that reads in cutout FITS files and rotates them so that their Y-axis 
-        aligns with north
+        Parameters
+        ----------
+        size_pct : float
+            Arrow length as a fraction of the cutout width (e.g. 0.15 = 15%).
+        offset_pct : float
+            Padding from the top-right corner as a fraction of the cutout width.
+        """
+        # 1. Get current axis limits (cutout size)
+        x_min, x_max = ax.get_xlim()
+        y_min, y_max = ax.get_ylim()
+        width = abs(x_max - x_min)
+        
+        # 2. Scale size and offset relative to the actual cutout dimensions
+        cross_size = width * size_pct
+        size = cross_size / 2
+        offset = 1.8 * size  # Padding from the corner
 
-    Args:
-        cutout_dir (str): Directory containing the larger cutouts
-        output_dir (str): Directory to store the rotated cutouts
-    """
-    fits_array = glob.glob(os.path.join(cutout_dir, "*.fits"))
-    print(f"Found {len(fits_array)} cutout FITS files.")
-    
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
+        # 3. Set Origin (Top-Right, pushed INWARD)
+        # We subtract the offset so it doesn't overlap the border
+        x0 = x_max - offset
+        y0 = y_max - offset
 
-    for fits_file in fits_array:
+        # 4. Math for Vectors
+        # Note: DS9 North usually points towards higher Dec.
+        # angle_deg should be the angle of North relative to the +Y axis.
+        angle_rad = np.deg2rad(angle_deg)
         
-        fname = os.path.basename(fits_file)
-        gal_id = fname.split('_')[0]
-        filter = fname.split('_')[1]
-        survey_obs = fname.split('_')[3]
+        # North vector: sin/cos based on angle from Y-axis
+        # We subtract the components because the origin is at the top-right; 
+        # to stay inside the box, the vectors generally need to point 'down' or 'left'
+        # but the math handles this if we just use the angle correctly.
+        xN = x0 + size * np.sin(angle_rad)
+        yN = y0 + size * np.cos(angle_rad)
+
+        # East is typically +90 degrees from North in the coordinate system
+        # but in most FITS images, East is LEFT when North is UP.
+        east_angle_rad = angle_rad + np.pi/2
+        xE = x0 - size * np.sin(east_angle_rad)
+        yE = y0 - size * np.cos(east_angle_rad)
+
+        # 5. Draw N/E-lines
+        ax.plot([x0, xN], [y0, yN], color="yellow", lw=1.5, solid_capstyle='round')
+        ax.plot([x0, xE], [y0, yE], color="yellow", lw=1.5, solid_capstyle='round')
+
+        # 6. Labels with slight padding so they don't touch the lines
+        ax.text(xN + (size*0.3 * np.sin(angle_rad)), 
+                yN + (size*0.3 * np.cos(angle_rad)), 
+                "N", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
         
-        # Check the survey obs
-        if '003' in survey_obs:
-            survey = 'primer'
-            obs = '003'
-        elif '004' in survey_obs:
-            survey = 'primer'
-            obs = '004'
-        elif 'cweb1' in survey_obs:
-            survey = 'cweb'
-            obs = '1'
-        elif 'cweb2' in survey_obs:
-            survey = 'cweb'
-            obs = '2'
-        elif 'cos3d1' in survey_obs:
-            survey = 'cos3d'
-            obs = '1'
-        elif 'cos3d2' in survey_obs:
-            survey = 'cos3d'
-            obs = '2'
-        else:
-            print(f"Unknown survey and/or observation number for galaxy {id}:\n")
-            print(survey_obs)
+        ax.text(xE - (size*0.3 * np.sin(east_angle_rad)), 
+                yE - (size*0.3 * np.cos(east_angle_rad)), 
+                "E", color="yellow", fontsize=10, ha="center", va="center", fontweight='bold')
+
+        # 7 Draw X/Y-lines
+        xX = x0 + size
+        yX = y0 # X only points to the right
         
-        angle = calculate_angle(fits_file)
+        xY = x0 # Y only points up
+        yY = y0 + size
+
+        ax.plot([x0, xX], [y0, yX], color="cyan", lw=1.5, solid_capstyle='round')
+        ax.plot([x0, xY], [y0, yY], color="cyan", lw=1.5, solid_capstyle='round')
+
+        # 8. Labels with slight padding so they don't touch the lines
+        ax.text(xX + (size*0.2), 
+                yX, 
+                "X", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
         
+        ax.text(xY, 
+                yY + (size*0.2), 
+                "Y", color="cyan", fontsize=10, ha="center", va="center", fontweight='bold')
+
+    @staticmethod
+    def calculate_angle(fits_file):
         with fits.open(fits_file) as hdul:
-            image_data = hdul[1].data
-            header = hdul[1].header
-            wcs = WCS(header)
-        
-        crpix_original = np.array([header['CRPIX1'], header['CRPIX2']])
-        crval_original = wcs.pixel_to_world(crpix_original[0], crpix_original[1])
+            # Check for SCI extension or Primary
+            ext = 'SCI' if 'SCI' in hdul else 0
+            header = hdul[ext].header
+            w = WCS(header)
 
-        theta = np.radians(angle)
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        rotation_matrix = np.array([[cos_t, -sin_t], 
-                                    [sin_t, cos_t]])
+        # 1. Get the 'North' direction in pixel space
+        # We look at how the sky coordinates change at the center of the image
+        res = w.pixel_scale_matrix
         
-        if 'PC1_1' in header and 'PC2_2' in header:
-            pc_matrix = np.array([[header['PC1_1'], header['PC1_2']],
-                                [header['PC2_1'], header['PC2_2']]])
-            rotation_matrix = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
-            new_pc_matrix = np.dot(rotation_matrix, pc_matrix)
+        # The 'CD' or 'PC' matrix components
+        # cd[1,1] is change in Dec with Y, cd[0,1] is change in RA with Y
+        # This is the most robust way to find "Up" in celestial terms
+        cd = res
         
-            # Update the PC matrix in the header
-            header['PC1_1'], header['PC1_2'] = new_pc_matrix[0]
-            header['PC2_1'], header['PC2_2'] = new_pc_matrix[1]
+        # Calculate the angle of North relative to the Y-axis (Up)
+        # This automatically handles the PC matrix, scaling, and parity
+        angle = np.degrees(np.arctan2(cd[0, 1], cd[1, 1]))
         
-        # Recompute the scale (CDELT1, CDELT2) based on new PC matrix
-        cdelt1_sign = np.sign(header.get('CDELT1', -1))  # Usually negative
-        cdelt2_sign = np.sign(header.get('CDELT2', 1))   # Usually positive
-
-        header['CDELT1'] = cdelt1_sign * np.sqrt(header['PC1_1']**2 + header['PC2_1']**2)
-        header['CDELT2'] = cdelt2_sign * np.sqrt(header['PC1_2']**2 + header['PC2_2']**2)
-
-        
-        new_wcs = WCS(header)
-        new_crpix = new_wcs.world_to_pixel(crval_original)
-
-        header['CRPIX1'] = np.round(new_crpix[0])
-        header['CRPIX2'] = np.round(new_crpix[1])
-
-        rotated_image = rotate(image_data, -angle, reshape=False, 
-                               order=1, cval=np.nan, mode='grid-constant')
-        
-        def crop_centered_array(array, x_arcsec):
-            """Crop a 2D NumPy array around the centre to the desired shape."""
-            y, x = array.shape
-            startx = x // 2 - x_arcsec // 2
-            starty = y // 2 - x_arcsec // 2
-            return array[starty:starty + x_arcsec, startx:startx + x_arcsec]
-        
-        # Crop cutout to 3x3 arcsec
-        miri_scale = 0.11092  # arcsec per pixel
-        arcsec = 3
-        x_arcsec = int(arcsec/miri_scale)
-        
-        cropped_data = crop_centered_array(rotated_image, x_arcsec)
-        
-        # Save the rotated FITS file
-        os.makedirs(output_dir, exist_ok=True)
-        output_file = os.path.join(output_dir, f'{gal_id}_{filter}_cutout_{survey}.fits')
-        hdu = fits.PrimaryHDU(cropped_data, header=header)
-        hdu.writeto(output_file, overwrite=True)
-        
-        print(f"Rotated image saved to {output_file}")
-        
-        
-        
+        return angle
