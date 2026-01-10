@@ -80,7 +80,7 @@ class RGBComposer:
         match = re.search(r'\d+', filter_name)
         return int(match.group()) if match else 0
 
-    def find_files_for_galaxy(self, gid):
+    def find_files(self, gid):
         """
         Scans directories to see what FITS files actually exist for this ID.
         Returns a dictionary: {filter_name: path_to_file}
@@ -107,7 +107,7 @@ class RGBComposer:
             
         return available
 
-    def determine_recipe(self, available_files):
+    def get_recipe(self, available_files):
         """
         Applies your logic to map available files to R, G, B channels.
         """
@@ -117,7 +117,6 @@ class RGBComposer:
             key=self.get_filter_wavelength
         )                
                 
-        nircam_path = available_files.get(self.nircam_anchor)
         count = len(miri_filters)
         
         # Helper to create a channel entry
