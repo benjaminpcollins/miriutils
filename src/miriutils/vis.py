@@ -71,6 +71,7 @@ class RGBComposer:
         self.cutout_dir = cutout_dir
         self.nircam_dir = nircam_dir
         self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Define our filter "anchor"
         self.nircam_anchor = 'F444W'
