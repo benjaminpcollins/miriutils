@@ -49,10 +49,16 @@ warnings.simplefilter("ignore", category=FITSFixedWarning)
 class CutoutManager:
     """A tool for generating multi-instrument astronomical cutouts."""
     
-    def __init__(self, base_dir, mosaic_dir, instrument="MIRI"):
+    def __init__(self, base_dir, survey_dict, catalogue, instrument="MIRI"):
         self.base_dir = base_dir
         self.instrument = instrument
-        self.mosaic_dir = mosaic_dir
+        self.survey_dict = survey_dict
+        
+        with fits.open(catalogue) as cat_hdul:
+            cat_data = cat_hdul[1].data
+            self.ids = cat_data['id']
+            self.ras = cat_data['ra']
+            self.decs = cat_data['dec']
         
         # Easy to expand for NIRCam or HST later
         self.scales = {
@@ -73,14 +79,14 @@ class CutoutManager:
             os.makedirs(p, exist_ok=True)
         return paths
 
-    def check_quality(self, data, global_thresh=0.4, inner_thresh=0.05):
+    def check_quality(self, data, global_thresh=0.4, inner_size_arcsec=2.0, inner_thresh=0.05):
         """The 'Center-Check' logic you requested."""
         # Global check
         if np.isnan(data).sum() / data.size > global_thresh:
             return False
             
-        # Inner 2x2" check
-        box_pix = int(2.0 / self.pixel_scale)
+        # Inner square check
+        box_pix = int(inner_size_arcsec / self.pixel_scale)
         ny, nx = data.shape
         inner = data[ny//2 - box_pix//2 : ny//2 + box_pix//2, 
                      nx//2 - box_pix//2 : nx//2 + box_pix//2]
@@ -89,18 +95,159 @@ class CutoutManager:
             return False
         return True
 
-    def run_survey(self, indir, survey_label, filter_name, size_arcsec=8.0, png=True):
-        """The main execution method."""
-        # 1. Create directory structure: base/survey/filter/fits
-        out_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "fits")
-        png_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "png")
-        os.makedirs(out_path, exist_ok=True)
-        if png: os.makedirs(png_path, exist_ok=True)
+    def is_target_in_fov(self, wcs, target_coord, shape):
+        """Checks if a SkyCoord is within the pixel bounds of an image."""
+        try:
+            x, y = wcs.world_to_pixel(target_coord)
+            return 0 <= x < shape[1] and 0 <= y < shape[0]
+        except Exception:
+            return False
+        
+    def create_galaxy_cutout(self, hdul, target_coord, cutout_size):
+        """Loops through all extensions to create a matched multi-extension HDUList."""
+        cutout_hdul = fits.HDUList([fits.PrimaryHDU(header=hdul[0].header)])
+        
+        # Loop through all extensions (skipping PrimaryHDU at 0)
+        for ext in range(1, len(hdul)):
+            hdu = hdul[ext]
+            if hdu.data is None or hdu.data.ndim != 2:
+                continue
 
-        # 2. Logic to find mosaics and loop...
-        # [The same logic you have now, but using self.ids, self.ras, etc.]
-        # Use self._check_quality() inside the loop
+            # Process just the SCI extension
+            try:
+                # 1. Grab the SCI extension (Index 1 in JWST files)
+                sci_hdu = hdul['SCI']
+                wcs = WCS(sci_hdu.header, naxis=2)
+
+                # 2. Create the cutout
+                cutout = Cutout2D(sci_hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
+
+                # 3. Create the "Centered" Header
+                new_wcs = cutout.wcs
+                # Center pixel (0-based)
+                center_f = (cutout.data.shape[0] - 1) / 2.0 
+                # Update WCS keywords
+                new_wcs.wcs.crpix = [center_f + 1, center_f + 1] # +1 for FITS standard
+                new_wcs.wcs.crval = [target_coord.ra.deg, target_coord.dec.deg]
+
+                # 4. Build the final Header
+                # We copy the SCI header so we keep things like 'FILTER' and 'PHOTMJSR'
+                new_header = sci_hdu.header.copy()
+                new_header.update(new_wcs.to_header())
+                
+            except Exception as e:
+                print(f"Error creating cutout for {self.ids[i]}: {e}")
+                return None
+
+            # Create output HDU with original extension name preserved
+            cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
+            if 'EXTNAME' in hdu.header:
+                cutout_hdu.name = hdu.header['EXTNAME']
+            
+            # Add to output file
+            cutout_hdul.append(cutout_hdu)
+                
+        return cutout_hdul
+    
+    def save_cutout_png(self, data, angle, filter_name, output_path):
+        """Generates the grayscale preview with the North/East compass."""
+        plt.figure(figsize=(6, 6))      
+        interval = ZScaleInterval()
+        
+        vmin, vmax = interval.get_limits(data)
+        norm = ImageNormalize(vmin=vmin, vmax=vmax, stretch=AsinhStretch())
+        
+        plt.imshow(data, origin="lower", cmap="gray")
+        plt.title(filter_name)
+        
+        # Draw North/East compass
+        ax = plt.gca()
+        self.draw_compass(ax, angle_deg=angle)
+        
+        plt.savefig(output_path)
+        plt.close()
+    
+    def run_survey(self, survey_label, filter_name, size_arcsec=8.0, png=True):
+        """The main execution method."""
+        
+        # Find all FITS files matching the requested filter
+        filter_l = filter_name.lower()
+        survey_name = survey_label.rstrip('0123456789').upper()
+        indir = self.survey_dict.get(survey_label, "")
+        large_mosaics = glob.glob(os.path.join(indir, f"*{filter_l}*.fits"))
+            
+        if len(large_mosaics) == 0:
+            print(f"⚠️ No FITS files found for survey label {survey_label} with filter {filter_name}.")
+            return
+        
+        print(f"✅ Found {len(large_mosaics)} FITS files from the {survey_name} survey with filter {filter_name}:")
+        for f in large_mosaics:
+            print(f"{f}")
+        
         print(f"--- Processing {survey_label} | {filter_name} ---")
+        
+        # Create directory structure: base/survey/filter/fits
+        fits_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "fits")
+        png_path = os.path.join(self.base_dir, survey_label, filter_name.upper(), "png")
+        os.makedirs(fits_path, exist_ok=True)
+        if png: os.makedirs(png_path, exist_ok=True)
+        
+        # Initialise counter for successful cutouts
+        counts = 0
+        total = len(self.ids)
+        
+        # Calculate cutout size in pixels based on MIRI instrument scale
+        pixel_scale = self.pixel_scale  # arcsec/pixel
+        x_pixels = int(np.round(size_arcsec/pixel_scale))
+        cutout_size = (x_pixels, x_pixels)
+        
+        print("Everything works until here")
+        
+        # Process each FITS file
+        for mosaic_file in large_mosaics:
+            with fits.open(mosaic_file) as hdul:
+                # Use extension 1 as the reference for WCS and field coverage check
+                ref_data = hdul['SCI'].data
+                ref_header = hdul['SCI'].header
+                ref_wcs = WCS(ref_header)
+
+                # Process each galaxy from the catalogue
+                for i in range(total):
+                    # Create SkyCoord object for the target position
+                    target_coord = SkyCoord(self.ras[i], self.decs[i], unit=(u.deg, u.deg))
+
+                    if not self.is_target_in_fov(ref_wcs, target_coord, ref_data.shape):
+                        continue
+                    
+                    print("Target in FOV:", self.ids[i], self.ras[i], self.decs[i])
+                    
+                    cutout_hdul = self.create_galaxy_cutout(hdul, target_coord, cutout_size)
+                    if cutout_hdul is None:
+                        continue
+                    
+                    # Save the cutout if it meets quality criteria (not too many NaNs and has data extensions)
+                    preview_data = cutout_hdul[1].data
+                    
+                    if self.check_quality(preview_data) == True:
+                        
+                        # Calculate angle of rotation for NE cross
+                        angle = self.calculate_angle(mosaic_file)  
+                        print(f"Galaxy ID {self.ids[i]}: angle = {angle:.2f} degrees")
+                        
+                        if png:
+                            output_path = os.path.join(png_path, f"{self.ids[i]}_{filter_l}_{survey_label}.png")
+                            self.save_cutout_png(preview_data, angle, filter_name, output_path)
+                        
+                        # Save multi-extension FITS cutout
+                        fits_filename = os.path.join(fits_path, f"{self.ids[i]}_{filter_l}_{survey_label}.fits")
+                        cutout_hdul.writeto(fits_filename, overwrite=True)
+                        counts += 1
+                        
+                        print(f"Files were successfully saved to {os.path.join(self.base_dir, survey_label, filter_name.upper())}.")
+
+        # Report completion statistics
+        print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
+        
         
     def produce_cutouts(self, cat, survey, x_arcsec, filter, nan_thresh=0.4, png=False):
         """
@@ -112,10 +259,7 @@ class CutoutManager:
         
         Parameters
         ----------
-        cat : str
-            Path to the FITS catalogue file containing object IDs and coordinates.
-            Expected columns: 'id', 'ra', 'dec'.
-        
+
         survey : str
             Name of the survey. Used for naming output files and plot titles.
         
