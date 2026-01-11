@@ -57,6 +57,7 @@ import re
 import glob
 import numpy as np
 from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from reproject import reproject_interp
@@ -70,6 +71,7 @@ class RGBComposer:
         self.cutout_dir = cutout_dir
         self.nircam_dir = nircam_dir
         self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # Define our filter "anchor"
         self.nircam_anchor = 'F444W'
@@ -209,12 +211,26 @@ class RGBComposer:
             
             with fits.open(chan_info['path']) as h:
                 # Passing h['SCI'] gives reproject the data + its WCS
-                data, footprint = reproject_interp(
-                    h['SCI'], 
+                raw_data = h['SCI'].data
+                
+                # 1. Calculate the robust background
+                # sigma=3.0 and maxiters=5 is standard for JWST
+                _, median_bkg, std_bkg = sigma_clipped_stats(raw_data, sigma=3.0, maxiters=5)
+                
+                # 2. Fill NaNs with the median background
+                # We use a copy to avoid modifying the original file data in memory
+                clean_data = np.where(np.isnan(raw_data), median_bkg, raw_data)
+                
+                # 3. Inject back into a temporary HDU for reprojection
+                # reproject_interp needs an object with a .header and .data
+                temp_hdu = fits.ImageHDU(data=clean_data, header=h['SCI'].header)
+                
+                data, _ = reproject_interp(
+                    temp_hdu, 
                     target_wcs, 
                     shape_out=(crop_pix, crop_pix)
                 )
-                processed_arrays[chan] = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
+                processed_arrays[chan] = data
         
         return processed_arrays, target_wcs
     
