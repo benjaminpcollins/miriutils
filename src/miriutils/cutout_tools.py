@@ -79,21 +79,37 @@ class CutoutManager:
             os.makedirs(p, exist_ok=True)
         return paths
 
-    def check_quality(self, data, global_thresh=0.4, inner_size_arcsec=2.0, inner_thresh=0.05):
-        """The 'Center-Check' logic you requested."""
-        # Global check
+    def check_quality(self, data, global_thresh=0.4, inner_thresh=0.05, radius_arcsec=2.0):
+        """
+        Performs quality check using a global threshold and a circular central mask.
+        """
+        # 1. Global Check (Total NaNs in the whole 8x8" frame)
         if np.isnan(data).sum() / data.size > global_thresh:
             return False
-            
-        # Inner square check
-        box_pix = int(inner_size_arcsec / self.pixel_scale)
-        ny, nx = data.shape
-        inner = data[ny//2 - box_pix//2 : ny//2 + box_pix//2, 
-                     nx//2 - box_pix//2 : nx//2 + box_pix//2]
         
-        if (np.isnan(inner).sum() / inner.size) > inner_thresh:
-            return False
-        return True
+        # 2. Circular Centre Check
+        ny, nx = data.shape
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        
+        # Convert radius from arcsec to pixels
+        r_pix = radius_arcsec / self.pixel_scale
+        
+        # Create a coordinate grid
+        y, x = np.ogrid[:ny, :nx]
+        
+        # Calculate squared distance from center (more efficient than sqrt)
+        dist_sq = (x - cx)**2 + (y - cy)**2
+        
+        # Create the circular mask
+        mask = dist_sq <= r_pix**2
+        
+        # Extract data within the circle
+        central_pixels = data[mask]
+        
+        # Calculate NaN ratio within the circle
+        inner_nan_ratio = np.isnan(central_pixels).sum() / central_pixels.size
+        
+        return inner_nan_ratio <= inner_thresh
 
     def is_target_in_fov(self, wcs, target_coord, shape):
         """Checks if a SkyCoord is within the pixel bounds of an image."""
@@ -167,7 +183,7 @@ class CutoutManager:
         plt.savefig(output_path)
         plt.close()
     
-    def run_survey(self, survey_label, filter_name, size_arcsec=8.0, png=True):
+    def run_survey(self, survey_label, filter_name, size_arcsec=8.0, png=True, overwrite=False):
         """The main execution method."""
         
         # Find all FITS files matching the requested filter
@@ -192,6 +208,27 @@ class CutoutManager:
         os.makedirs(fits_path, exist_ok=True)
         if png: os.makedirs(png_path, exist_ok=True)
         
+        # --- NEW: Overwrite/Cleanup Logic ---
+        if overwrite:
+            print(f"!!! Overwrite is TRUE. Cleaning old files in {survey_label}/{filter_name}...")
+            # Determine which folders to check based on the 'png' flag
+            folders_to_clean = [fits_path]
+            if png:
+                folders_to_clean.append(png_path)
+
+            for target_dir in folders_to_clean:
+                # Check if the folder exists and has elements in it
+                if os.path.exists(target_dir) and len(os.listdir(target_dir)) > 0:
+                                        
+                    # Run the deletion loop
+                    files = glob.glob(os.path.join(target_dir, "*"))
+                    for f in files:
+                        try:
+                            os.remove(f)
+                        except OSError as e:
+                            print(f"Error deleting {f}: {e}")
+        # ------------------------------------
+        
         # Initialise counter for successful cutouts
         counts = 0
         total = len(self.ids)
@@ -200,9 +237,7 @@ class CutoutManager:
         pixel_scale = self.pixel_scale  # arcsec/pixel
         x_pixels = int(np.round(size_arcsec/pixel_scale))
         cutout_size = (x_pixels, x_pixels)
-        
-        print("Everything works until here")
-        
+                
         # Process each FITS file
         for mosaic_file in large_mosaics:
             with fits.open(mosaic_file) as hdul:
@@ -218,9 +253,7 @@ class CutoutManager:
 
                     if not self.is_target_in_fov(ref_wcs, target_coord, ref_data.shape):
                         continue
-                    
-                    print("Target in FOV:", self.ids[i], self.ras[i], self.decs[i])
-                    
+                                        
                     cutout_hdul = self.create_galaxy_cutout(hdul, target_coord, cutout_size)
                     if cutout_hdul is None:
                         continue
@@ -232,18 +265,22 @@ class CutoutManager:
                         
                         # Calculate angle of rotation for NE cross
                         angle = self.calculate_angle(mosaic_file)  
-                        print(f"Galaxy ID {self.ids[i]}: angle = {angle:.2f} degrees")
+                        #print(f"Galaxy ID {self.ids[i]}: angle = {angle:.2f} degrees")
                         
                         if png:
                             output_path = os.path.join(png_path, f"{self.ids[i]}_{filter_l}_{survey_label}.png")
-                            self.save_cutout_png(preview_data, angle, filter_name, output_path)
+                            if not os.path.exists(output_path) or overwrite:
+                                self.save_cutout_png(preview_data, angle, filter_name, output_path)
                         
                         # Save multi-extension FITS cutout
                         fits_filename = os.path.join(fits_path, f"{self.ids[i]}_{filter_l}_{survey_label}.fits")
-                        cutout_hdul.writeto(fits_filename, overwrite=True)
+                        
+                        if not os.path.exists(fits_filename) or overwrite:
+                            cutout_hdul.writeto(fits_filename, overwrite=True)
+                        
                         counts += 1
                         
-                        print(f"Files were successfully saved to {os.path.join(self.base_dir, survey_label, filter_name.upper())}.")
+        print(f"Files were successfully saved to {os.path.join(self.base_dir, survey_label, filter_name.upper())}.")
 
         # Report completion statistics
         print(f"Produced cutouts for {counts} of {total} galaxies in the catalogue.")
