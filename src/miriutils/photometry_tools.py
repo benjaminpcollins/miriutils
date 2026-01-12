@@ -64,18 +64,67 @@ from astropy.wcs import WCS
 from photutils.centroids import centroid_com
 from photutils.segmentation import SegmentationImage, detect_sources
 
-from .cutout_tools import load_cutout
-
 class MIRIPipeline:
-    def __init__(self, cutouts_dir, output_dir):
+    def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, scaling_exceptions_file=None):
         self.cutouts_dir = cutouts_dir
         self.output_dir = output_dir
+        self.nircam_dir = nircam_dir
         
+        # 1. Load Master Table first to get all IDs
+        self.master_table = Table.read(aperture_table)
+        # Ensure IDs are integers (cleaning the 'b' bytes issue we discussed)
+        self.all_ids = [int(val.decode('utf-8') if isinstance(val, bytes) else val) 
+                        for val in self.master_table['ID']]
+        self.all_ids = sorted(set(self.all_ids))
+        
+        # 2. Handle Scaling Exceptions File
+        if scaling_exceptions_file is None:
+            # Default name in the output directory if none provided
+            scaling_exceptions_file = os.path.join(self.output_dir, "scaling_config.csv")
+
+        self.scaling_exceptions_path = scaling_exceptions_file
+        self.scaling_exceptions = self._initialise_scaling_config()
+
         # Internal storage for results
         self.raw_results = [] 
         
         os.makedirs(self.output_dir, exist_ok=True)
 
+    def _initialise_scaling_config(self):
+        """Creates a template CSV if missing; otherwise loads existing values."""
+        if not os.path.exists(self.scaling_exceptions_path):
+            print(f"Creating new scaling config template: {self.scaling_exceptions_path}")
+            
+            instructions = [
+                "# MIRI Photometry Pipeline: Scaling Configuration",
+                "# Edit the Scale_Factor column for individual galaxies.",
+                "# Default factor is 2.0. Factors are multipliers for the NIRCam aperture size.",
+                "# Comments can contain any text. Commas are allowed (Pandas handles quoting).",
+                "# --------------------------------------------------------------------------"
+            ]
+            
+            # Create a dataframe with all IDs and a default scale factor of 2.0
+            df = pd.DataFrame({
+                'ID': self.all_ids,
+                'Scale_Factor': [2.0] * len(self.all_ids),
+                'Comment': ["" for _ in self.all_ids]
+            })
+            
+            with open(self.scaling_exceptions_path, 'w') as f:
+                for line in instructions:
+                    f.write(line + "\n")
+                # Use index=False to keep it clean. 
+                # Pandas will automatically wrap comments in quotes if they contain commas.
+                df.to_csv(f, index=False)
+                
+            return dict(zip(df['ID'], df['Scale_Factor']))
+        
+        else:
+            print(f"Loading existing scaling config: {self.scaling_exceptions_path}")
+            df = pd.read_csv(self.scaling_exceptions_path)
+            # Ensure IDs in the CSV are treated as ints for dictionary matching
+            return dict(zip(df['ID'].astype(int), df['Scale_Factor']))
+    
     def find_files(self, gid, priority=['primer', 'cweb', 'cos3d']):
         """
         Finds one file per filter using the directory structure as the source of truth.
@@ -114,7 +163,47 @@ class MIRIPipeline:
             if best_file_for_filter:
                 selected_files.append(best_file_for_filter)
                 
-        return selected_files
+        return selected_files if len(selected_files) > 0 else None
+    
+    def parse_path_metadata(self, file_path):
+        """
+        Extracts metadata from the directory structure.
+        Example path: .../cos3d1/F1000W/fits/13297_f1000w_cos3d1.fits
+        """
+        path_parts = file_path.split(os.sep)
+        
+        # Extract from directory names for reliability
+        survey_obs = path_parts[-4] # e.g., 'cos3d1'
+        filter_name = path_parts[-3] # e.g., 'F1000W'
+        filename = path_parts[-1]
+        galaxy_id = filename.split('_')[0]
+        
+        return {
+            "id": galaxy_id,
+            "filter": filter_name,
+            "survey_obs": survey_obs,
+            "full_path": file_path
+        }
+        
+    def get_pixel_scale(self, gid, wcs_miri, wcs_nircam):
+        # 1. Get exact pixel scales from WCS (in deg/pixel)
+        miri_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_miri.pixel_scale_matrix))) # ~0.11
+        nircam_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_nircam.pixel_scale_matrix))) # ~0.03
+        
+        # 2. Basic conversion (arcsec-to-pixel ratio)
+        return nircam_pix_scale / miri_pix_scale
+        
+        
+    def get_wcs_rotation(self, wcs):
+        # This works regardless of whether the header uses CD or PC
+        pc = wcs.wcs.get_pc()
+        
+        # arctan2(y, x) -> result is in radians
+        rot_rad = np.arctan2(pc[0, 1], pc[1, 1])
+        
+        # Explicit conversion so your 'Apr_Theta' matching is safe
+        return np.degrees(rot_rad)
+    
     
     def prepare_aperture(self, file_path, rescale=True):
         """
@@ -125,11 +214,11 @@ class MIRIPipeline:
         5. Apply Rotation and Rescaling
         """
         meta = self.parse_path_metadata(file_path)
-        gid = int(meta['gid'])
+        gid = int(meta['id'])
 
         # --- 1. Load Master Aperture ---
         # Assuming self.master_table is already loaded in __init__
-        matches = self.master_table[self.master_table["ID"] == gid]
+        matches = self.master_table[self.master_table["ID"] == str(gid)]
         if len(matches) == 0:
             print(f"Warning: Galaxy {gid} not in catalogue.")
             return None
@@ -137,16 +226,19 @@ class MIRIPipeline:
 
         # --- 2. Load MIRI and NIRCam WCS ---
         with fits.open(file_path) as hdu_miri:
-            wcs_miri = WCS(hdu_miri[0].header)
-            data_miri = hdu_miri[0].data
+            wcs_miri = WCS(hdu_miri['SCI'].header)
+            data_miri = hdu_miri['SCI'].data
+            
             # Get rotation directly from header logic
-            miri_rotation = wcs_miri.to_header().get('ORIENTAT', 0.0)
+            miri_rotation = self.get_wcs_rotation(wcs_miri)
 
         nircam_path = os.path.join(self.nircam_dir, f"{gid}_F444W_cutout.fits")
         with fits.open(nircam_path) as hdu_ni:
-            wcs_ni = WCS(hdu_ni[0].header)
-            ni_rotation = wcs_ni.to_header().get('ORIENTAT', 0.0)
-
+            wcs_ni = WCS(hdu_ni['SCI'].header)
+            
+            # Get rotation directly from header logic
+            ni_rotation = self.get_wcs_rotation(wcs_ni)
+            
         # --- 3. Coordinate Transformation ---
         # Project NIRCam pixel center to World (RA/Dec) then to MIRI pixels
         sky_coord = wcs_ni.pixel_to_world(row["Apr_Xcenter"], row["Apr_Ycenter"])
@@ -155,25 +247,92 @@ class MIRIPipeline:
         # --- 4. Rotation Logic ---
         # The change in rotation between the two images
         delta_rot = miri_rotation - ni_rotation
-        new_theta = (row["Apr_Theta"] + delta_rot) % 180
-
+        new_theta = (row["Apr_Theta"] - delta_rot) % 180
+        
         # --- 5. Rescaling Logic ---
-        scale_factor = self.get_scale_factor(gid, rescale)
-        # Convert NIRCam pix scale to MIRI pix scale
-        # (Assuming standard JWST scales if headers vary)
-        pixel_ratio = 0.03 / 0.11092 
-        total_scale = pixel_ratio * scale_factor
-
+        pixel_conversion = self.get_pixel_scale(gid, wcs_miri, wcs_ni)
+        
+        # Lookup the user multiplier (default to 2.0 if ID not in exceptions)
+        # self.scaling_exceptions is a dict loaded from a CSV in __init__
+        multiplier = self.scaling_exceptions.get(int(gid), 2.0)
+        
+        # Always rescale pixels from NIRCam to MIRI
+        # Only rescale apertures additionally if rescale=True
+        total_scale = pixel_conversion * multiplier if rescale else pixel_conversion
+        
+        # Apply total scaling to apertures
+        a_rescaled = row["Apr_A"] * total_scale
+        b_rescaled = row["Apr_B"] * total_scale
+        
         return {
             "id": gid,
+            # Store information about the modified MIRI aperture
             "x": miri_x,
             "y": miri_y,
-            "a": row["Apr_A"] * total_scale,
-            "b": row["Apr_B"] * total_scale,
+            "a": a_rescaled/2,
+            "b": b_rescaled/2,
             "theta": new_theta,
-            "data": data_miri, # Pass data along for background/flux steps
+            # Store information about the original aperture
+            "orig_a": (row["Apr_A"]/2) * pixel_conversion,
+            "orig_b": (row["Apr_B"]/2) * pixel_conversion,
+            "orig_theta": row["Apr_Theta"],
+            # Store data and metadata
+            "data": data_miri, 
             "meta": meta
         }
+    
+    def plot_apertures_multiband(self, results_list, output_dir=None):
+        """
+        results_list: A list of dictionaries returned by prepare_aperture for ONE galaxy.
+        """
+        # Sort by wavelength: Extract the number from 'F770W', 'F1000W', etc.
+        # This ensures F770W comes before F1000W
+        results_list.sort(key=lambda x: int(''.join(filter(str.isdigit, x['meta']['filter']))))
+        n_bands = len(results_list)
+        fig, axes = plt.subplots(1, n_bands, figsize=(4 * n_bands, 4), squeeze=False)
+        
+        for i, params in enumerate(results_list):
+            ax = axes[0, i]
+            data = params["data"]
+            filt = params["meta"]["filter"]
+            survey_obs = params["meta"]["survey_obs"]
+            
+            # Robust scaling per band
+            vmin, vmax = np.nanpercentile(data, [10, 99.5])
+            
+            ax.imshow(data, origin="lower", cmap="magma", vmin=vmin, vmax=vmax)
+            
+            # Draw the aperture (remembering photutils needs radians)
+            ap = EllipticalAperture((params["x"], params["y"]), 
+                                a=params["a"], b=params["b"], 
+                                theta=np.radians(params["theta"]))
+            ap.plot(ax=ax, color="cyan", lw=2, label="MIRI Adjusted")
+            
+            if i == 0:
+                ap_orig = EllipticalAperture((params["x"], params["y"]), 
+                                        a=params["orig_a"], 
+                                        b=params["orig_b"], 
+                                        theta=np.radians(params["orig_theta"]))
+                ap_orig.plot(ax=ax, color="red", lw=1.5, label="NIRCam Original", alpha=0.7)
+                ax.legend(loc="upper right", fontsize=8)
+                
+            # Zoom to 4" x 4" (approx 40x40 MIRI pixels)
+            ax.set_xlim(params["x"] - 20, params["x"] + 20)
+            ax.set_ylim(params["y"] - 20, params["y"] + 20)
+            ax.set_title(f"{filt} | {survey_obs}")
+            ax.axis('off')
+        
+        galaxy_id = results_list[0]['id']
+        
+        plt.suptitle(f"Galaxy ID: {galaxy_id}", fontsize=14)
+        if output_dir is None:
+            aperture_dir = os.path.join(self.output_dir, "aperture_plots")
+        os.makedirs(aperture_dir, exist_ok=True)
+        out_path = os.path.join(aperture_dir, f"{galaxy_id}_multiband.png")
+        plt.savefig(out_path, bbox_inches='tight', dpi=150)
+        plt.close()
+    
+    
 
     def run_photometry(self, filter_name, apply_aper_corr=False):
         """
@@ -181,6 +340,9 @@ class MIRIPipeline:
         """
         files = self.select_files(filter_name)
         filter_results = []
+        
+        custom_count = sum(1 for v in self.scaling_exceptions.values() if v != 2.0)
+        print(f"Processing photometry using {custom_count} custom scale factors.")
         
         for fits_path in files:
             # 1. Adjust apertures to MIRI
@@ -205,8 +367,7 @@ class MIRIPipeline:
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
 
-def adjust_aperture(
-    galaxy_id, filter, survey, obs, output_folder, mask_folder=None, rescale=True):
+def adjust_aperture(galaxy_id, filter, survey, obs, output_folder, mask_folder=None, rescale=True):
     # --- Load the FITS table ---
     table_path = "/Users/benjamincollins/University/master/Red_Cardinal/photometry/phot_tables/Flux_Aperture_PSFMatched_AperCorr_old.fits"
     aperture_table = Table.read(table_path)
