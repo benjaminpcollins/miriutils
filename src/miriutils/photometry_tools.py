@@ -121,11 +121,11 @@ class MIRIPipeline:
         
         else:
             print(f"Loading existing scaling config: {self.scaling_exceptions_path}")
-            df = pd.read_csv(self.scaling_exceptions_path)
+            df = pd.read_csv(self.scaling_exceptions_path, comment="#")
             # Ensure IDs in the CSV are treated as ints for dictionary matching
             return dict(zip(df['ID'].astype(int), df['Scale_Factor']))
     
-    def find_files(self, gid, priority=['primer', 'cweb', 'cos3d']):
+    def find_files(self, gid, priority=['primer', 'cweb', 'cos3d1', 'cos3d2']):
         """
         Finds one file per filter using the directory structure as the source of truth.
         Structure: .../survey_obs/FILTER/fits/12345_f770w_obs.fits
@@ -247,7 +247,7 @@ class MIRIPipeline:
         # --- 4. Rotation Logic ---
         # The change in rotation between the two images
         delta_rot = miri_rotation - ni_rotation
-        new_theta = (row["Apr_Theta"] - delta_rot) % 180
+        new_theta_deg = (row["Apr_Theta"] + delta_rot) % 180 * u.deg
         
         # --- 5. Rescaling Logic ---
         pixel_conversion = self.get_pixel_scale(gid, wcs_miri, wcs_ni)
@@ -271,11 +271,11 @@ class MIRIPipeline:
             "y": miri_y,
             "a": a_rescaled/2,
             "b": b_rescaled/2,
-            "theta": new_theta,
+            "theta": -np.radians(new_theta_deg),
             # Store information about the original aperture
             "orig_a": (row["Apr_A"]/2) * pixel_conversion,
             "orig_b": (row["Apr_B"]/2) * pixel_conversion,
-            "orig_theta": row["Apr_Theta"],
+            "orig_theta": -np.radians(row["Apr_Theta"] * u.deg),
             # Store data and metadata
             "data": data_miri, 
             "meta": meta
@@ -331,6 +331,8 @@ class MIRIPipeline:
         out_path = os.path.join(aperture_dir, f"{galaxy_id}_multiband.png")
         plt.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close()
+        
+        
     
     
 
