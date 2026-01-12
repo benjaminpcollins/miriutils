@@ -64,6 +64,10 @@ from astropy.wcs import WCS
 from photutils.centroids import centroid_com
 from photutils.segmentation import SegmentationImage, detect_sources
 
+# Suppress common WCS-related warnings that don't affect functionality
+warnings.simplefilter("ignore", category=FITSFixedWarning)
+
+
 class MIRIPipeline:
     def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, scaling_exceptions_file=None):
         self.cutouts_dir = cutouts_dir
@@ -336,6 +340,86 @@ class MIRIPipeline:
         plt.close()
         
 
+    def estimate_background(self, aperture_params, sigma_val=3.0):
+        """
+        Fits a 2D plane to the image (excluding sources) and calculates 
+        local statistics in an elliptical annulus.
+        """
+        data = aperture_params["data"]
+        x, y = aperture_params["x"], aperture_params["y"]
+        a, b = aperture_params["a"], aperture_params["b"]
+        theta = aperture_params["theta"] # Already in Radians from prepare_aperture
+        gid = aperture_params["id"]
+
+        # 1. Create Source Mask
+        source_ap = EllipticalAperture((x, y), a=a, b=b, theta=theta)
+        source_mask = source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
+        
+        # 2. Initial Sigma Clipping & Source Detection for Masking
+        # We ignore the source and NaNs
+        init_mask = source_mask | np.isnan(data)
+        _, median_bg, std_bg = sigma_clipped_stats(data, sigma=2.5, mask=init_mask)
+        
+        threshold = median_bg + (sigma_val * std_bg)
+        # Detect other sources in the field to exclude from background fit
+        segm = detect_sources(data, threshold, npixels=5)
+        segm_mask = (segm.data > 0) if segm else np.zeros_like(data, dtype=bool)
+        
+        # Combined mask: Source + other objects + NaNs
+        combined_mask = source_mask | segm_mask | np.isnan(data)
+        
+        # 3. 2D Plane Fit (Global Gradient)
+        yi, xi = np.indices(data.shape)
+        fit_mask = ~combined_mask
+        
+        A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
+        z = data[fit_mask]
+        
+        if len(z) < 10: # Safety check
+            coeffs = [0, 0, median_bg] # Fallback to flat median
+        else:
+            coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+        
+        alpha, beta, gamma = coeffs
+        background_plane = alpha * xi + beta * yi + gamma
+        data_bkgsub = data - background_plane
+
+        # 4. Define Local Annulus for Statistics
+        # For publication: define annulus relative to aperture size
+        a_in, b_in = a + 5, b + 5 
+        
+        # Dynamic outer radius based on image bounds to prevent crashes
+        img_h, img_w = data.shape
+        dist_to_edge = min(x, img_w - x, y, img_h - y)
+        a_out = max(a_in + 2, dist_to_edge - 2)
+        b_out = a_out * (b/a) # Maintain aspect ratio
+
+        annulus = EllipticalAnnulus((x, y), a_in=a_in, a_out=a_out, 
+                                    b_in=b_in, b_out=b_out, theta=theta)
+        
+        ann_mask = annulus.to_mask(method='center').to_image(data.shape).astype(bool)
+        # Only use pixels that are in the annulus AND not a detected source
+        bkg_pixels_mask = ann_mask & ~combined_mask
+        
+        # 5. Final Stats
+        bkg_residuals = data_bkgsub[bkg_pixels_mask]
+        if len(bkg_residuals) > 0:
+            sigma_bkg = np.std(bkg_residuals)
+            # Propagation of error: Std dev of the mean background across aperture area
+            background_std = sigma_bkg * np.sqrt(source_ap.area)
+            background_median = np.median(bkg_residuals)
+        else:
+            background_std, background_median = 0, 0
+
+        return {
+            "median": background_median,
+            "std": background_std,
+            "plane": background_plane,
+            "subtracted": data_bkgsub,
+            "annulus": annulus,
+            "source_ap": source_ap
+        }
+
     def run_photometry(self, filter_name, apply_aper_corr=False):
         """
         Wraps the 1300-line logic but keeps it organized.
@@ -365,156 +449,6 @@ class MIRIPipeline:
 
 
 
-# Suppress common WCS-related warnings that don't affect functionality
-warnings.simplefilter("ignore", category=FITSFixedWarning)
-
-
-def adjust_aperture(galaxy_id, filter, survey, obs, output_folder, mask_folder=None, rescale=True):
-    # --- Load the FITS table ---
-    table_path = "/Users/benjamincollins/University/master/Red_Cardinal/photometry/phot_tables/Flux_Aperture_PSFMatched_AperCorr_old.fits"
-    aperture_table = Table.read(table_path)
-    # table_path =  '/Users/benjamincollins/University/master/Red_Cardinal/catalogues/aperture_table.csv'
-    # df = pd.read_csv(table_path)
-
-    # --- Select the galaxy by ID ---
-    matches = aperture_table[aperture_table["ID"] == galaxy_id]
-    if len(matches) == 0:
-        print(f"Galaxy ID {galaxy_id} not found in the table.")
-        return None
-    else:
-        row = matches[0]
-    # row = df[df['ID'] == galaxy_id].iloc[0]
-
-    # --- Read in rotation angle of MIRI FITS file ---
-    angle_file = (
-        "/Users/benjamincollins/University/master/Red_Cardinal/rotation_angles.json"
-    )
-    with open(angle_file, "r") as f:
-        angles = json.load(f)
-    angle = angles[f"angle_{survey}{obs}"]
-
-    # --- Read WCS from NIRCam image ---
-    nircam_path = f"/Users/benjamincollins/University/master/Red_Cardinal/NIRCam/F444W_cutouts/{galaxy_id}_F444W_cutout.fits"
-    nircam_data, nircam_wcs = load_cutout(nircam_path)
-
-    # --- Convert NIRCam pixel coordinates to sky ---
-    sky_coord = nircam_wcs.pixel_to_world(row["Apr_Xcenter"], row["Apr_Ycenter"])
-
-    # --- Open MIRI cutout image ---
-    miri_path = f"/Users/benjamincollins/University/master/Red_Cardinal/cutouts_phot/{galaxy_id}_{filter}_cutout_{survey}{obs}.fits"
-    miri_data, miri_wcs = load_cutout(miri_path)
-
-    # --- Convert sky coords to MIRI pixel coordinates ---
-    miri_x, miri_y = miri_wcs.world_to_pixel(sky_coord)
-
-    # --- Create elliptical region in MIRI pixel space ---
-    nircam_scale = 0.03  # arcsec/pixel
-    miri_scale = 0.11092  # arcsec per pixel
-
-    # arcsec/pixel
-    scale_factor = nircam_scale / miri_scale
-    pixel_conversion = scale_factor
-
-    ####################################################
-    ### Additional rescaling of the NIRCam apertures ###
-    ####################################################
-
-    if rescale == True:
-        if int(galaxy_id) == 12332:
-            scale_factor *= 1.0  # no additional scaling to avoid contaminating source
-        elif int(galaxy_id) in [7136, 7904, 7922, 11136, 16419, 21452]:
-            scale_factor *= 1.6
-        elif int(galaxy_id) in [7934, 10314, 10592, 18332]:
-            scale_factor *= 1.8
-        else:
-            scale_factor *= 2.0
-    else:
-        scale_factor *= 1.0  # no rescaling, use original aperture sizes
-
-    # --- Specify parameters for the ellipse ---
-    width = row["Apr_A"] * scale_factor
-    height = row["Apr_B"] * scale_factor
-    theta = -row["Apr_Theta"]
-    theta_new = ((theta - angle) % 180) * u.deg
-
-    if mask_folder:
-        # --- Clean and prepare the MIRI data for plotting ---
-        miri_clean = np.copy(miri_data)
-        finite_vals = miri_clean[np.isfinite(miri_clean)].flatten()
-
-        # Sort and get lowest 80% values
-        sorted_vals = np.sort(finite_vals)
-        cutoff_index = int(0.8 * len(sorted_vals))
-        background_vals = sorted_vals[:cutoff_index]
-        background_mean = np.mean(background_vals)
-
-        # Replace NaNs or infs with background mean
-        miri_clean[~np.isfinite(miri_clean)] = background_mean
-
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.imshow(
-            miri_clean,
-            origin="lower",
-            cmap="gray",
-            vmin=np.percentile(miri_clean, 5),
-            vmax=np.percentile(miri_clean, 99),
-        )
-
-        # Original ellipse (without rotation correction)
-        ellipse_original = Ellipse(
-            xy=(miri_x, miri_y),
-            width=row["Apr_A"] * pixel_conversion,  # Here we just
-            height=row["Apr_B"] * pixel_conversion,  # leave the
-            angle=theta,  # original values
-            edgecolor="red",
-            facecolor="none",
-            # linestyle='--',
-            lw=2,
-            label="Original",
-        )
-        ax.add_patch(ellipse_original)
-
-        ellipse = Ellipse(
-            xy=(miri_x, miri_y),
-            width=width,
-            height=height,
-            angle=theta_new.to_value(u.deg),
-            edgecolor="dodgerblue",
-            # linestyle='--',  # maybe dashed to differentiate
-            facecolor="none",
-            lw=3,
-            label="Modified",
-        )
-        ax.add_patch(ellipse)
-
-        # ax.set_title(f"Galaxy {galaxy_id} - {filter}")
-        ax.set_xlim(miri_x - 30, miri_x + 30)
-        ax.set_ylim(miri_y - 30, miri_y + 30)
-        ax.legend(loc="upper right", fontsize=16)
-
-        # Save figure
-        mask_dir = os.path.join(output_folder, mask_folder)
-        os.makedirs(mask_dir, exist_ok=True)
-        png_path = os.path.join(
-            mask_dir, f"{galaxy_id}_{survey}{obs}_{filter}_overlay.png"
-        )
-        plt.savefig(png_path, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-    # Collect modified aperture data including full context
-    aperture_info = {
-        "ID": galaxy_id,
-        "Filter": filter,
-        "Survey": survey,
-        "Obs": obs,
-        "Apr_A": width,
-        "Apr_B": height,
-        "Apr_Xcenter": miri_x,
-        "Apr_Ycenter": miri_y,
-        "Apr_Theta": theta_new.to_value(u.deg),
-    }
-
-    return aperture_info
 
 
 def estimate_background(
