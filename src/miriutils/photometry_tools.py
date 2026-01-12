@@ -273,15 +273,15 @@ class MIRIPipeline:
             "b": b_rescaled/2,
             "theta": -np.radians(new_theta_deg),
             # Store information about the original aperture
-            "x_orig": row["Apr_Xcenter"],
-            "y_orig": row["Apr_Ycenter"],
+            #"x_orig": row["Apr_Xcenter"],
+            #"y_orig": row["Apr_Ycenter"],
             "a_orig": (row["Apr_A"]/2) * pixel_conversion,
             "b_orig": (row["Apr_B"]/2) * pixel_conversion,
             "theta_orig": -np.radians(row["Apr_Theta"] * u.deg),
             # Store data and metadata
             "data": data_miri, 
             "meta": meta,
-            "pixel_conversion": pixel_conversion
+            #"pixel_conversion": pixel_conversion
         }
     
     def plot_apertures_multiband(self, results_list, output_dir=None):
@@ -335,24 +335,6 @@ class MIRIPipeline:
         plt.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close()
         
-        fig, ax = plt.subplots(figsize=(5, 5))  
-              
-        n_path = os.path.join(self.nircam_dir, f"{galaxy_id}_F444W_cutout.fits")
-        with fits.open(n_path) as hdu_nir:
-            data = hdu_nir['SCI'].data
-        
-        # Robust scaling per band
-        vmin, vmax = np.nanpercentile(data, [10, 99.5])
-        
-        pixel_conversion = params["pixel_conversion"]
-        ax.imshow(data, origin="lower", cmap="magma", vmin=vmin, vmax=vmax)
-        ap_orig = EllipticalAperture((params["x_orig"], params["y_orig"]), 
-                                        a=params["a_orig"]/pixel_conversion, 
-                                        b=params["b_orig"]/pixel_conversion, 
-                                        theta=np.radians(params["theta_orig"]))
-        ap_orig.plot(ax=ax, color="red", lw=1.5, label="NIRCam Original", alpha=0.7)
-        plt.show()
-    
 
     def run_photometry(self, filter_name, apply_aper_corr=False):
         """
