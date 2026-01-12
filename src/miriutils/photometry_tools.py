@@ -43,12 +43,13 @@ from collections import defaultdict
 
 import astropy.units as u
 import h5py
+from scipy.stats import skew
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from astropy.io import fits
-from astropy.stats import SigmaClip, sigma_clipped_stats
+from astropy.stats import sigma_clip, sigma_clipped_stats
 from astropy.table import MaskedColumn, Table
 from astropy.wcs import FITSFixedWarning
 from matplotlib.patches import Ellipse
@@ -66,7 +67,7 @@ from photutils.segmentation import SegmentationImage, detect_sources
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
-
+warnings.filterwarnings("ignore", category=NoDetectionsWarning)
 
 class MIRIPipeline:
     def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, scaling_exceptions_file=None):
@@ -169,7 +170,7 @@ class MIRIPipeline:
                 
         return selected_files if len(selected_files) > 0 else None
     
-    def parse_path_metadata(self, file_path):
+    def _parse_path_metadata(self, file_path):
         """
         Extracts metadata from the directory structure.
         Example path: .../cos3d1/F1000W/fits/13297_f1000w_cos3d1.fits
@@ -217,7 +218,7 @@ class MIRIPipeline:
         4. Project NIRCam coords -> MIRI pixels
         5. Apply Rotation and Rescaling
         """
-        meta = self.parse_path_metadata(file_path)
+        meta = self._parse_path_metadata(file_path)
         gid = int(meta['id'])
 
         # --- 1. Load Master Aperture ---
@@ -335,12 +336,12 @@ class MIRIPipeline:
         if output_dir is None:
             aperture_dir = os.path.join(self.output_dir, "aperture_plots")
         os.makedirs(aperture_dir, exist_ok=True)
-        out_path = os.path.join(aperture_dir, f"{galaxy_id}_multiband.png")
+        out_path = os.path.join(aperture_dir, f"{galaxy_id}_all.png")
         plt.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=3.0):
+    def estimate_background(self, aperture_params, sigma_val=3.0, skew_threshold=3.0):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -349,7 +350,9 @@ class MIRIPipeline:
         x, y = aperture_params["x"], aperture_params["y"]
         a, b = aperture_params["a"], aperture_params["b"]
         theta = aperture_params["theta"] # Already in Radians from prepare_aperture
-        gid = aperture_params["id"]
+        galaxy_id = aperture_params["id"]
+        
+        filt = aperture_params["meta"]["filter"]
 
         # 1. Create Source Mask
         source_ap = EllipticalAperture((x, y), a=a, b=b, theta=theta)
@@ -358,9 +361,9 @@ class MIRIPipeline:
         # 2. Initial Sigma Clipping & Source Detection for Masking
         # We ignore the source and NaNs
         init_mask = source_mask | np.isnan(data)
-        _, median_bg, std_bg = sigma_clipped_stats(data, sigma=2.5, mask=init_mask)
+        _, median_bkg, std_bkg = sigma_clipped_stats(data, sigma=2.5, mask=init_mask, maxiters=5)
+        threshold = median_bkg + (sigma_val * std_bkg)
         
-        threshold = median_bg + (sigma_val * std_bg)
         # Detect other sources in the field to exclude from background fit
         segm = detect_sources(data, threshold, npixels=5)
         segm_mask = (segm.data > 0) if segm else np.zeros_like(data, dtype=bool)
@@ -370,13 +373,13 @@ class MIRIPipeline:
         
         # 3. 2D Plane Fit (Global Gradient)
         yi, xi = np.indices(data.shape)
-        fit_mask = ~combined_mask
+        fit_mask = ~combined_mask   # fit_mask now includes all data used for the fit
         
         A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
         z = data[fit_mask]
         
         if len(z) < 10: # Safety check
-            coeffs = [0, 0, median_bg] # Fallback to flat median
+            coeffs = [0, 0, median_bkg] # Fallback to flat median
         else:
             coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
         
@@ -384,41 +387,146 @@ class MIRIPipeline:
         background_plane = alpha * xi + beta * yi + gamma
         data_bkgsub = data - background_plane
 
-        # 4. Define Local Annulus for Statistics
-        # For publication: define annulus relative to aperture size
-        a_in, b_in = a + 5, b + 5 
+        # 4. Define elliptical annulus based on aperture size         
+        a_in, b_in = a + 8, b + 8
         
         # Dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
         dist_to_edge = min(x, img_w - x, y, img_h - y)
-        a_out = max(a_in + 2, dist_to_edge - 2)
-        b_out = a_out * (b/a) # Maintain aspect ratio
-
+        a_out = dist_to_edge - 2    # 2 pixel buffer at the image boundaries
+        b_out = a_out * 0.9 # Maintain aspect ratio
+        
         annulus = EllipticalAnnulus((x, y), a_in=a_in, a_out=a_out, 
                                     b_in=b_in, b_out=b_out, theta=theta)
         
         ann_mask = annulus.to_mask(method='center').to_image(data.shape).astype(bool)
+        
         # Only use pixels that are in the annulus AND not a detected source
         bkg_pixels_mask = ann_mask & ~combined_mask
         
         # 5. Final Stats
         bkg_residuals = data_bkgsub[bkg_pixels_mask]
-        if len(bkg_residuals) > 0:
-            sigma_bkg = np.std(bkg_residuals)
-            # Propagation of error: Std dev of the mean background across aperture area
-            background_std = sigma_bkg * np.sqrt(source_ap.area)
-            background_median = np.median(bkg_residuals)
+        
+        # 2. Check for Skewness (= presence of artefacts)
+        current_skew = skew(bkg_residuals)
+        
+        # Assign a flag level
+        if current_skew > 5.0:
+            bkg_flag = "CRITICAL_SKEW"  # Likely an artifact or huge spike
+            print(f"🔴 ID {galaxy_id} in {filt}: CRITICAL SKEW detected ({current_skew:.3f}). Artefact or huge spike present...")
+        elif current_skew > 2.0:
+            bkg_flag = "HIGH_SKEW"      # Check for unmasked neighbours
+            print(f"🟡 ID {galaxy_id} in {filt}: HIGH SKEW detected ({current_skew:.3f}). Check for unmasked neighbours...")
         else:
-            background_std, background_median = 0, 0
+            bkg_flag = "CLEAN"     
+        
+        if len(bkg_residuals) > 0:
+            # Sigma clipping will throw away artefacts with very large skew
+            # This identifies which pixels in the residuals were rejected
+            clipped_array = sigma_clip(bkg_residuals, sigma=3.0, maxiters=5, cenfunc=np.median)
+            # The '.mask' attribute is True where pixels were REJECTED
+            clipped_mask_indices = clipped_array.mask
 
+            # 2. Extract stats from the unclipped portions
+            clean_median = np.ma.median(clipped_array)
+            clean_std = np.ma.std(clipped_array)
+            
+            # 3. Update mask_vis to show WHERE the clipping happened
+            # We need to map the 1D clipped_mask back to the 2D image
+            clipped_map_2d = np.zeros_like(data, dtype=bool)
+            # Use the same indices that defined bkg_pixels_mask
+            clipped_map_2d[bkg_pixels_mask] = clipped_mask_indices
+            
+            background_median = clean_median
+            background_std = clean_std * np.sqrt(source_ap.area)
+            
+        else:
+            print("⚠️ No background residuals available, standard deviation and median defaulting to 0.")
+            background_std, background_median = 0, 0
+        
+        mask_vis = np.zeros_like(data, dtype=int)
+        mask_vis[~combined_mask] = 2
+        mask_vis[bkg_pixels_mask] = 3  # Pixels in the annulus/rectangle
+        mask_vis[source_mask] = 4  # Source pixels
+        mask_vis[clipped_map_2d] = 1 # Rejected by additional sigma_clipping
+        
         return {
+            "id": galaxy_id,
+            "filter": filt,
             "median": background_median,
             "std": background_std,
             "plane": background_plane,
             "subtracted": data_bkgsub,
             "annulus": annulus,
-            "source_ap": source_ap
+            "source_ap": source_ap,
+            "mask_vis": mask_vis,
+            "bkg_flag": bkg_flag
         }
+
+    def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
+        """
+        Creates a 2x2 diagnostic mosaic to verify background modeling.
+        """
+        data = aperture_params["data"]
+        gid = aperture_params["id"]
+        filt = aperture_params["meta"]["filter"]
+        survey_obs = aperture_params["meta"]["survey_obs"]
+        
+        # Extract calculated objects from bkg_dict
+        plane = bkg_dict["plane"]
+        subtracted = bkg_dict["subtracted"]
+        source_ap = bkg_dict["source_ap"]
+        annulus = bkg_dict["annulus"]
+        
+        
+        # Create the figure
+        fig, axes = plt.subplots(2, 2, figsize=(10, 9), constrained_layout=True)
+        ax1, ax2, ax3, ax4 = axes.flatten()
+
+        # --- 1. Original Data ---
+        v1_min, v1_max = np.nanpercentile(data, [2, 98])
+        im1 = ax1.imshow(data, origin="lower", cmap="magma", vmin=v1_min, vmax=v1_max)
+        source_ap.plot(ax=ax1, color='dodgerblue', lw=2, label="Aperture")
+        ax1.set_title(f"Original Data ({filt})")
+        #plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+        # --- 2. 2D Background Plane ---
+        v2_min, v2_max = np.nanpercentile(plane, [2, 98])
+        im2 = ax2.imshow(plane, origin="lower", cmap="magma", vmin=v2_min, vmax=v2_max)
+        ax2.set_title("Fitted Background Plane")
+        #plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+        # --- 3. Subtracted Data + Annulus ---
+        v3_min, v3_max = np.nanpercentile(subtracted, [5, 95])
+        im3 = ax3.imshow(subtracted, origin="lower", cmap="magma", vmin=v3_min, vmax=v3_max)
+        source_ap.plot(ax=ax3, color='dodgerblue', lw=2)
+        #annulus.plot(ax=ax3, color='yellow', lw=1.5, ls='--', label="Annulus")
+        ax3.set_title("Bkg-Subtracted")
+        #ax3.legend(loc='upper right', fontsize=8)
+        #plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+        # --- 4. Mask/Region Visualization ---
+        mask_vis = bkg_dict["mask_vis"]
+        
+        cmap_mask = plt.get_cmap('viridis', 5)
+        im4 = ax4.imshow(mask_vis, origin="lower", cmap=cmap_mask, vmin=-0.5, vmax=4.5)
+        ax4.set_title("Region Classification")
+        
+        cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
+        cbar.set_ticklabels(["Clipped", "Excluded/NaN", "Fit Region", "Annulus", "Source"])
+
+        plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
+        
+        # 1. Determine the destination
+        if save_path is None:
+            # Default organizational structure
+            aperture_dir = os.path.join(self.output_dir, "mosaic_plots")
+            os.makedirs(aperture_dir, exist_ok=True)
+            save_path = os.path.join(aperture_dir, f"{gid}_{filt}_bkg.png")
+
+        # 2. Save the figure (do this BEFORE close)
+        plt.savefig(save_path, bbox_inches='tight', dpi=200)
+        plt.close(fig)
 
     def run_photometry(self, filter_name, apply_aper_corr=False):
         """
