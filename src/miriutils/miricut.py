@@ -120,46 +120,45 @@ class CutoutManager:
         """Loops through all extensions to create a matched multi-extension HDUList."""
         cutout_hdul = fits.HDUList([fits.PrimaryHDU(header=hdul[0].header)])
         
+        # We use the Science extension as our WCS reference
+        # This ensures that SCI and ERR are perfectly registered to the same pixels
+        ref_sci_header = hdul['SCI'].header
+        ref_wcs = WCS(ref_sci_header, naxis=2)
+        
         # Loop through all extensions (skipping PrimaryHDU at 0)
         for ext in range(1, len(hdul)):
             hdu = hdul[ext]
+            
+            # Skip extensions that aren't 2D images (like metadata tables)
             if hdu.data is None or hdu.data.ndim != 2:
                 continue
 
-            # Process just the SCI extension
             try:
-                # 1. Grab the SCI extension (Index 1 in JWST files)
-                sci_hdu = hdul['SCI']
-                wcs = WCS(sci_hdu.header, naxis=2)
+                # --- THE FIX ---
+                # We extract from 'hdu.data' (the current extension), NOT 'hdul['SCI'].data'
+                cutout = Cutout2D(hdu.data, target_coord, cutout_size, wcs=ref_wcs, mode="partial")
 
-                # 2. Create the cutout
-                cutout = Cutout2D(sci_hdu.data, target_coord, cutout_size, wcs=wcs, mode="partial")
-
-                # 3. Create the "Centered" Header
-                new_wcs = cutout.wcs
-                # Center pixel (0-based)
-                center_f = (cutout.data.shape[0] - 1) / 2.0 
-                # Update WCS keywords
-                new_wcs.wcs.crpix = [center_f + 1, center_f + 1] # +1 for FITS standard
-                new_wcs.wcs.crval = [target_coord.ra.deg, target_coord.dec.deg]
-
-                # 4. Build the final Header
-                # We copy the SCI header so we keep things like 'FILTER' and 'PHOTMJSR'
-                new_header = sci_hdu.header.copy()
-                new_header.update(new_wcs.to_header())
+                # Build the new header for this specific extension
+                new_header = hdu.header.copy()
                 
+                # Update the WCS in the header so it points to the new center
+                # .to_header() handles the crpix/crval math we did manually before
+                new_header.update(cutout.wcs.to_header())
+
+                # Create the new ImageHDU with the CORRECT data
+                cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
+                
+                # Preserve the Extension Name (e.g., 'SCI', 'ERR', 'VAR', 'DQ')
+                if 'EXTNAME' in hdu.header:
+                    cutout_hdu.name = hdu.header['EXTNAME']
+                
+                cutout_hdul.append(cutout_hdu)
+
             except Exception as e:
-                print(f"Error creating cutout for {self.ids[i]}: {e}")
-                return None
-
-            # Create output HDU with original extension name preserved
-            cutout_hdu = fits.ImageHDU(data=cutout.data, header=new_header)
-            if 'EXTNAME' in hdu.header:
-                cutout_hdu.name = hdu.header['EXTNAME']
-            
-            # Add to output file
-            cutout_hdul.append(cutout_hdu)
-                
+                # If a specific extension fails, we skip it but keep the others
+                print(f"Warning: Could not process extension {ext}: {e}")
+                continue
+                    
         return cutout_hdul
     
     def save_cutout_png(self, data, angle, filter_name, output_path):
