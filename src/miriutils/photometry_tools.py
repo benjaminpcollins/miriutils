@@ -67,13 +67,13 @@ from photutils.segmentation import SegmentationImage, detect_sources
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
-warnings.filterwarnings("ignore", category=NoDetectionsWarning)
 
 class MIRIPipeline:
     def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, scaling_exceptions_file=None):
         self.cutouts_dir = cutouts_dir
         self.output_dir = output_dir
         self.nircam_dir = nircam_dir
+        os.makedirs(self.output_dir, exist_ok=True)
         
         # 1. Load Master Table first to get all IDs
         self.master_table = Table.read(aperture_table)
@@ -92,8 +92,6 @@ class MIRIPipeline:
 
         # Internal storage for results
         self.raw_results = [] 
-        
-        os.makedirs(self.output_dir, exist_ok=True)
 
     def _initialise_scaling_config(self):
         """Creates a template CSV if missing; otherwise loads existing values."""
@@ -208,6 +206,26 @@ class MIRIPipeline:
         
         # Explicit conversion so your 'Apr_Theta' matching is safe
         return np.degrees(rot_rad)
+    
+    def get_psf(self, filter_name, psf_dir="/Users/benjamincollins/University/master/Red_Cardinal/WebbPSF/"):
+        """
+        Read MIRI PSF file for the specified filter.
+
+        Parameters
+        ----------
+        filter_name : str
+            Name of the filter
+        psf_dir : str
+            Directory containing PSF files
+
+        Returns
+        -------
+        psf_data : ndarray
+            PSF data
+        """
+        psf_file = os.path.join(psf_dir, f"PSF_MIRI_{filter_name}.fits")
+        with fits.open(psf_file) as psf:
+            return psf[3].data  # Recommended extension!
     
     
     def prepare_aperture(self, file_path, rescale=True):
@@ -341,7 +359,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=3.0, skew_threshold=3.0):
+    def estimate_background(self, aperture_params, sigma_val=3.0, save_vis=None):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -445,10 +463,47 @@ class MIRIPipeline:
             background_std, background_median = 0, 0
         
         mask_vis = np.zeros_like(data, dtype=int)
-        mask_vis[~combined_mask] = 2
-        mask_vis[bkg_pixels_mask] = 3  # Pixels in the annulus/rectangle
+        mask_vis[~combined_mask] = 1
+        mask_vis[bkg_pixels_mask] = 2  # Pixels in the annulus/rectangle
         mask_vis[source_mask] = 4  # Source pixels
-        mask_vis[clipped_map_2d] = 1 # Rejected by additional sigma_clipping
+        mask_vis[clipped_map_2d] = 3 # Rejected by additional sigma_clipping
+        
+        aperture_map = {
+            "x": float(aperture_params.get("x")),
+            "y": float(aperture_params.get("y")),
+            "a": float(aperture_params.get("a")),
+            "b": float(aperture_params.get("b")),
+            "theta": float(aperture_params.get("theta").value if hasattr(aperture_params.get("theta"), 'value') 
+                   else aperture_params.get("theta")),
+        }
+        
+        # Store visualisation data
+        vis_data = {
+            "galaxy_id": galaxy_id,
+            "filter": filt,
+            "original_data": data,
+            "background_plane": background_plane,
+            "background_subtracted": data_bkgsub,
+            "mask_vis": mask_vis,
+            "segmentation_mask": segm_mask,
+            "background_region_mask": ann_mask,
+            "region_name": "Annulus",
+            "source_mask": source_mask,
+            "aperture_params": aperture_map,
+            "a_in": a_in,
+            "b_in": b_in,
+            "a_out": a_out,
+            "b_out": b_out,
+            "sigma": sigma_val,
+            "coeffs": (alpha, beta, gamma),
+        }
+        
+        # Save visualisation data to .h5 file
+        vis_dir = os.path.join(self.output_dir, "vis_data")
+        os.makedirs(vis_dir, exist_ok=True)
+
+        vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filt}.h5")
+        self.save_vis(vis_data, vis_path)
         
         return {
             "id": galaxy_id,
@@ -513,7 +568,7 @@ class MIRIPipeline:
         ax4.set_title("Region Classification")
         
         cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
-        cbar.set_ticklabels(["Clipped", "Excluded/NaN", "Fit Region", "Annulus", "Source"])
+        cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Annulus", "Clipped", "Source"])
 
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         
@@ -527,7 +582,8 @@ class MIRIPipeline:
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
         plt.close(fig)
-
+        
+    
     def run_photometry(self, filter_name, apply_aper_corr=False):
         """
         Wraps the 1300-line logic but keeps it organized.
@@ -554,320 +610,130 @@ class MIRIPipeline:
         # Internal helper: contains your measurement logic
         # returns the dictionary you shared in your prompt
         pass
+        
+    
+    @staticmethod  
+    def save_vis(vis_data, filename):
+        """
+        Save visualisation data to HDF5 file.
 
+        Parameters:
+        -----------
+        vis_data : dict
+            Dictionary containing visualization data
+        filename : str
+            Output filename (should end with .h5 or .hdf5)
+        """
+        with h5py.File(filename, "w") as f:
+            # Save arrays with compression
+            for key in [
+                "original_data",
+                "background_plane",
+                "background_subtracted",
+                "mask_vis",
+                "segmentation_mask",
+                "background_region_mask",
+                "source_mask",
+            ]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.create_dataset(
+                        key, data=vis_data[key], compression="gzip", compression_opts=6
+                    )
 
+            # Save scalars
+            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.attrs[key] = vis_data[key]
 
+            # Save strings
+            for key in ["filter", "region_name"]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.attrs[key] = (
+                        vis_data[key].encode("utf-8")
+                        if isinstance(vis_data[key], str)
+                        else vis_data[key]
+                    )
 
+            # Save coefficients tuple
+            if "coeffs" in vis_data and vis_data["coeffs"] is not None:
+                f.create_dataset("coeffs", data=np.array(vis_data["coeffs"]))
 
-def estimate_background(
-    galaxy_id, filter_name, image_data, aperture_params, sigma_val, rescale=True
-):
-    """
-    Estimate background using a global 2D plane fit, then extract statistics from
-    an elliptical annulus.
+            # Save aperture_params dict as JSON string
+            if "aperture_params" in vis_data and vis_data["aperture_params"] is not None:
+                f.attrs["aperture_params"] = json.dumps(vis_data["aperture_params"])
 
-    Parameters
-    ----------
-    galaxy_id : str
-        The ID of the galaxy
-    filter_name : str
-        The band which is being observed
-    image_data : ndarray
-        The 2D image data
-    aperture_params : dict
-        Dictionary containing aperture parameters (x_center, y_center, a, b, theta)
-    sigma : float
-        Sigma clipping threshold
+            # Add metadata
+            f.attrs["created_date"] = str(np.datetime64("now"))
+            f.attrs["data_type"] = "galaxy_visualisation_data"
+        
+    @staticmethod
+    def load_vis(filename):
+        """
+        Load visualisation data from HDF5 file and reconstruct Photutils objects.
+        """
+        vis_data = {}
 
-    Returns
-    -------
-    - background_std : float
-        standard deviation of background model within the annulus (excluding clipped data)
-    - background_median : float
-        median background value within the annulus
-    - background_plane : ndarray
-        2D background model
+        with h5py.File(filename, "r") as f:
+            # 1. Load Arrays
+            for key in [
+                "original_data",
+                "background_plane",
+                "background_subtracted",
+                "mask_vis",
+                "segmentation_mask",
+                "background_region_mask",
+                "source_mask",
+            ]:
+                if key in f:
+                    vis_data[key] = f[key][:]
 
-    """
+            # 2. Load coefficients
+            if "coeffs" in f:
+                vis_data["coeffs"] = tuple(f["coeffs"][:])
 
-    x_center = aperture_params["x_center"]
-    y_center = aperture_params["y_center"]
-    a = aperture_params["a"]
-    b = aperture_params["b"]
-    theta = aperture_params["theta"]  # in radians
+            # 3. Load scalars from attributes
+            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
+                if key in f.attrs:
+                    vis_data[key] = f.attrs[key]
 
-    # Create source aperture
-    source_aperture = EllipticalAperture(
-        positions=(x_center, y_center), a=a, b=b, theta=theta
-    )
+            # 4. Load strings and decode if necessary
+            for key in ["filter", "region_name"]:
+                if key in f.attrs:
+                    val = f.attrs[key]
+                    vis_data[key] = val.decode("utf-8") if isinstance(val, bytes) else val
 
-    # Create mask for the source
-    source_mask = source_aperture.to_mask(method="center").to_image(image_data.shape)
-    source_mask_bool = source_mask.astype(bool)
-    total_mask = source_mask_bool | np.isnan(image_data)
+            # 5. Load aperture_params dict
+            if "aperture_params" in f.attrs:
+                vis_data["aperture_params"] = json.loads(f.attrs["aperture_params"])
 
-    # Step 1: Get initial background estimate using sigma clipping
-    # This doesn't require knowing sources beforehand
-    mean_bg, median_bg, std_bg = sigma_clipped_stats(
-        image_data, sigma=2.5, maxiters=5, mask=total_mask
-    )
-
-    # Step 2: Create segmentation map based on initial background estimate
-    # Typically threshold is set at median + (N * std) above background
-    threshold = median_bg + (sigma_val * std_bg)  # sigma threshold, adjust as needed
-    masked_for_segm = np.copy(image_data)
-    masked_for_segm[source_mask_bool] = median_bg
-    segm = detect_sources(masked_for_segm, threshold, npixels=5)
-
-    # Convert segmentation to a boolean mask (True where sources are detected)
-    if segm is not None:
-        segm_mask = segm.data > 0
-    else:
-        segm_mask = np.zeros_like(image_data, dtype=bool)
-
-    # Step 3: Combine the known source mask with the segmentation mask
-    combined_mask = source_mask_bool | segm_mask | np.isnan(image_data)
-
-    # Create a global mask for all valid background pixels (not in any source)
-    global_mask = ~combined_mask
-
-    # Define indices for the full image
-    y, x = np.indices(image_data.shape)
-
-    # Extract coordinates and values of all valid background pixels for global fitting
-    x_vals = x[global_mask].flatten()
-    y_vals = y[global_mask].flatten()
-    z_vals = image_data[global_mask].flatten()
-
-    # Check if we have enough pixels for fitting
-    if len(z_vals) < 3:
-        raise ValueError(
-            "Not enough background pixels for fitting. Try adjusting parameters."
-        )
-
-    # Fit a 2D plane (ax + by + c) to all valid background pixels
-    A = np.vstack([x_vals, y_vals, np.ones_like(x_vals)]).T
-    coeffs, residuals, rank, s = np.linalg.lstsq(A, z_vals, rcond=None)
-    alpha, beta, gamma = coeffs
-
-    # Create the 2D background plane for the entire image
-    background_plane = alpha * x + beta * y + gamma
-
-    # Define the background region
-    region_name = "Annulus"
-
-    # Optional block for rescaling apertures such that the annuli are consistent
-    # ==========================================
-    if rescale:
-        # --- Create elliptical region in MIRI pixel space ---
-        nircam_scale = 0.03  # arcsec/pixel
-        miri_scale = 0.11092  # arcsec per pixel
-
-        # arcsec/pixel
-        scale_factor = nircam_scale / miri_scale
-
-        if int(galaxy_id) == 12332:
-            scale_factor *= 1.0  # no additional scaling to avoid contaminating source
-        elif int(galaxy_id) in [7136, 7904, 7922, 11136, 16419, 21452]:
-            scale_factor *= 1.6
-        elif int(galaxy_id) in [7934, 10314, 10592, 18332]:
-            scale_factor *= 1.8
-        else:
-            scale_factor *= 2.0
-    else:
-        scale_factor = 1.0
-
-    a *= scale_factor
-    b *= scale_factor
-    # ==========================================
-
-    # Define inner and outer radii for the annulus
-    a_in = a + 8
-    b_in = b + 8
-
-    # Check how much space there is to the boundary
-    delta_x = min(x_center, 72 - x_center)
-    delta_y = min(y_center, 72 - y_center)
-
-    # Maximum theoretically possible radius for a circle
-    r_max = max(delta_x, delta_y) - 2  # for boundary buffer
-
-    # Specify a_out and b_out
-    a_out = r_max
-    b_out = 0.9 * r_max
-
-    # Create the annulus
-    annulus = EllipticalAnnulus(
-        positions=(x_center, y_center),
-        a_in=a_in,
-        b_in=b_in,
-        a_out=a_out,
-        b_out=b_out,
-        theta=theta,
-    )
-
-    # Create mask for the annulus region
-    annulus_mask = annulus.to_mask(method="center").to_image(image_data.shape)
-    annulus_mask_bool = annulus_mask.astype(bool)
-    background_region_mask = annulus_mask_bool & ~np.isnan(image_data) & ~segm_mask
-
-    # Gather all the pixels within the background region that were NOT sigma-clipped
-    bkg_region_valid_pixels = ~segm_mask & background_region_mask
-    data_bkgsub = image_data - background_plane
-
-    # Calculate background statistics
-    background_residuals = data_bkgsub[bkg_region_valid_pixels]
-    sigma_bkg = np.std(background_residuals)
-
-    # The following should be the 1-sigma uncertainty on the total background flux in the aperture
-    background_std = sigma_bkg * np.sqrt(source_aperture.area)
-
-    # Extract background plane values for the background region and calculate the median
-    background_median = np.median(background_residuals)
-
-    # Create a mask visualisation
-    mask_vis = np.zeros_like(image_data, dtype=int)
-    mask_vis[~combined_mask] = 1  # Excluded pixels
-    mask_vis[background_region_mask] = 2  # Pixels in the annulus/rectangle
-    mask_vis[source_mask_bool] = 3  # Source pixels
-
-    # Store visualisation data
-    vis_data = {
-        "galaxy_id": galaxy_id,
-        "filter": filter_name,
-        "original_data": image_data,
-        "background_plane": background_plane,
-        "background_subtracted": data_bkgsub,
-        "mask_vis": mask_vis,
-        "segmentation_mask": segm_mask,
-        "background_region_mask": background_region_mask,
-        "source_mask": source_mask_bool,
-        "aperture_params": aperture_params,
-        "a_in": a_in,
-        "b_in": b_in,
-        "a_out": a_out,
-        "b_out": b_out,
-        "sigma": sigma_val,
-        "region_name": region_name,
-        "coeffs": (alpha, beta, gamma),
-    }
-
-    # Save visualisation data to .h5 file
-    vis_dir = "/Users/benjamincollins/University/master/Red_Cardinal/photometry/vis_data_small"
-    os.makedirs(vis_dir, exist_ok=True)
-
-    vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filter_name}.h5")
-    save_vis(vis_data, vis_path)
-
-    return background_median, background_std, background_plane
-
-
-def save_vis(vis_data, filename):
-    """
-    Save visualisation data to HDF5 file.
-
-    Parameters:
-    -----------
-    vis_data : dict
-        Dictionary containing visualization data
-    filename : str
-        Output filename (should end with .h5 or .hdf5)
-    """
-    with h5py.File(filename, "w") as f:
-        # Save arrays with compression
-        for key in [
-            "original_data",
-            "background_plane",
-            "background_subtracted",
-            "mask_vis",
-            "segmentation_mask",
-            "background_region_mask",
-            "source_mask",
-        ]:
-            if key in vis_data and vis_data[key] is not None:
-                f.create_dataset(
-                    key, data=vis_data[key], compression="gzip", compression_opts=6
+            # --- RECONSTRUCTION STEP ---
+            ap = vis_data.get("aperture_params")
+            if ap:
+                # Reconstruct the Source Aperture
+                # Note: ap['x'], ap['y'] etc. are now plain floats from JSON
+                vis_data['source_ap'] = EllipticalAperture(
+                    positions=(ap['x'], ap['y']),
+                    a=ap['a'],
+                    b=ap['b'],
+                    theta=ap['theta']
                 )
 
-        # Save scalars
-        for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-            if key in vis_data and vis_data[key] is not None:
-                f.attrs[key] = vis_data[key]
-
-        # Save strings
-        for key in ["filter", "region_name"]:
-            if key in vis_data and vis_data[key] is not None:
-                f.attrs[key] = (
-                    vis_data[key].encode("utf-8")
-                    if isinstance(vis_data[key], str)
-                    else vis_data[key]
+                # Reconstruct the Annulus
+                # Uses the a_in, b_out etc stored in the main vis_data dict
+                vis_data['annulus'] = EllipticalAnnulus(
+                    positions=(ap['x'], ap['y']),
+                    a_in=vis_data['a_in'],
+                    a_out=vis_data['a_out'],
+                    b_in=vis_data['b_in'],
+                    b_out=vis_data['b_out'],
+                    theta=ap['theta']
                 )
 
-        # Save coefficients tuple
-        if "coeffs" in vis_data and vis_data["coeffs"] is not None:
-            f.create_dataset("coeffs", data=np.array(vis_data["coeffs"]))
+        return vis_data
 
-        # Save aperture_params dict as JSON string
-        if "aperture_params" in vis_data and vis_data["aperture_params"] is not None:
-            f.attrs["aperture_params"] = json.dumps(vis_data["aperture_params"])
-
-        # Add metadata
-        f.attrs["created_date"] = str(np.datetime64("now"))
-        f.attrs["data_type"] = "galaxy_visualisation_data"
+    
 
 
-def load_vis(filename):
-    """
-    Load visualisation data from HDF5 file.
-
-    Parameters:
-    -----------
-    filename : str
-        Input filename
-
-    Returns:
-    --------
-    dict : Loaded visualisation data
-    """
-    vis_data = {}
-
-    with h5py.File(filename, "r") as f:
-        # Load arrays
-        for key in [
-            "original_data",
-            "background_plane",
-            "background_subtracted",
-            "mask_vis",
-            "segmentation_mask",
-            "background_region_mask",
-            "source_mask",
-        ]:
-            if key in f:
-                vis_data[key] = f[key][:]
-
-        # Load coefficients
-        if "coeffs" in f:
-            vis_data["coeffs"] = tuple(f["coeffs"][:])
-
-        # Load scalars from attributes
-        for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-            if key in f.attrs:
-                vis_data[key] = f.attrs[key]
-
-        # Load strings from attributes
-        for key in ["filter", "region_name"]:
-            if key in f.attrs:
-                val = f.attrs[key]
-                if isinstance(val, bytes):
-                    vis_data[key] = val.decode("utf-8")
-                else:
-                    vis_data[key] = val
-
-        # Load aperture_params dict
-        if "aperture_params" in f.attrs:
-            vis_data["aperture_params"] = json.loads(f.attrs["aperture_params"])
-
-    return vis_data
 
 
 def create_mosaics(input_dir, mosaic_dir=None, plane_sub_dir=None):
@@ -1100,28 +966,7 @@ def visualise_background(vis_data, fig_path=None):
         plt.close(fig)
 
 
-def get_psf(
-    filter_name,
-    psf_dir="/Users/benjamincollins/University/master/Red_Cardinal/WebbPSF/",
-):
-    """
-    Read MIRI PSF file for the specified filter.
 
-    Parameters
-    ----------
-    filter_name : str
-        Name of the filter
-    psf_dir : str
-        Directory containing PSF files
-
-    Returns
-    -------
-    psf_data : ndarray
-        PSF data
-    """
-    psf_file = os.path.join(psf_dir, f"PSF_MIRI_{filter_name}.fits")
-    with fits.open(psf_file) as psf:
-        return psf[3].data  # Recommended extension!
 
 
 def get_aperture_params(galaxy_id, filter, aperture_table):
