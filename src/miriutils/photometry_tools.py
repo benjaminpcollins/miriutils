@@ -40,6 +40,7 @@ import pickle as pkl
 import random
 import warnings
 from collections import defaultdict
+import stpsf
 
 import astropy.units as u
 import h5py
@@ -52,7 +53,6 @@ from astropy.io import fits
 from astropy.stats import sigma_clip, sigma_clipped_stats
 from astropy.table import MaskedColumn, Table
 from astropy.wcs import FITSFixedWarning
-from matplotlib.patches import Ellipse
 from photutils.aperture import (
     EllipticalAnnulus,
     EllipticalAperture,
@@ -69,18 +69,27 @@ from photutils.segmentation import SegmentationImage, detect_sources
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
 class MIRIPipeline:
-    def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, scaling_exceptions_file=None):
+    def __init__(self, all_ids, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
         self.cutouts_dir = cutouts_dir
         self.output_dir = output_dir
         self.nircam_dir = nircam_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # 1. Load Master Table first to get all IDs
+        # Load Master Table first to get all IDs
         self.master_table = Table.read(aperture_table)
         # Ensure IDs are integers (cleaning the 'b' bytes issue we discussed)
-        self.all_ids = [int(val.decode('utf-8') if isinstance(val, bytes) else val) 
-                        for val in self.master_table['ID']]
-        self.all_ids = sorted(set(self.all_ids))
+        self.all_ids = all_ids
+        
+        # Default PSF directory if none provided
+        if psf_dir is None:
+            self.psf_dir = os.path.join(self.output_dir, "psfs")
+            print(f"Using default PSF directory: {self.psf_dir}")
+        else:
+            self.psf_dir = psf_dir
+            print(f"Found PSF directory {self.psf_dir}")
+            
+        # Ensure the PSF directory exists
+        os.makedirs(self.psf_dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
         if scaling_exceptions_file is None:
@@ -127,6 +136,36 @@ class MIRIPipeline:
             df = pd.read_csv(self.scaling_exceptions_path, comment="#")
             # Ensure IDs in the CSV are treated as ints for dictionary matching
             return dict(zip(df['ID'].astype(int), df['Scale_Factor']))
+        
+    def get_psf(self, filter_name, oversample=4):
+        """
+        Retrieves a PSF. If the file doesn't exist, it uses stpsf to 
+        generate, save, and return it.
+        """
+        psf_filename = f"PSF_MIRI_{filter_name}.fits"
+        psf_path = os.path.join(self.psf_dir, psf_filename)
+
+        # 1. Check if the file already exists
+        if not os.path.exists(psf_path):
+            print(f"⚡️ PSF for {filter_name} not found. Generating with stpsf (oversample={oversample})...")
+            
+            # 2. Generate the PSF
+            inst = stpsf.MIRI()
+            inst.filter = filter_name
+            # calc_psf can take a while, so we only do this if necessary
+            psf_obj = inst.calc_psf(oversample=oversample)
+            
+            # 3. Display and save to disc for future use
+            stpsf.display(psf_obj)
+            psf_obj.writeto(psf_path, overwrite=True)
+            print(f"Saved PSF to {psf_path}")
+
+        # 4. Read and return the recommended extension (Ext 3 is the oversampled PSF)
+        with fits.open(psf_path) as hdul:
+            # Note: Extension 0 = Detector sampled, 3 = Oversampled (usually)
+            # Use extension 3 if you are doing precise modeling/deconvolution
+            print(f"✅ PSF file found! Loading {psf_path}.")
+            return hdul[3].data
     
     def find_files(self, gid, priority=['primer', 'cweb', 'cos3d1', 'cos3d2']):
         """
@@ -188,14 +227,6 @@ class MIRIPipeline:
             "full_path": file_path
         }
         
-    def get_pixel_scale(self, gid, wcs_miri, wcs_nircam):
-        # 1. Get exact pixel scales from WCS (in deg/pixel)
-        miri_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_miri.pixel_scale_matrix))) # ~0.11
-        nircam_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_nircam.pixel_scale_matrix))) # ~0.03
-        
-        # 2. Basic conversion (arcsec-to-pixel ratio)
-        return nircam_pix_scale / miri_pix_scale
-        
         
     def get_wcs_rotation(self, wcs):
         # This works regardless of whether the header uses CD or PC
@@ -207,25 +238,82 @@ class MIRIPipeline:
         # Explicit conversion so your 'Apr_Theta' matching is safe
         return np.degrees(rot_rad)
     
-    def get_psf(self, filter_name, psf_dir="/Users/benjamincollins/University/master/Red_Cardinal/WebbPSF/"):
+    def plot_psf_aperture_review(self, psf_hdul, aperture_params, oversample=4):
         """
-        Read MIRI PSF file for the specified filter.
-
-        Parameters
-        ----------
-        filter_name : str
-            Name of the filter
-        psf_dir : str
-            Directory containing PSF files
-
-        Returns
-        -------
-        psf_data : ndarray
-            PSF data
+        Generate a diagnostics plot as a sanity check for the aperture correction
         """
-        psf_file = os.path.join(psf_dir, f"PSF_MIRI_{filter_name}.fits")
-        with fits.open(psf_file) as psf:
-            return psf[3].data  # Recommended extension!
+        filter_name = aperture_params["meta"]["filter"]
+            
+        # 2. Define the center in ARCSEC
+        # In the stpsf plot, (0,0) is exactly the center of the PSF
+        center_arcsec = (0, 0)
+
+        # 3. Convert aperture dimensions from Science Pixels to Arcseconds
+        # Science Pixels -> Arcsec: pixel_value * 0.1109
+        # (We don't need to worry about oversample 4 here if we go straight to arcsec)
+        science_pixel_scale = 0.11092         
+        a_arcsec = aperture_params["a"] * science_pixel_scale
+        b_arcsec = aperture_params["b"] * science_pixel_scale
+
+        # 4. Define the aperture in ARCSEC units
+        aperture_arcsec = EllipticalAperture(
+            positions=center_arcsec,
+            a=a_arcsec,
+            b=b_arcsec,
+            theta=aperture_params["theta"]
+        )
+
+        # 5. Plot using the specialized wrapper
+        fig, ax = plt.subplots(figsize=(8, 8))
+        stpsf.display_psf(psf_hdul, ext=3, ax=ax, imagecrop=5, colorbar=True)
+
+        # Plot the ARCSEC aperture
+        aperture_arcsec.plot(ax=ax, color='cyan', lw=2, ls='--', label='Correction Aperture')
+
+        ax.set_title(f"MIRI {filter_name} PSF - Ext 3 (Oversampled x{oversample})")        
+        ax.legend(loc='upper right')
+        plt.show()
+    
+    def calculate_psf_corr(self, aperture_params, oversample=4, show_plot=False):
+        """
+        Read MIRI PSF file for the specified filter and calculates 
+        the aperture correction factor
+        """
+        filter_name = aperture_params["meta"]["filter"]
+        
+        psf_file = os.path.join(self.psf_dir, f"PSF_MIRI_{filter_name}.fits")
+        with fits.open(psf_file) as psf_hdul:
+            psf_data = psf_hdul[3].data  # Most realistic extension!
+            
+            if show_plot is True:
+                self.plot_psf_aperture_review(psf_hdul, aperture_params)
+        
+        # Check for proper normalisation
+        total_flux = np.sum(psf_data)
+        if not np.isclose(total_flux, 1.0, atol=1e-3):
+            print(f"Warning: PSF not normalised (sum = {total_flux:.6f}). Normalising now.")
+            psf_data /= total_flux
+
+        # Find centroid of the PSF
+        x_cen, y_cen = centroid_com(psf_data)
+        print("Centroid: ", x_cen, y_cen)
+
+        aperture = EllipticalAperture(
+            positions=(x_cen, y_cen),
+            a=aperture_params["a"],
+            b=aperture_params["b"],
+            theta=aperture_params["theta"],
+        )
+        
+        # Ensure background is subtracted
+        psf_data -= np.median(psf_data[psf_data < np.percentile(psf_data, 10)])
+
+        # Calculate flux in aperture using exact method
+        phot_table = aperture_photometry(psf_data, aperture, method="exact")
+        flux_in_aperture = phot_table["aperture_sum"][0]
+        correction_factor = total_flux / flux_in_aperture
+        
+        return correction_factor
     
     
     def prepare_aperture(self, file_path, rescale=True):
@@ -249,11 +337,35 @@ class MIRIPipeline:
 
         # --- 2. Load MIRI and NIRCam WCS ---
         with fits.open(file_path) as hdu_miri:
-            wcs_miri = WCS(hdu_miri['SCI'].header)
+            header_miri = hdu_miri['SCI'].header
+            wcs_miri = WCS(header_miri)
             data_miri = hdu_miri['SCI'].data
+            err_miri = hdu_miri['ERR'].data
+           
+            # Get the pixel area in steradians
+            # Defaulting to a MIRI average if the header is missing (though it shouldn't be)
+            # 1. Try to get the official pipeline value
+            pixel_area_sr = header_miri.get("PIXAR_SR")
+
+            # 2. If it's missing (None), use the geometric derivation
+            if pixel_area_sr is None:
+                # Use the WCS pixel scale matrix determinant
+                # This accounts for the transformation of the pixel area to the sky
+                pix_scale_deg = np.sqrt(np.abs(np.linalg.det(wcs_miri.pixel_scale_matrix)))
+                pixel_area_sr = (np.radians(pix_scale_deg))**2
+                
+                # Optional: Log a warning so you know you're using a fallback
+                print("WARNING: PIXAR_SR not found. Using WCS geometric derivation.")
+    
+            # Scalar flux conversion factor from counts/sec to photometric 
+            # units for the given dataset mode and photometric reference table.
+            photmjsr = header_miri.get("PHOTMJSR", 1.0)
             
             # Get rotation directly from header logic
             miri_rotation = self.get_wcs_rotation(wcs_miri)
+
+        meta["pixel_area_sr"] = pixel_area_sr
+        meta["photmjsr"] = photmjsr
 
         nircam_path = os.path.join(self.nircam_dir, f"{gid}_F444W_cutout.fits")
         with fits.open(nircam_path) as hdu_ni:
@@ -273,7 +385,9 @@ class MIRIPipeline:
         new_theta_deg = (row["Apr_Theta"] + delta_rot) % 180 * u.deg
         
         # --- 5. Rescaling Logic ---
-        pixel_conversion = self.get_pixel_scale(gid, wcs_miri, wcs_ni)
+        miri_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_miri.pixel_scale_matrix))) # ~0.11
+        ni_pix_scale = np.sqrt(np.abs(np.linalg.det(wcs_ni.pixel_scale_matrix))) # ~0.11
+        pixel_conversion = ni_pix_scale / miri_pix_scale
         
         # Lookup the user multiplier (default to 2.0 if ID not in exceptions)
         # self.scaling_exceptions is a dict loaded from a CSV in __init__
@@ -303,6 +417,7 @@ class MIRIPipeline:
             "theta_orig": -np.radians(row["Apr_Theta"] * u.deg),
             # Store data and metadata
             "data": data_miri, 
+            "err": err_miri,
             "meta": meta,
             #"pixel_conversion": pixel_conversion
         }
@@ -430,13 +545,13 @@ class MIRIPipeline:
         
         # Assign a flag level
         if current_skew > 5.0:
-            bkg_flag = "CRITICAL_SKEW"  # Likely an artifact or huge spike
+            skew_flag = "CRITICAL_SKEW"  # Likely an artifact or huge spike
             print(f"🔴 ID {galaxy_id} in {filt}: CRITICAL SKEW detected ({current_skew:.3f}). Artefact or huge spike present...")
         elif current_skew > 2.0:
-            bkg_flag = "HIGH_SKEW"      # Check for unmasked neighbours
+            skew_flag = "HIGH_SKEW"      # Check for unmasked neighbours
             print(f"🟡 ID {galaxy_id} in {filt}: HIGH SKEW detected ({current_skew:.3f}). Check for unmasked neighbours...")
         else:
-            bkg_flag = "CLEAN"     
+            skew_flag = "CLEAN"     
         
         if len(bkg_residuals) > 0:
             # Sigma clipping will throw away artefacts with very large skew
@@ -462,11 +577,13 @@ class MIRIPipeline:
             print("⚠️ No background residuals available, standard deviation and median defaulting to 0.")
             background_std, background_median = 0, 0
         
-        mask_vis = np.zeros_like(data, dtype=int)
-        mask_vis[~combined_mask] = 1
+        # Initialise mask visualisation for plotting
+        mask_vis = np.zeros_like(data, dtype=int)        
+        mask_vis[~combined_mask] = 1 # All pixels used by the 2D plane fit
         mask_vis[bkg_pixels_mask] = 2  # Pixels in the annulus/rectangle
         mask_vis[source_mask] = 4  # Source pixels
         mask_vis[clipped_map_2d] = 3 # Rejected by additional sigma_clipping
+        # All other pixels are 0 -> Excluded/NaN       
         
         aperture_map = {
             "x": float(aperture_params.get("x")),
@@ -515,7 +632,7 @@ class MIRIPipeline:
             "annulus": annulus,
             "source_ap": source_ap,
             "mask_vis": mask_vis,
-            "bkg_flag": bkg_flag
+            "skew_flag": skew_flag
         }
 
     def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
@@ -575,9 +692,9 @@ class MIRIPipeline:
         # 1. Determine the destination
         if save_path is None:
             # Default organizational structure
-            aperture_dir = os.path.join(self.output_dir, "mosaic_plots")
+            aperture_dir = os.path.join(self.output_dir, "mosaic_plots", filt)
             os.makedirs(aperture_dir, exist_ok=True)
-            save_path = os.path.join(aperture_dir, f"{gid}_{filt}_bkg.png")
+            save_path = os.path.join(aperture_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
@@ -731,7 +848,75 @@ class MIRIPipeline:
 
         return vis_data
 
-    
+    def measure_flux(self, aperture_params, bkg_results):
+        """
+        Performs aperture photometry, unit conversion, and error propagation.
+        """
+        # Extract data from dictionaries
+        data = aperture_params["data"]
+        err_map = aperture_params["err"] 
+        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
+        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"] # From PIXAR_SR header
+        
+        # Get background-subtracted data
+        data_bkgsub = bkg_results["subtracted"]
+        source_ap = bkg_results["source_ap"]
+        
+        # Perform photometry
+        phot_table = aperture_photometry(data_bkgsub, source_ap, method='exact')
+        raw_flux_mjysr = phot_table['aperture_sum'][0]
+        
+        # 4. Error Propagation
+        # A. Detector/Poisson noise from the ERR extension
+        ap_mask = source_ap.to_mask(method='exact')
+        # Weighted sum of variance (method='exact' accounts for fractional pixels)
+        detector_variance = np.nansum(ap_mask.multiply(err_map**2))
+        print(detector_variance)
+        
+        # B. Background modelling uncertainty already calculated in estimate_background
+        # bkg_std = clean_std * np.sqrt(source_ap.area)
+        bkg_error_mjysr = bkg_results["std"]
+        print(bkg_error_mjysr)
+        
+        
+        print(f"Pixels in mask: {np.sum(ap_mask.to_image(data.shape))}")
+        
+        # C. Combine in quadrature
+        total_err_mjysr = np.sqrt(detector_variance + bkg_error_mjysr**2)
+        
+        # 5. Unit Conversion (MJy/sr -> Jy)
+        # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
+        conv = 1e6 * pixel_area_sr
+        
+        flux_jy = raw_flux_mjysr * conv
+        err_jy = total_err_mjysr * conv
+        
+        # 6. Final Results Dictionary
+        return {
+            "flux_jy": flux_jy,
+            "flux_err_jy": err_jy,
+            "flux_ujy": flux_jy * 1e6,
+            "flux_err_ujy": err_jy * 1e6,
+            "snr": flux_jy / err_jy if err_jy > 0 else 0,
+            "area_pix": source_ap.area,
+            "bkg_median_mjysr": bkg_results["median"],
+            "skew_flag": "HIGH" if bkg_results.get("skew", 0) > 3.0 else "CLEAN"
+        }
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
