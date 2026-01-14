@@ -47,6 +47,7 @@ import h5py
 from scipy.stats import skew
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import numpy as np
 import pandas as pd
 from astropy.io import fits
@@ -237,83 +238,6 @@ class MIRIPipeline:
         
         # Explicit conversion so your 'Apr_Theta' matching is safe
         return np.degrees(rot_rad)
-    
-    def plot_psf_aperture_review(self, psf_hdul, aperture_params, oversample=4):
-        """
-        Generate a diagnostics plot as a sanity check for the aperture correction
-        """
-        filter_name = aperture_params["meta"]["filter"]
-            
-        # 2. Define the center in ARCSEC
-        # In the stpsf plot, (0,0) is exactly the center of the PSF
-        center_arcsec = (0, 0)
-
-        # 3. Convert aperture dimensions from Science Pixels to Arcseconds
-        # Science Pixels -> Arcsec: pixel_value * 0.1109
-        # (We don't need to worry about oversample 4 here if we go straight to arcsec)
-        science_pixel_scale = 0.11092         
-        a_arcsec = aperture_params["a"] * science_pixel_scale
-        b_arcsec = aperture_params["b"] * science_pixel_scale
-
-        # 4. Define the aperture in ARCSEC units
-        aperture_arcsec = EllipticalAperture(
-            positions=center_arcsec,
-            a=a_arcsec,
-            b=b_arcsec,
-            theta=aperture_params["theta"]
-        )
-
-        # 5. Plot using the specialized wrapper
-        fig, ax = plt.subplots(figsize=(8, 8))
-        stpsf.display_psf(psf_hdul, ext=3, ax=ax, imagecrop=5, colorbar=True)
-
-        # Plot the ARCSEC aperture
-        aperture_arcsec.plot(ax=ax, color='cyan', lw=2, ls='--', label='Correction Aperture')
-
-        ax.set_title(f"MIRI {filter_name} PSF - Ext 3 (Oversampled x{oversample})")        
-        ax.legend(loc='upper right')
-        plt.show()
-    
-    def calculate_psf_corr(self, aperture_params, oversample=4, show_plot=False):
-        """
-        Read MIRI PSF file for the specified filter and calculates 
-        the aperture correction factor
-        """
-        filter_name = aperture_params["meta"]["filter"]
-        
-        psf_file = os.path.join(self.psf_dir, f"PSF_MIRI_{filter_name}.fits")
-        with fits.open(psf_file) as psf_hdul:
-            psf_data = psf_hdul[3].data  # Most realistic extension!
-            
-            if show_plot is True:
-                self.plot_psf_aperture_review(psf_hdul, aperture_params)
-        
-        # Check for proper normalisation
-        total_flux = np.sum(psf_data)
-        if not np.isclose(total_flux, 1.0, atol=1e-3):
-            print(f"Warning: PSF not normalised (sum = {total_flux:.6f}). Normalising now.")
-            psf_data /= total_flux
-
-        # Find centroid of the PSF
-        x_cen, y_cen = centroid_com(psf_data)
-        print("Centroid: ", x_cen, y_cen)
-
-        aperture = EllipticalAperture(
-            positions=(x_cen, y_cen),
-            a=aperture_params["a"],
-            b=aperture_params["b"],
-            theta=aperture_params["theta"],
-        )
-        
-        # Ensure background is subtracted
-        psf_data -= np.median(psf_data[psf_data < np.percentile(psf_data, 10)])
-
-        # Calculate flux in aperture using exact method
-        phot_table = aperture_photometry(psf_data, aperture, method="exact")
-        flux_in_aperture = phot_table["aperture_sum"][0]
-        correction_factor = total_flux / flux_in_aperture
-        
-        return correction_factor
     
     
     def prepare_aperture(self, file_path, rescale=True):
@@ -699,6 +623,91 @@ class MIRIPipeline:
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
         plt.close(fig)
+        
+    
+    def plot_psf_aperture_review(self, psf_hdul, aperture_params, oversample=4):
+        """
+        Displays the oversampled PSF but re-scales the axes to 'Science Pixels'.
+        This allows direct comparison with the science image aperture.
+        """
+        filter_name = aperture_params["meta"]["filter"]
+        
+        psf_data = psf_hdul[3].data
+        
+        # 1. Create a coordinate grid for the PSF in 'Science Pixel' units
+        # If oversample is 4, a 256x256 oversampled array is 64x64 science pixels
+        ny, nx = psf_data.shape
+        # We center the axes so (0,0) is the PSF peak
+        x_axis = (np.arange(nx) - nx/2) / oversample
+        y_axis = (np.arange(ny) - ny/2) / oversample
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+        # 2. Use 'extent' to force the imshow to display in Science Pixel units
+        extent = [x_axis.min(), x_axis.max(), y_axis.min(), y_axis.max()]
+        
+        im = ax.imshow(psf_data, origin='lower', extent=extent,
+                    norm=LogNorm(vmin=psf_data.max()*1e-5, vmax=psf_data.max()),
+                    cmap='magma')
+        
+        # 3. Use the ORIGINAL aperture (no multiplication by 4)
+        # Since the axes are now in science pixels, the original 'a' and 'b' will match
+        ap_pixel = EllipticalAperture(
+            positions=(0, 0), # (0,0) because our 'extent' centered the image
+            a=aperture_params["a"],
+            b=aperture_params["b"],
+            theta=aperture_params["theta"]
+        )
+        
+        ap_pixel.plot(ax=ax, color='cyan', lw=2, ls='--')
+
+        # 4. Formatting
+        ax.set_xlabel("Offset from Center [Science Pixels]")
+        ax.set_ylabel("Offset from Center [Science Pixels]")
+        ax.set_title(f"MIRI {filter_name} PSF - Ext 3 (Oversampled x{oversample})")
+        
+        plt.colorbar(im, label='Normalised Intensity')
+        plt.show()
+        
+            
+    def calculate_psf_corr(self, aperture_params, oversample=4, show_plot=False):
+        """
+        Read MIRI PSF file for the specified filter and calculates 
+        the aperture correction factor
+        """
+        filter_name = aperture_params["meta"]["filter"]
+        
+        psf_file = os.path.join(self.psf_dir, f"PSF_MIRI_{filter_name}.fits")
+        with fits.open(psf_file) as psf_hdul:
+            psf_data = psf_hdul[3].data  # Most realistic extension!
+            
+            if show_plot is True:
+                self.plot_psf_aperture_review(psf_hdul, aperture_params)
+        
+        # 1. Normalise the PSF so the ENTIRE model equals 1.0
+        current_sum = np.nansum(psf_data)
+
+        # 2. Find centroid
+        x_cen, y_cen = centroid_com(psf_data)
+
+        # 3. Create the MATH aperture (scaled by oversample)
+        aperture = EllipticalAperture(
+            positions=(x_cen, y_cen),
+            a=aperture_params["a"] * oversample,
+            b=aperture_params["b"] * oversample,
+            theta=aperture_params["theta"],
+        )
+
+        # 4. Calculate flux in aperture
+        # Since the total sum is 1.0, 'flux_in_aperture' is the Encircled Energy (EE)
+        phot_table = aperture_photometry(psf_data, aperture, method="exact")
+        ee_fraction = phot_table["aperture_sum"][0]
+        
+        # 5. The Correction Factor
+        # If ee_fraction is 0.9 (90%), correction is 1.11
+        correction_factor = current_sum / ee_fraction
+
+        return correction_factor
         
     
     def run_photometry(self, filter_name, apply_aper_corr=False):
