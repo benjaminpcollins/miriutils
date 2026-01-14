@@ -99,6 +99,21 @@ class MIRIPipeline:
 
         self.scaling_exceptions_path = scaling_exceptions_file
         self.scaling_exceptions = self._initialise_scaling_config()
+        
+        # Place these in your __init__ or as a config block
+        self.quality_config = {
+            "exclude_all": [18094, 19307],
+            "exclude_filters": {
+                "F770W": [16424], "F1000W": [], "F1800W": [12202, 12332, 16419], "F2100W": [7102, 16874],
+            },
+            "art_filters": {
+                "F770W": [7185, 8013, 8469, 8500, 8843, 9517, 11136, 11137, 11494, 11716, 16516, 17793, 19098, 21451],
+                "F1000W": [],
+                "F1800W": [7102, 11716, 12202, 17793, 19098, 21451],
+                "F2100W": [11723, 12175, 12213, 16874, 17984],
+            },
+            "has_companion": [7136, 7904, 7922, 7934, 8469, 10314, 16424, 17517, 18332, 21452]
+        }
 
         # Internal storage for results
         self.raw_results = [] 
@@ -185,7 +200,7 @@ class MIRIPipeline:
             filter_name = p.parent.parent.name.upper() # e.g., "F1000W"
             files_by_filter.setdefault(filter_name, []).append(p)
         
-        selected_files = []
+        selected_files = {}
 
         # 3. For each filter, pick the best file based on priority
         for filter_name, path_list in files_by_filter.items():
@@ -204,10 +219,28 @@ class MIRIPipeline:
                     break # Stop looking for lower priorities (cweb/cos3d) for this filter
             
             if best_file_for_filter:
-                selected_files.append(best_file_for_filter)
+                selected_files[filter_name] = best_file_for_filter
                 
-        return selected_files if len(selected_files) > 0 else None
-    
+        # 1. Map filters to central wavelengths (microns) for correct physical sorting
+        wavelength_map = {
+            'F560W': 5.6,
+            'F770W': 7.7,
+            'F1000W': 10.0,
+            'F1130W': 11.3,
+            'F1280W': 12.8,
+            'F1500W': 15.0,
+            'F1800W': 18.0,
+            'F2100W': 21.0,
+            'F2550W': 25.5
+        }
+        
+        # 2. Sort the dictionary by wavelength using our mapping
+        # We use .get(k, 99.0) to handle any unexpected filter names by putting them at the end
+        sorted_keys = sorted(selected_files.keys(), key=lambda k: wavelength_map.get(k, 99.0))
+        sorted_files = {k: selected_files[k] for k in sorted_keys}
+
+        return sorted_files if len(sorted_files) > 0 else None
+            
     def _parse_path_metadata(self, file_path):
         """
         Extracts metadata from the directory structure.
@@ -709,33 +742,6 @@ class MIRIPipeline:
 
         return correction_factor
         
-    
-    def run_photometry(self, filter_name, apply_aper_corr=False):
-        """
-        Wraps the 1300-line logic but keeps it organized.
-        """
-        files = self.select_files(filter_name)
-        filter_results = []
-        
-        custom_count = sum(1 for v in self.scaling_exceptions.values() if v != 2.0)
-        print(f"Processing photometry using {custom_count} custom scale factors.")
-        
-        for fits_path in files:
-            # 1. Adjust apertures to MIRI
-            # 2. Background estimation
-            # 3. Flux measurement
-            # 4. Correction factor
-            
-            # This is where your dictionary construction happens
-            res = self._process_single_file(fits_path, filter_name, apply_aper_corr)
-            filter_results.append(res)
-            
-        return filter_results
-
-    def _process_single_file(self, fits_path, filter_name, apply_aper_corr):
-        # Internal helper: contains your measurement logic
-        # returns the dictionary you shared in your prompt
-        pass
         
     
     @staticmethod  
@@ -916,6 +922,54 @@ class MIRIPipeline:
 
 
 
+
+
+
+
+
+
+
+
+    def run_photometry(self, filter_name, apply_aper_corr=False):
+        """
+        Wraps the 1300-line logic but keeps it organized.
+        """
+        for target_id in self.all_ids:
+            
+            # 1. Hard Exclusion Check
+            if target_id in self.quality_config["exclude_all"]:
+                continue
+                
+            for filt in filters:
+                # 2. Filter-Specific Exclusion Check
+                if target_id in self.quality_config["exclude_filters"].get(filt, []):
+                    continue
+                
+                # 3. Set Flags
+                companion_flag = target_id in self.quality_config["has_companion"]
+                artefact_flag = target_id in self.quality_config["art_filters"].get(filt, [])
+                
+                try:
+                    # Perform the photometry steps we've built
+                    ap_params = self.prepare_aperture(target_id, filt)
+                    bkg_res = self.estimate_background(ap_params)
+                    measurements = self.measure_flux(ap_params, bkg_res)
+                    
+                    # Add the flags to the measurement dictionary
+                    measurements.update({
+                        "Flag_Com": companion_flag,
+                        "Flag_Art": artefact_flag
+                    })
+                    
+                    self.raw_results.append(measurements)
+                    
+                except Exception as e:
+                    print(f"Error processing {target_id} in {filt}: {e}")
+
+    def _process_single_file(self, fits_path, filter_name, apply_aper_corr):
+        # Internal helper: contains your measurement logic
+        # returns the dictionary you shared in your prompt
+        pass
 
 
 
