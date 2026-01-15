@@ -39,7 +39,6 @@ import os
 import pickle as pkl
 import random
 import warnings
-from collections import defaultdict
 import stpsf
 
 import astropy.units as u
@@ -64,22 +63,35 @@ from pathlib import Path
 from astropy.wcs import WCS
 
 from photutils.centroids import centroid_com
-from photutils.segmentation import SegmentationImage, detect_sources
+from photutils.segmentation import detect_sources
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
 
 class MIRIPipeline:
-    def __init__(self, all_ids, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
+    def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
+        
+        # Initialise directories
         self.cutouts_dir = cutouts_dir
         self.output_dir = output_dir
         self.nircam_dir = nircam_dir
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Load Master Table first to get all IDs
+        # Load aperture table
         self.master_table = Table.read(aperture_table)
-        # Ensure IDs are integers (cleaning the 'b' bytes issue we discussed)
-        self.all_ids = all_ids
+        
+         # 1. Map filters to central wavelengths (microns) for correct physical sorting
+        self.wavelength_map = {
+            'F560W': 5.6,
+            'F770W': 7.7,
+            'F1000W': 10.0,
+            'F1130W': 11.3,
+            'F1280W': 12.8,
+            'F1500W': 15.0,
+            'F1800W': 18.0,
+            'F2100W': 21.0,
+            'F2550W': 25.5
+        }
         
         # Default PSF directory if none provided
         if psf_dir is None:
@@ -220,23 +232,10 @@ class MIRIPipeline:
             
             if best_file_for_filter:
                 selected_files[filter_name] = best_file_for_filter
-                
-        # 1. Map filters to central wavelengths (microns) for correct physical sorting
-        wavelength_map = {
-            'F560W': 5.6,
-            'F770W': 7.7,
-            'F1000W': 10.0,
-            'F1130W': 11.3,
-            'F1280W': 12.8,
-            'F1500W': 15.0,
-            'F1800W': 18.0,
-            'F2100W': 21.0,
-            'F2550W': 25.5
-        }
         
-        # 2. Sort the dictionary by wavelength using our mapping
+        # Sort the dictionary by wavelength using our mapping
         # We use .get(k, 99.0) to handle any unexpected filter names by putting them at the end
-        sorted_keys = sorted(selected_files.keys(), key=lambda k: wavelength_map.get(k, 99.0))
+        sorted_keys = sorted(selected_files.keys(), key=lambda k: self.wavelength_map.get(k, 99.0))
         sorted_files = {k: selected_files[k] for k in sorted_keys}
 
         return sorted_files if len(sorted_files) > 0 else None
@@ -886,85 +885,197 @@ class MIRIPipeline:
         ap_mask = source_ap.to_mask(method='exact')
         # Weighted sum of variance (method='exact' accounts for fractional pixels)
         detector_variance = np.nansum(ap_mask.multiply(err_map**2))
-        print(detector_variance)
         
         # B. Background modelling uncertainty already calculated in estimate_background
         # bkg_std = clean_std * np.sqrt(source_ap.area)
-        bkg_error_mjysr = bkg_results["std"]
-        print(bkg_error_mjysr)
-        
-        
-        print(f"Pixels in mask: {np.sum(ap_mask.to_image(data.shape))}")
+        bkg_err_mjysr = bkg_results["std"]
         
         # C. Combine in quadrature
-        total_err_mjysr = np.sqrt(detector_variance + bkg_error_mjysr**2)
+        total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
         
         # 5. Unit Conversion (MJy/sr -> Jy)
         # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
         conv = 1e6 * pixel_area_sr
-        
         flux_jy = raw_flux_mjysr * conv
         err_jy = total_err_mjysr * conv
+        
+        # This is the "Nominal" error in Jy
+        nominal_err_jy = np.sqrt(detector_variance) * conv
+        
+        # Obtain local background and error
+        bkg_median_jy = bkg_results["median"] * conv
+        bkg_err_jy = bkg_err_mjysr * conv
         
         # 6. Final Results Dictionary
         return {
             "flux_jy": flux_jy,
             "flux_err_jy": err_jy,
-            "flux_ujy": flux_jy * 1e6,
-            "flux_err_ujy": err_jy * 1e6,
             "snr": flux_jy / err_jy if err_jy > 0 else 0,
             "area_pix": source_ap.area,
-            "bkg_median_mjysr": bkg_results["median"],
-            "skew_flag": "HIGH" if bkg_results.get("skew", 0) > 3.0 else "CLEAN"
+            "bkg_median_jy": bkg_median_jy,
+            "bkg_err_jy": bkg_err_jy,
+            "nominal_err_jy": nominal_err_jy,
+            "skew_flag": bkg_results["skew_flag"]
         }
+
+    def run_photometry(self, all_ids):
+        """
+        Function to do the heavy lifting. Runs the entire photometry
+        """
         
-
-
-
-
-
-
-
-
-
-
-
-
-    def run_photometry(self, filter_name, apply_aper_corr=False):
-        """
-        Wraps the 1300-line logic but keeps it organized.
-        """
-        for target_id in self.all_ids:
-            
-            # 1. Hard Exclusion Check
+        all_rows = []
+        
+        for target_id in all_ids:
             if target_id in self.quality_config["exclude_all"]:
                 continue
                 
-            for filt in filters:
-                # 2. Filter-Specific Exclusion Check
+            # This dict will eventually become ONE row in the table
+            galaxy_row = {"ID": target_id}
+            
+            # Track if we've stored general aperture yet
+            aperture_stored = False
+            files = self.find_files(target_id)
+            
+            for filt, file in files.items():
                 if target_id in self.quality_config["exclude_filters"].get(filt, []):
                     continue
                 
-                # 3. Set Flags
-                companion_flag = target_id in self.quality_config["has_companion"]
-                artefact_flag = target_id in self.quality_config["art_filters"].get(filt, [])
-                
                 try:
-                    # Perform the photometry steps we've built
-                    ap_params = self.prepare_aperture(target_id, filt)
+                    # Perform the photometry steps:
+                    
+                    # 1. Prepare the apertures for MIRI
+                    ap_params = self.prepare_aperture(file, rescale=True)
+                    
+                    # 2. Create background model
                     bkg_res = self.estimate_background(ap_params)
+                    
+                    # 3. Measure fluxes
                     measurements = self.measure_flux(ap_params, bkg_res)
                     
-                    # Add the flags to the measurement dictionary
-                    measurements.update({
-                        "Flag_Com": companion_flag,
-                        "Flag_Art": artefact_flag
-                    })
+                    # 4. Compute PSF correction
+                    psf_corr = self.calculate_psf_corr(ap_params)
                     
-                    self.raw_results.append(measurements)
+                    # Get (uncorrected) aperture fluxes
+                    apflux = measurements["flux_jy"]                    
+                    apflux_err = measurements["flux_err_jy"]
+                    
+                    # Get PSF-corrected fluxes
+                    flux_corr = measurements["flux_jy"] * psf_corr 
+                    flux_err_corr = measurements["flux_err_jy"] * psf_corr
+                    
+                    # --- Convert fluxes into AB magnitudes ---
+                    if flux_corr > 0:
+                        # constant is 8.90 for Jy and 23.90 for µJy
+                        ab_mag = -2.5 * np.log10(flux_corr) + 8.90
+                    else:
+                        ab_mag = np.nan
+
+                    
+                    # Get nominal flux error (from ERR extension)
+                    apflux_errnominal = measurements["nominal_err_jy"]
+                    
+                    # Get local bkg estimates (median + error)
+                    n_pix = measurements["area_pix"]
+                    bkg_median_jy = measurements["bkg_median_jy"]
+                    local_bkg = bkg_median_jy * n_pix
+                    bkg_err = measurements["bkg_err_jy"]
+                    
+                    # --- Fill Filter-Specific Columns ---
+                    galaxy_row[f"{filt}_flux"] = flux_corr
+                    galaxy_row[f"{filt}_flux_err"] = flux_err_corr
+                    galaxy_row[f"{filt}_abmag"] = ab_mag
+                    galaxy_row[f"{filt}_apflux"] = apflux
+                    galaxy_row[f"{filt}_apflux_err"] = apflux_err
+                    galaxy_row[f"{filt}_apflux_errnominal"] = apflux_errnominal
+                    galaxy_row[f"{filt}_apcorr"] = psf_corr
+                    galaxy_row[f"{filt}_bkg"] = local_bkg
+                    galaxy_row[f"{filt}_bkg_err"] = bkg_err
+                    
+                    # Handle the "varying" parameters per band
+                    galaxy_row[f"{filt}_theta"] = np.degrees(ap_params["theta"])
+                    galaxy_row[f"{filt}_x"] = ap_params["x"]
+                    galaxy_row[f"{filt}_y"] = ap_params["y"]
+                    galaxy_row[f"{filt}_flag_art"] = True in self.quality_config["art_filters"].get(filt, [])
+                    
+                    # Store "Scalar" values once
+                    if not geometry_stored:
+                        galaxy_row["MIRI_ap_a"] = ap_params["a"]
+                        galaxy_row["MIRI_ap_b"] = ap_params["b"]
+                        galaxy_row["MIRI_npix"] = n_pix
+                        galaxy_row["Flag_Com"] = True in self.quality_config["has_companion"]
+                        geometry_stored = True
                     
                 except Exception as e:
                     print(f"Error processing {target_id} in {filt}: {e}")
+                
+            # Only add the row if we actually measured something
+            if len(galaxy_row) > 1:
+                all_rows.append(galaxy_row)
+
+        # 2. Convert to DataFrame and finalize
+        df = pd.DataFrame(all_rows)
+        return df
+                    
+    
+    def run_photometry(self):
+        all_rows = []
+        
+        for target_id in self.all_ids:
+            if target_id in self.quality_config["exclude_all"]:
+                continue
+                
+            # This dict will eventually become ONE row in the table
+            galaxy_row = {"ID": target_id}
+            
+            # Track if we've stored general geometry yet
+            geometry_stored = False
+            files = self.find_files(target_id)
+            
+            for filt, file in files.items():
+                if target_id in self.quality_config["exclude_filters"].get(filt, []):
+                    continue
+
+                try:
+                    ap_params = self.prepare_aperture(file, rescale=True)
+                    bkg_res = self.estimate_background(ap_params)
+                    measurements = self.measure_flux(ap_params, bkg_res)
+                    psf_corr = self.calculate_psf_corr(ap_params)
+                    
+                    # Apply Correction
+                    flux_total = measurements["flux_jy"] * psf_corr
+                    flux_err_total = measurements["flux_err_jy"] * psf_corr
+                    
+                    # --- Fill Filter-Specific Columns ---
+                    galaxy_row[f"{filt}_flux"] = flux_total
+                    galaxy_row[f"{filt}_flux_err"] = flux_err_total
+                    galaxy_row[f"{filt}_apflux"] = measurements["flux_jy"]
+                    galaxy_row[f"{filt}_apcorr"] = psf_corr
+                    galaxy_row[f"{filt}_abmag"] = -2.5 * np.log10(flux_total) + 8.90 if flux_total > 0 else np.nan
+                    
+                    # Handle the "Varying" parameters per band
+                    galaxy_row[f"{filt}_theta"] = np.degrees(ap_params["theta"])
+                    galaxy_row[f"{filt}_x_center"] = ap_params["x"]
+                    galaxy_row[f"{filt}_y_center"] = ap_params["y"]
+                    galaxy_row[f"{filt}_flag_art"] = target_id in self.quality_config["art_filters"].get(filt, [])
+                    
+                    # Store "Scalar" values once (they should be same-ish across bands)
+                    if not geometry_stored:
+                        galaxy_row["MIRI_ap_a"] = ap_params["a"]
+                        galaxy_row["MIRI_ap_b"] = ap_params["b"]
+                        galaxy_row["MIRI_npix"] = ap_params["pixel_count"]
+                        galaxy_row["Flag_Com"] = target_id in self.quality_config["has_companion"]
+                        geometry_stored = True
+
+                except Exception as e:
+                    print(f"Error on {target_id} [{filt}]: {e}")
+
+            # Only add the row if we actually measured something
+            if len(galaxy_row) > 1:
+                all_rows.append(galaxy_row)
+
+        # 2. Convert to DataFrame and finalize
+        df = pd.DataFrame(all_rows)
+        return df
 
     def _process_single_file(self, fits_path, filter_name, apply_aper_corr):
         # Internal helper: contains your measurement logic
