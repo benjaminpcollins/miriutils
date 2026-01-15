@@ -64,9 +64,11 @@ from astropy.wcs import WCS
 
 from photutils.centroids import centroid_com
 from photutils.segmentation import detect_sources
+from photutils.utils.exceptions import NoDetectionsWarning
 
 # Suppress common WCS-related warnings that don't affect functionality
 warnings.simplefilter("ignore", category=FITSFixedWarning)
+warnings.filterwarnings('ignore', category=NoDetectionsWarning)
 
 class MIRIPipeline:
     def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
@@ -332,7 +334,7 @@ class MIRIPipeline:
         # Project NIRCam pixel center to World (RA/Dec) then to MIRI pixels
         sky_coord = wcs_ni.pixel_to_world(row["Apr_Xcenter"], row["Apr_Ycenter"])
         miri_x, miri_y = wcs_miri.world_to_pixel(sky_coord)
-
+        
         # --- 4. Rotation Logic ---
         # The change in rotation between the two images
         delta_rot = miri_rotation - ni_rotation
@@ -915,23 +917,80 @@ class MIRIPipeline:
             "nominal_err_jy": nominal_err_jy,
             "skew_flag": bkg_results["skew_flag"]
         }
+    
+    def get_filter_column_template(self, filt):
+        """Defines the standard set of columns for any single MIRI band."""
+        return {
+            f"{filt}_flux": np.nan,
+            f"{filt}_flux_err": np.nan,
+            f"{filt}_abmag": np.nan,
+            f"{filt}_apflux": np.nan,
+            f"{filt}_apflux_err": np.nan,
+            f"{filt}_apflux_errnominal": np.nan,
+            f"{filt}_apcorr": np.nan,
+            f"{filt}_bkg": np.nan,
+            f"{filt}_bkg_err": np.nan,
+            f"{filt}_ap_x": np.nan,
+            f"{filt}_ap_y": np.nan,
+            f"{filt}_ap_theta": np.nan,
+            f"{filt}_flag_art": False,  # Boolean default
+        }
+
+    def pre_scan_filters(self):
+        """
+        Crawls the cutouts directory to identify all MIRI filters available in the dataset.
+        """
+        root = Path(self.cutouts_dir)
+        # This looks for the filter folder name (e.g., .../primer1/F770W/fits/)
+        # Adjust the glob pattern if your folder structure is different
+        filter_dirs = root.glob("*/*/fits")
+        
+        found_filters = {p.parent.name.upper() for p in filter_dirs}
+        
+        # Sort them by wavelength using your existing wavelength_map
+        sorted_filters = sorted(
+            list(found_filters), 
+            key=lambda k: self.wavelength_map.get(k, 99.0)
+        )
+        
+        return sorted_filters
 
     def run_photometry(self, all_ids, output_filename):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
         
+        print("========== MIRI Photometry Pipeline v3 =========")
+        
         all_rows = []
+        all_filters = self.pre_scan_filters()
+        print("Scanned for all bands and found: ")
+        print(all_filters)
+        print("Initialising empty table sturcture...")
         
         for target_id in all_ids:
             if target_id in self.quality_config["exclude_all"]:
                 continue
                 
-            # This dict will eventually become ONE row in the table
-            galaxy_row = {"ID": target_id}
+            # Base identity for the galaxy
+            galaxy_row = {
+                "ID": target_id,
+                "MIRI_ap_a": np.nan,
+                "MIRI_ap_b": np.nan,
+                "MIRI_ap_npix": np.nan,
+                "Flag_Com": target_id in self.quality_config["has_companion"]
+            }
+            
+            # Pre-populate with columns for all filters ALREADY discovered
+            for filt in all_filters:
+                galaxy_row.update(self.get_filter_column_template(filt))
+            
+            files = self.find_files(target_id)
+            if not files: 
+                continue
             
             # Track if we've stored general aperture yet
-            aperture_stored = False
+            ap_geometry_stored = False
             files = self.find_files(target_id)
             
             for filt, file in files.items():
@@ -990,22 +1049,24 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
                     # Handle the "varying" parameters per band
-                    galaxy_row[f"{filt}_theta"] = np.degrees(ap_params["theta"])
-                    galaxy_row[f"{filt}_x"] = ap_params["x"]
-                    galaxy_row[f"{filt}_y"] = ap_params["y"]
-                    galaxy_row[f"{filt}_flag_art"] = True in self.quality_config["art_filters"].get(filt, [])
+                    galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
+                    galaxy_row[f"{filt}_ap_x"] = ap_params["x"].item()
+                    galaxy_row[f"{filt}_ap_y"] = ap_params["y"].item()
+                    
+                    # This returns exactly True or False
+                    is_artifact = target_id in self.quality_config["art_filters"].get(filt, [])
+                    galaxy_row[f"{filt}_flag_art"] = target_id in self.quality_config["art_filters"].get(filt, [])
                     
                     # Store "Scalar" values once
-                    if not geometry_stored:
+                    if not ap_geometry_stored:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
-                        galaxy_row["MIRI_npix"] = n_pix
-                        galaxy_row["Flag_Com"] = True in self.quality_config["has_companion"]
-                        geometry_stored = True
+                        galaxy_row["MIRI_ap_npix"] = n_pix
+                        ap_geometry_stored = True
                     
                 except Exception as e:
                     print(f"Error processing {target_id} in {filt}: {e}")
-                
+            
             # Only add the row if we actually measured something
             if len(galaxy_row) > 1:
                 all_rows.append(galaxy_row)
@@ -1020,21 +1081,18 @@ class MIRIPipeline:
         self.save_catalogue(df, phot_table_path)
         
                     
-    def save_catalogue(self, df, output_filename):
-        # Convert pandas to Astropy Table
-        # Astropy handles the 'Wide' column format beautifully
-        final_table = Table.from_pandas(df)
+    def save_catalogue(self, df, base_filename):
+        """Saves the result in both FITS (Science) and CSV (Human-Readable)."""
+        # Save CSV
+        csv_path = f"{base_filename}.csv"
+        df.to_csv(csv_path, index=False)
         
-        # Optional: Add metadata/units to columns
-        for col in final_table.colnames:
-            if "flux" in col:
-                final_table[col].unit = 'Jy'
-            if "theta" in col:
-                final_table[col].unit = 'deg'
-                
-        final_table.write(output_filename, format='fits', overwrite=True)
-        print("=====================================================")
-        print(f"💾 Catalogue saved with {len(final_table)} sources and {len(final_table.colnames)} columns.")
+        # Save FITS
+        fits_path = f"{base_filename}.fits"
+        table = Table.from_pandas(df)
+        table.write(fits_path, format='fits', overwrite=True)
+        
+        print(f"Catalog exported to:\n1. {csv_path}\n2. {fits_path}")
 
 
 
@@ -1312,48 +1370,6 @@ def get_aperture_params(galaxy_id, filter, aperture_table):
         "theta": (row["Apr_Theta"] * u.deg).to_value(u.rad),  # Convert to radians
     }
 
-
-def calculate_aperture_correction(psf_data, aperture_params):
-    """
-    Calculate aperture correction factor for given PSF and aperture.
-
-    Parameters
-    ----------
-    psf_data
-        Loaded PSF data
-    aperture_params : dict
-        Aperture parameters
-
-    Returns
-    -------
-    correction_factor : float
-        Aperture correction factor
-    """
-
-    # Check for proper normalisation
-    total_flux = np.sum(psf_data)
-    if not np.isclose(total_flux, 1.0, atol=1e-3):
-        print(f"Warning: PSF not normalised (sum = {total_flux:.6f}). Normalising now.")
-        psf_data /= total_flux
-
-    # Find centroid of the PSF
-    x_cen, y_cen = centroid_com(psf_data)
-
-    aperture = EllipticalAperture(
-        positions=(x_cen, y_cen),
-        a=aperture_params["a"],
-        b=aperture_params["b"],
-        theta=aperture_params["theta"],
-    )
-
-    # Ensure background is subtracted
-    psf_data -= np.median(psf_data[psf_data < np.percentile(psf_data, 10)])
-
-    # Calculate flux in aperture using exact method
-    phot_table = aperture_photometry(psf_data, aperture, method="exact")
-    flux_in_aperture = phot_table["aperture_sum"][0]
-    correction_factor = total_flux / flux_in_aperture
-    return correction_factor
 
 
 
