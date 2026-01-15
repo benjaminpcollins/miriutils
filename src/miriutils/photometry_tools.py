@@ -1,78 +1,119 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "astropy",
+#     "h5py",
+#     "matplotlib",
+#     "numpy",
+#     "pandas",
+#     "photutils",
+#     "scipy",
+#     "stpsf",
+# ]
+# ///
 """
-MIRI Utils Photometry Pipeline
-==============================
+MIRI Utils: Photometric Pipeline Module
+==========================================
 
-Functions for performing aperture photometry on MIRI (Mid-Infrared Instrument) images.
+This module provides the MiriPipeline class, a specialized framework designed
+to produce publication-ready mid-infrared photometry for the Blue Jay survey.
+It automates the transition from raw FITS cutouts in the '_i2d.fits' format to
+aperture-corrected Janskys.
 
-This module provides tools for:
-- Background estimation and subtraction using 2D plane fitting
-- Aperture photometry with elliptical apertures
-- PSF-based aperture corrections
-- Flux and uncertainty calculations
-- Visualisation of photometry results
+Class
+-------
+    - MiriPipeline: The core engine for batch processing MIRI photometry.
 
-The primary workflow involves:
-1. Loading FITS image data and error maps
-2. Estimating background using sigma-clipped plane fitting
-3. Measuring source flux within defined apertures
-4. Applying aperture corrections based on PSF models
-5. Converting measurements to physical units (Jy, AB magnitudes)
+Key Capabilities
+----------------
+    - Automated "Wide" Table generation (one row per ID, columns per band).
+    - Multi-instrument WCS alignment and automated aperture adjustment.
+    - Local background modeling using iterative sigma-clipped 2D statistics.
+    - High-fidelity aperture corrections using 4x oversampled stpsf models.
+    - Rigorous error propagation including nominal detector noise and 
+      background modeling uncertainties.
+    - Quality flagging for detector artefacts and companion contamination.
+    - Stores data for visualising the background modelling in h5py format
+      and provides functions for easy reading and plotting.
+
+Workflow
+--------
+    1. Pre-scans directories to initialize a type-safe, wavelength-ordered table structure.
+    2. Aligns science apertures based on Blue Jay (NIRCam F444W) morphology.
+    3. Performs exact aperture photometry and background estimation.
+    4. Calculates band-specific PSF corrections on an oversampled grid.
+    5. Exports a dual-format (FITS/CSV) catalogue with standardised columns.
 
 Example usage
 -------------
-    from miri_utils.photometry import perform_photometry
+    from miri_utils import MiriPipeline
 
-    perform_photometry(
-        cutout_files=['data/12345_F770W.fits', 'data/12345_F1800W.fits'],
-        aperture_table='data/apertures.csv',
-        output_folder='results/'
+    ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
+    
+    # Initialise the pipeline
+    pipeline = BlueJayMiriPipeline(
+        all_ids=ids_to_process,
+        cutout_dir="./data/cutouts",
+        output_dir="./miri_photometry",
+        nircam_dir="./NIRCam/cutouts",
+        aperture_table="./data/aperture_table.fits"
     )
 
+    # Run full survey photometry and store FITS and CSV format output tables
+    pipeline.run_photometry(write_to="Phot_Table_MIRI")
+    
+
 Author: Benjamin P. Collins
-Date: May 15, 2025
-Version: 2.0
+Date: January 15, 2026
+Version: 3.2.0
 """
 
+import os
+import time
+import warnings
+import random
 import glob
 import json
-import os
 import pickle as pkl
-import random
-import warnings
-import stpsf
-import time
-
-import astropy.units as u
-import h5py
-from scipy.stats import skew
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-import numpy as np
-import pandas as pd
-from astropy.io import fits
-from astropy.stats import sigma_clip, sigma_clipped_stats
-from astropy.table import MaskedColumn, Table
-from astropy.wcs import FITSFixedWarning
-from photutils.aperture import (
-    EllipticalAnnulus,
-    EllipticalAperture,
-    aperture_photometry,
-)
 from pathlib import Path
 
-from astropy.wcs import WCS
+import numpy as np
+import pandas as pd
+import h5py
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+from matplotlib.colors import LogNorm
+from scipy.stats import skew
 
+import astropy.units as u
+from astropy.io import fits
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.table import Table, MaskedColumn
+from astropy.stats import sigma_clip, sigma_clipped_stats
+
+import stpsf
+from photutils.aperture import (
+    EllipticalAperture,
+    EllipticalAnnulus,
+    aperture_photometry,
+)
 from photutils.centroids import centroid_com
 from photutils.segmentation import detect_sources
 from photutils.utils.exceptions import NoDetectionsWarning
 
-# Suppress common WCS-related warnings that don't affect functionality
+# --- Global Configuration & Silencing ---
+
+# Suppress common WCS-related warnings that don't affect photometric accuracy
 warnings.simplefilter("ignore", category=FITSFixedWarning)
+
+# Silencing NoDetectionsWarning from segmentation-mapping
 warnings.filterwarnings('ignore', category=NoDetectionsWarning)
 
+# --- Standalone Utility Functions ---
 class MIRIPipeline:
-    def __init__(self, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
+    def __init__(self, all_ids, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
         
         # Initialise directories
         self.cutouts_dir = cutouts_dir
@@ -82,6 +123,8 @@ class MIRIPipeline:
         
         # Load aperture table
         self.master_table = Table.read(aperture_table)
+        
+        self.all_ids = all_ids
         
          # 1. Map filters to central wavelengths (microns) for correct physical sorting
         self.wavelength_map = {
@@ -956,7 +999,7 @@ class MIRIPipeline:
         
         return sorted_filters
 
-    def run_photometry(self, all_ids, output_filename):
+    def run_photometry(self, write_to):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
@@ -979,7 +1022,7 @@ class MIRIPipeline:
         
         print(f"\n[INFO] Survey Discovery:")
         print(f"  > Found {len(all_filters)} MIRI bands: {', '.join(all_filters)}")
-        print(f"  > Target Galaxy Count: {len(all_ids)}")
+        print(f"  > Target Galaxy Count: {len(self.all_ids)}")
         print(f"  > Initialising 'Wide' table structure...")
         
         # Simple progress bar visualization for the initialization
@@ -992,7 +1035,7 @@ class MIRIPipeline:
         
         all_rows = []
         
-        for target_id in all_ids:
+        for target_id in self.all_ids:
             if target_id in self.quality_config["exclude_all"]:
                 continue
                 
@@ -1101,7 +1144,7 @@ class MIRIPipeline:
         table_dir = os.path.join(self.output_dir, "phot_tables")
         os.makedirs(table_dir, exist_ok=True)
         
-        phot_table_path = os.path.join(table_dir, output_filename)
+        phot_table_path = os.path.join(table_dir, write_to)
         self.save_catalogue(df, phot_table_path)
         
                     
@@ -1114,6 +1157,18 @@ class MIRIPipeline:
         # Save FITS
         fits_path = f"{base_filename}.fits"
         table = Table.from_pandas(df)
+        
+        for col_name in table.colnames:
+            # We only want to mask numerical data (Fluxes, Mags, etc.)
+            if any(key in col_name for key in ['flux', 'abmag', 'bkg', 'err']):
+                data = table[col_name].data
+                
+                # Create a mask where values are NaN
+                mask = np.isnan(data)
+                
+                # Replace the column with a MaskedColumn
+                table[col_name] = MaskedColumn(data, name=col_name, mask=mask, fill_value=np.nan)
+            
         table.write(fits_path, format='fits', overwrite=True)
         
         print(f"Catalog exported to:\n1. {csv_path}\n2. {fits_path}")
