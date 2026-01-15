@@ -40,6 +40,7 @@ import pickle as pkl
 import random
 import warnings
 import stpsf
+import time
 
 import astropy.units as u
 import h5py
@@ -960,13 +961,36 @@ class MIRIPipeline:
         Function to do the heavy lifting. Runs the entire photometry
         """
         
-        print("========== MIRI Photometry Pipeline v3 =========")
+        # Stylized ASCII Header
+        print("\n" + "="*60)
+        print("""
+ ____           _    ____              _ _             _ 
+|  _ \ ___   __| |  / ___|__ _ _ __ __| (_)_ __   __ _| |
+| |_) / _ \ / _` | | |   / _` | '__/ _` | | '_ \ / _` | |
+|  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
+|_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
+        """)
+        print("                 JWST MIRI PIPELINE v3.0")
+        print("                 MIRI Photometry for JWST")
+        print("="*60)
+        
+        # Pre-scan and visual summary
+        all_filters = self.pre_scan_filters()
+        
+        print(f"\n[INFO] Survey Discovery:")
+        print(f"  > Found {len(all_filters)} MIRI bands: {', '.join(all_filters)}")
+        print(f"  > Target Galaxy Count: {len(all_ids)}")
+        print(f"  > Initialising 'Wide' table structure...")
+        
+        # Simple progress bar visualization for the initialization
+        print("\nPreparing Columns: [", end="")
+        for i in range(20):
+            time.sleep(0.02) # Just for aesthetic effect
+            print("■", end="", flush=True)
+        print("] 100%\n")
+
         
         all_rows = []
-        all_filters = self.pre_scan_filters()
-        print("Scanned for all bands and found: ")
-        print(all_filters)
-        print("Initialising empty table sturcture...")
         
         for target_id in all_ids:
             if target_id in self.quality_config["exclude_all"]:
