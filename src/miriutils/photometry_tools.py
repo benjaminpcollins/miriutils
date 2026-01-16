@@ -86,6 +86,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
 from scipy.stats import skew
+from scipy.ndimage import binary_dilation
 
 import astropy.units as u
 from astropy.io import fits
@@ -474,7 +475,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=3.0, save_vis=None):
+    def estimate_background(self, aperture_params, sigma_val=2.5, save_vis=None):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -493,16 +494,26 @@ class MIRIPipeline:
         
         # 2. Initial Sigma Clipping & Source Detection for Masking
         # We ignore the source and NaNs
-        init_mask = source_mask | np.isnan(data)
-        _, median_bkg, std_bkg = sigma_clipped_stats(data, sigma=2.5, mask=init_mask, maxiters=5)
-        threshold = median_bkg + (sigma_val * std_bkg)
+        # 1. Create an oversized Source Mask (Buffer of 2-3x the aperture)
+        # This prevents the target's own light from biasing the background
+        a_in, b_in = a + 8, b + 8
         
-        # Detect other sources in the field to exclude from background fit
-        segm = detect_sources(data, threshold, npixels=5)
-        segm_mask = (segm.data > 0) if segm else np.zeros_like(data, dtype=bool)
+        bkg_source_ap = EllipticalAperture((x, y), a=a_in, b=b_in, theta=theta)
+        source_mask_large = bkg_source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
+
+        # 2. Aggressive Neighbor Detection
+        # We use a very low threshold (1.5 sigma) to catch faint wings
+        init_mask = source_mask_large | np.isnan(data)
+        _, median_init, std_init = sigma_clipped_stats(data, sigma=3.0, mask=init_mask, maxiters=5)
+
+        # Stricter detection threshold for the mask
+        detection_threshold = median_init + (2.0 * std_init) 
+        segm = detect_sources(data, detection_threshold, npixels=5)
+
+        segm_mask = (segm.data > 0) if segm else np.zeros_like(data, dtype=bool) 
         
-        # Combined mask: Source + other objects + NaNs
-        combined_mask = source_mask | segm_mask | np.isnan(data)
+        # 3. Final Combined Mask
+        combined_mask = source_mask_large | segm_mask | np.isnan(data)
         
         # 3. 2D Plane Fit (Global Gradient)
         yi, xi = np.indices(data.shape)
@@ -512,7 +523,8 @@ class MIRIPipeline:
         z = data[fit_mask]
         
         if len(z) < 10: # Safety check
-            coeffs = [0, 0, median_bkg] # Fallback to flat median
+            coeffs = [0, 0, median_init] # Fallback to flat median
+            print("Safety check failed, fallback")
         else:
             coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
         
@@ -521,7 +533,7 @@ class MIRIPipeline:
         data_bkgsub = data - background_plane
 
         # 4. Define elliptical annulus based on aperture size         
-        a_in, b_in = a + 8, b + 8
+        
         
         # Dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
@@ -556,7 +568,7 @@ class MIRIPipeline:
         if len(bkg_residuals) > 0:
             # Sigma clipping will throw away artefacts with very large skew
             # This identifies which pixels in the residuals were rejected
-            clipped_array = sigma_clip(bkg_residuals, sigma=3.0, maxiters=5, cenfunc=np.median)
+            clipped_array = sigma_clip(bkg_residuals, sigma=2.5, maxiters=5, cenfunc=np.median)
             # The '.mask' attribute is True where pixels were REJECTED
             clipped_mask_indices = clipped_array.mask
 
@@ -581,7 +593,7 @@ class MIRIPipeline:
         mask_vis = np.zeros_like(data, dtype=int)        
         mask_vis[~combined_mask] = 1 # All pixels used by the 2D plane fit
         mask_vis[bkg_pixels_mask] = 2  # Pixels in the annulus/rectangle
-        mask_vis[source_mask] = 4  # Source pixels
+        mask_vis[source_mask_large] = 4  # Source pixels
         mask_vis[clipped_map_2d] = 3 # Rejected by additional sigma_clipping
         # All other pixels are 0 -> Excluded/NaN       
         
@@ -605,7 +617,7 @@ class MIRIPipeline:
             "segmentation_mask": segm_mask,
             "background_region_mask": ann_mask,
             "region_name": "Annulus",
-            "source_mask": source_mask,
+            "source_mask": source_mask_large,
             "aperture_params": aperture_map,
             "a_in": a_in,
             "b_in": b_in,
@@ -999,7 +1011,7 @@ class MIRIPipeline:
         
         return sorted_filters
 
-    def run_photometry(self, write_to):
+    def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
@@ -1025,13 +1037,15 @@ class MIRIPipeline:
         print(f"  > Target Galaxy Count: {len(self.all_ids)}")
         print(f"  > Initialising 'Wide' table structure...")
         
-        # Simple progress bar visualization for the initialization
+        # Simple progress bar visualisation for the initialisation
         print("\nPreparing Columns: [", end="")
         for i in range(20):
             time.sleep(0.02) # Just for aesthetic effect
             print("■", end="", flush=True)
         print("] 100%\n")
 
+        if rescale == False:
+            print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
         
         all_rows = []
         
@@ -1068,16 +1082,19 @@ class MIRIPipeline:
                     # Perform the photometry steps:
                     
                     # 1. Prepare the apertures for MIRI
-                    ap_params = self.prepare_aperture(file, rescale=True)
+                    ap_params = self.prepare_aperture(file, rescale=rescale)
                     
                     # 2. Create background model
                     bkg_res = self.estimate_background(ap_params)
+                    
+                    if plot_mosaics is True:
+                        self.plot_background_diagnostic(ap_params, bkg_res)
                     
                     # 3. Measure fluxes
                     measurements = self.measure_flux(ap_params, bkg_res)
                     
                     # 4. Compute PSF correction
-                    psf_corr = self.calculate_psf_corr(ap_params)
+                    psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
                     # Get (uncorrected) aperture fluxes
                     apflux = measurements["flux_jy"]                    
