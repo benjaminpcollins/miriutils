@@ -475,7 +475,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=2.5, save_vis=None):
+    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=2):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -488,54 +488,78 @@ class MIRIPipeline:
         
         filt = aperture_params["meta"]["filter"]
 
-        # 1. Create Source Mask
+        # 1. Create an two source masks (buffer around the aperture)
         source_ap = EllipticalAperture((x, y), a=a, b=b, theta=theta)
         source_mask = source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
         
-        # 2. Initial Sigma Clipping & Source Detection for Masking
-        # We ignore the source and NaNs
-        # 1. Create an oversized Source Mask (Buffer of 2-3x the aperture)
-        # This prevents the target's own light from biasing the background
+        # The large source mask prevents the target's own light from biasing the background
         a_in, b_in = a + 8, b + 8
-        
         bkg_source_ap = EllipticalAperture((x, y), a=a_in, b=b_in, theta=theta)
         source_mask_large = bkg_source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
 
         # 2. Aggressive Neighbor Detection
         # We use a very low threshold (1.5 sigma) to catch faint wings
         init_mask = source_mask_large | np.isnan(data)
-        _, median_init, std_init = sigma_clipped_stats(data, sigma=3.0, mask=init_mask, maxiters=5)
+        _, median_init, std_init = sigma_clipped_stats(data, sigma=sigma_val, mask=init_mask, maxiters=5)
 
         # Stricter detection threshold for the mask
         detection_threshold = median_init + (2.0 * std_init) 
-        segm = detect_sources(data, detection_threshold, npixels=5)
+        segm = detect_sources(data, detection_threshold, npixels=8)
 
         segm_mask = (segm.data > 0) if segm else np.zeros_like(data, dtype=bool) 
         
-        # 3. Final Combined Mask
+        # 3. Final Combined Mask 
         combined_mask = source_mask_large | segm_mask | np.isnan(data)
         
-        # 3. 2D Plane Fit (Global Gradient)
+        # 4. Compute 2D plane fit 
+        # 4a. Initial rough Fit Mask (Source + Large Neighbors masked)
         yi, xi = np.indices(data.shape)
-        fit_mask = ~combined_mask   # fit_mask now includes all data used for the fit
-        
-        A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
-        z = data[fit_mask]
-        
-        if len(z) < 10: # Safety check
-            coeffs = [0, 0, median_init] # Fallback to flat median
-            print("Safety check failed, fallback")
-        else:
-            coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
-        
-        alpha, beta, gamma = coeffs
-        background_plane = alpha * xi + beta * yi + gamma
-        data_bkgsub = data - background_plane
+        fit_mask = ~combined_mask 
 
-        # 4. Define elliptical annulus based on aperture size         
+        # Initialise coefficients for the loop
+        coeffs = [0, 0, median_init] 
         
+        print(f"  > Starting iterative plane fit ({n_iters} iterations)...")
         
-        # Dynamic outer radius based on image bounds to prevent crashes
+        for i in range(n_iters):
+            # 1. Prepare the design matrix for pixels in the current mask
+            A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
+            z = data[fit_mask]
+            
+            if len(z) < 10:
+                break # Safety break if we mask too much
+                
+            # 2. Solve for Plane: z = alpha*x + beta*y + gamma
+            coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+            alpha, beta, gamma = coeffs
+            
+            # 3. Calculate residuals of this specific fit
+            current_plane = alpha * xi + beta * yi + gamma
+            residuals = data - current_plane
+            
+            # 4. Update the mask using sigma clipping on the residuals
+            # We only look at the pixels currently in fit_mask to find new outliers
+            res_to_clip = residuals[fit_mask]
+            clipped_res = sigma_clip(res_to_clip, sigma=sigma_val, maxiters=5, cenfunc=np.median)
+            
+            # 5. Refine the fit_mask for the NEXT iteration
+            # This removes pixels that were rejected by the sigma clip
+            new_fit_mask = fit_mask.copy()
+            new_fit_mask[fit_mask] = ~clipped_res.mask
+            
+            # Check if we've stopped masking new pixels (convergence)
+            if np.array_equal(new_fit_mask, fit_mask):
+                print(f"    - Converged after {i+1} iterations.")
+                break
+                
+            fit_mask = new_fit_mask
+
+        # Final Plane Generation
+        background_plane = alpha * xi + beta * yi + gamma
+        data_bkgsub = data - background_plane        
+    
+        # 5. Define elliptical annulus for local background estimate 
+        # Set dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
         dist_to_edge = min(x, img_w - x, y, img_h - y)
         a_out = dist_to_edge - 2    # 2 pixel buffer at the image boundaries
@@ -549,10 +573,10 @@ class MIRIPipeline:
         # Only use pixels that are in the annulus AND not a detected source
         bkg_pixels_mask = ann_mask & ~combined_mask
         
-        # 5. Final Stats
+        # 6. Final Stats
         bkg_residuals = data_bkgsub[bkg_pixels_mask]
         
-        # 2. Check for Skewness (= presence of artefacts)
+        # 7. Check for Skewness (= presence of artefacts)
         current_skew = skew(bkg_residuals)
         
         # Assign a flag level
@@ -565,36 +589,18 @@ class MIRIPipeline:
         else:
             skew_flag = "CLEAN"     
         
-        if len(bkg_residuals) > 0:
-            # Sigma clipping will throw away artefacts with very large skew
-            # This identifies which pixels in the residuals were rejected
-            clipped_array = sigma_clip(bkg_residuals, sigma=2.5, maxiters=5, cenfunc=np.median)
-            # The '.mask' attribute is True where pixels were REJECTED
-            clipped_mask_indices = clipped_array.mask
-
-            # 2. Extract stats from the unclipped portions
-            clean_median = np.ma.median(clipped_array)
-            clean_std = np.ma.std(clipped_array)
-            
-            # 3. Update mask_vis to show WHERE the clipping happened
-            # We need to map the 1D clipped_mask back to the 2D image
-            clipped_map_2d = np.zeros_like(data, dtype=bool)
-            # Use the same indices that defined bkg_pixels_mask
-            clipped_map_2d[bkg_pixels_mask] = clipped_mask_indices
-            
-            background_median = clean_median
-            background_std = clean_std * np.sqrt(source_ap.area)
-            
-        else:
-            print("⚠️ No background residuals available, standard deviation and median defaulting to 0.")
-            background_std, background_median = 0, 0
-        
         # Initialise mask visualisation for plotting
         mask_vis = np.zeros_like(data, dtype=int)        
-        mask_vis[~combined_mask] = 1 # All pixels used by the 2D plane fit
-        mask_vis[bkg_pixels_mask] = 2  # Pixels in the annulus/rectangle
-        mask_vis[source_mask_large] = 4  # Source pixels
-        mask_vis[clipped_map_2d] = 3 # Rejected by additional sigma_clipping
+        # 1. Start with everything as "0" (Excluded)
+
+        # 2. Assign the "Sky" pixels (all pixels used in the final iterative fit)
+        # This includes the annulus pixels that survived clipping
+        mask_vis[new_fit_mask] = 1 
+
+        # 3. Assign the "Source" pixels (your photometry aperture)
+        # We do this last so it overwrites anything else
+        mask_vis[source_mask] = 2
+        
         # All other pixels are 0 -> Excluded/NaN       
         
         aperture_map = {
@@ -692,12 +698,12 @@ class MIRIPipeline:
         # --- 4. Mask/Region Visualization ---
         mask_vis = bkg_dict["mask_vis"]
         
-        cmap_mask = plt.get_cmap('viridis', 5)
-        im4 = ax4.imshow(mask_vis, origin="lower", cmap=cmap_mask, vmin=-0.5, vmax=4.5)
+        cmap_mask = plt.get_cmap('viridis', 3)
+        im4 = ax4.imshow(mask_vis, origin="lower", cmap=cmap_mask, vmin=-0.5, vmax=2.5)
         ax4.set_title("Region Classification")
         
-        cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2, 3, 4], fraction=0.046, pad=0.04)
-        cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Annulus", "Clipped", "Source"])
+        cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2], fraction=0.046, pad=0.04)
+        cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Source"])
 
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         
