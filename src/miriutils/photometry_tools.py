@@ -71,7 +71,6 @@ Version: 3.2.0
 """
 
 import os
-import time
 import warnings
 import random
 import glob
@@ -85,8 +84,7 @@ import h5py
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
-from scipy.stats import skew
-from scipy.ndimage import binary_dilation
+from scipy.stats import skew, kurtosis
 
 import astropy.units as u
 from astropy.io import fits
@@ -161,10 +159,6 @@ class MIRIPipeline:
         
         # Place these in your __init__ or as a config block
         self.quality_config = {
-            "exclude_all": [18094, 19307],
-            "exclude_filters": {
-                "F770W": [16424], "F1000W": [], "F1800W": [12202, 12332, 16419], "F2100W": [7102, 16874],
-            },
             "art_filters": {
                 "F770W": [7185, 8013, 8469, 8500, 8843, 9517, 11136, 11137, 11494, 11716, 16516, 17793, 19098, 21451],
                 "F1000W": [],
@@ -317,7 +311,7 @@ class MIRIPipeline:
         return np.degrees(rot_rad)
     
     
-    def prepare_aperture(self, file_path, rescale=True):
+    def prepare_aperture(self, file_path, rescale):
         """
         1. Parse Metadata
         2. Load FITS/WCS
@@ -475,7 +469,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=2):
+    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -576,19 +570,15 @@ class MIRIPipeline:
         # 6. Final Stats
         bkg_residuals = data_bkgsub[bkg_pixels_mask]
         
-        # 7. Check for Skewness (= presence of artefacts)
-        current_skew = skew(bkg_residuals)
+         # 2. Extract stats from the unclipped portions
+        background_median = np.ma.median(bkg_residuals)
+        background_std = np.ma.std(bkg_residuals)
         
-        # Assign a flag level
-        if current_skew > 5.0:
-            skew_flag = "CRITICAL_SKEW"  # Likely an artifact or huge spike
-            print(f"🔴 ID {galaxy_id} in {filt}: CRITICAL SKEW detected ({current_skew:.3f}). Artefact or huge spike present...")
-        elif current_skew > 2.0:
-            skew_flag = "HIGH_SKEW"      # Check for unmasked neighbours
-            print(f"🟡 ID {galaxy_id} in {filt}: HIGH SKEW detected ({current_skew:.3f}). Check for unmasked neighbours...")
-        else:
-            skew_flag = "CLEAN"     
+        # Perform quality checks for the background residuals
+        global_bkg_res = data_bkgsub[~combined_mask]
+        quality_level, quality_reasons, quality_metrics = self.apply_quality_flagging(global_bkg_res)
         
+                
         # Initialise mask visualisation for plotting
         mask_vis = np.zeros_like(data, dtype=int)        
         # 1. Start with everything as "0" (Excluded)
@@ -650,7 +640,9 @@ class MIRIPipeline:
             "annulus": annulus,
             "source_ap": source_ap,
             "mask_vis": mask_vis,
-            "skew_flag": skew_flag
+            "quality_level": quality_level,
+            "quality_reasons": quality_reasons,
+            "quality_metrics": quality_metrics
         }
 
     def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
@@ -695,17 +687,34 @@ class MIRIPipeline:
         #ax3.legend(loc='upper right', fontsize=8)
         #plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-        # --- 4. Mask/Region Visualization ---
+        # --- 4. Mask/Region Visualisation ---
         mask_vis = bkg_dict["mask_vis"]
         
         cmap_mask = plt.get_cmap('viridis', 3)
         im4 = ax4.imshow(mask_vis, origin="lower", cmap=cmap_mask, vmin=-0.5, vmax=2.5)
         ax4.set_title("Region Classification")
         
+        # 1. Plot the Annulus Outline (The colorful boundary)
+        annulus.plot(ax=ax4, 
+                    color='black', 
+                    lw=1.2, 
+                    ls='-', 
+                    alpha=0.9, 
+                    label="Annulus")
+
+        # 2. Create the transparent fill by calling .plot again with fill=True
+        # This avoids the "no attribute" errors entirely
+        annulus.plot(ax=ax4,
+                    facecolor='white',
+                    edgecolor='none',
+                    alpha=0.15,
+                    fill=True)
+        
         cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2], fraction=0.046, pad=0.04)
         cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Source"])
 
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
+        plt.legend()
         
         # 1. Determine the destination
         if save_path is None:
@@ -976,13 +985,13 @@ class MIRIPipeline:
             "area_pix": source_ap.area,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
-            "nominal_err_jy": nominal_err_jy,
-            "skew_flag": bkg_results["skew_flag"]
+            "nominal_err_jy": nominal_err_jy
         }
     
     def get_filter_column_template(self, filt):
         """Defines the standard set of columns for any single MIRI band."""
         return {
+            # --- Photometry Results ---
             f"{filt}_flux": np.nan,
             f"{filt}_flux_err": np.nan,
             f"{filt}_abmag": np.nan,
@@ -990,12 +999,19 @@ class MIRIPipeline:
             f"{filt}_apflux_err": np.nan,
             f"{filt}_apflux_errnominal": np.nan,
             f"{filt}_apcorr": np.nan,
+            
+            # --- Background Statistics (Annulus) ---
             f"{filt}_bkg": np.nan,
             f"{filt}_bkg_err": np.nan,
+            
+            # --- Quality Control (QC) Flags ---
+            #f"{filt}_qc_level": "UNKNOWN",   # CLEAN, WARNING, or CRITICAL
+            #f"{filt}_qc_reasons": "",       # e.g., "HighSkew|ExtremeTails"
+            
+            # --- Aperture Geometry ---
             f"{filt}_ap_x": np.nan,
             f"{filt}_ap_y": np.nan,
             f"{filt}_ap_theta": np.nan,
-            f"{filt}_flag_art": False,  # Boolean default
         }
 
     def pre_scan_filters(self):
@@ -1016,13 +1032,77 @@ class MIRIPipeline:
         )
         
         return sorted_filters
+    
+
+    def apply_quality_flagging(self, bkg_residuals):
+        """
+        Performs a multi-variate statistical audit of the background.
+        Returns: (str) Level, (str) Reason String, (dict) Raw Metrics
+        """
+        if len(bkg_residuals) < 200:
+            return "WARNING", "InsufficientPixels", {}
+        
+        if len(bkg_residuals) < 50:
+            return "CRITICAL", "InsufficientPixels", {}
+
+        # --- A. Basic Moments ---
+        res_skew = skew(bkg_residuals)
+        res_kurt = kurtosis(bkg_residuals, fisher=True)
+        
+        # --- B. Robust RMS Ratio (Clipped vs MAD) ---
+        std_val = np.std(bkg_residuals)
+        # MAD scaled to match 1-sigma for a Gaussian
+        mad = np.median(np.abs(bkg_residuals - np.median(bkg_residuals)))
+        robust_std = 1.4826 * mad
+        std_ratio = std_val / robust_std if robust_std > 0 else 1.0
+
+        # --- C. Extreme Tail Fraction (>5-sigma) ---
+        # Note: We use robust_std for the threshold to avoid the outliers masking themselves
+        tail_threshold = 5 * robust_std
+        outliers = np.abs(bkg_residuals) > tail_threshold
+        tail_frac = np.mean(outliers)
+
+        # --- D. Signed Tail Imbalance (Directionality) ---
+        pos_tail = np.sum(bkg_residuals > tail_threshold)
+        neg_tail = np.sum(bkg_residuals < -tail_threshold)
+        
+        # Check for imbalance if we have enough total outliers to be significant
+        imbalance = 0
+        if (pos_tail + neg_tail) > 2:
+            imbalance = abs(pos_tail - neg_tail) / (pos_tail + neg_tail)
+
+        # --- E. Logic-based Flagging ---
+        reasons = []
+        
+        # Thresholds tuned for JWST/MIRI mosaics
+        if abs(res_skew) > 2.5:       reasons.append("HighSkew")
+        if res_kurt > 10.0:           reasons.append("HighKurtosis") # MIRI has high natural kurtosis
+        if std_ratio > 1.5:           reasons.append("NonGaussianWidth")
+        if tail_frac > 0.005:         reasons.append("ExtremeTails")
+        if imbalance > 0.7:           reasons.append("AsymmetricTails")
+
+        # Classification
+        if len(reasons) >= 2 or "AsymmetricTails" in reasons:
+            level = "CRITICAL"
+        elif len(reasons) == 1:
+            level = "WARNING"
+        else:
+            level = "CLEAN"
+
+        return level, "|".join(reasons), {
+            "skew": res_skew, 
+            "kurtosis": res_kurt,
+            "std_ratio": std_ratio, 
+            "tail_frac": tail_frac,
+            "imbalance": imbalance
+        }
 
     def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
         
-        # Stylized ASCII Header
+        # Stylised ASCII Header
         print("\n" + "="*60)
         print("""
  ____           _    ____              _ _             _ 
@@ -1035,54 +1115,44 @@ class MIRIPipeline:
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
-        # Pre-scan and visual summary
+        # Pre-scan for catalogue visualisation
         all_filters = self.pre_scan_filters()
-        
-        print(f"\n[INFO] Survey Discovery:")
-        print(f"  > Found {len(all_filters)} MIRI bands: {', '.join(all_filters)}")
-        print(f"  > Target Galaxy Count: {len(self.all_ids)}")
-        print(f"  > Initialising 'Wide' table structure...")
-        
-        # Simple progress bar visualisation for the initialisation
-        print("\nPreparing Columns: [", end="")
-        for i in range(20):
-            time.sleep(0.02) # Just for aesthetic effect
-            print("■", end="", flush=True)
-        print("] 100%\n")
 
         if rescale == False:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
         
         all_rows = []
         
+        bkg_floor = []
+        
+        stored_ids = 0
+        
         for target_id in self.all_ids:
-            if target_id in self.quality_config["exclude_all"]:
-                continue
                 
+            files = self.find_files(target_id)
+            if not files: 
+                continue
+            print("\n")
+            print(f"========== Processing galaxy ID {target_id} ==========")
+            
             # Base identity for the galaxy
             galaxy_row = {
                 "ID": target_id,
                 "MIRI_ap_a": np.nan,
                 "MIRI_ap_b": np.nan,
                 "MIRI_ap_npix": np.nan,
-                "Flag_Com": target_id in self.quality_config["has_companion"]
+                #"Flag_Com": target_id in self.quality_config["has_companion"]
             }
             
             # Pre-populate with columns for all filters ALREADY discovered
             for filt in all_filters:
                 galaxy_row.update(self.get_filter_column_template(filt))
             
-            files = self.find_files(target_id)
-            if not files: 
-                continue
-            
             # Track if we've stored general aperture yet
             ap_geometry_stored = False
-            files = self.find_files(target_id)
             
             for filt, file in files.items():
-                if target_id in self.quality_config["exclude_filters"].get(filt, []):
-                    continue
+                print(f"{filt}:")
                 
                 try:
                     # Perform the photometry steps:
@@ -1123,11 +1193,18 @@ class MIRIPipeline:
                     
                     # Get local bkg estimates (median + error)
                     n_pix = measurements["area_pix"]
-                    bkg_median_jy = measurements["bkg_median_jy"]
+                    bkg_median_jy = measurements["bkg_median_jy"]                    
                     local_bkg = bkg_median_jy * n_pix
                     bkg_err = measurements["bkg_err_jy"]
                     
-                    # --- Fill Filter-Specific Columns ---
+                    bkg_floor.append(local_bkg)
+                    
+                    # Get quality flagging
+                    quality_level = bkg_res["quality_level"]
+                    quality_reasons = bkg_res["quality_reasons"]
+                    quality_metrics = bkg_res["quality_metrics"]
+                    
+                    # --- Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
                     galaxy_row[f"{filt}_abmag"] = ab_mag
@@ -1135,50 +1212,56 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_apflux_err"] = apflux_err
                     galaxy_row[f"{filt}_apflux_errnominal"] = apflux_errnominal
                     galaxy_row[f"{filt}_apcorr"] = psf_corr
+                    
+                    # --- Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
-                    # Handle the "varying" parameters per band
+                    # --- Store quality flags ---
+                    #galaxy_row[f"{filt}_qc_level"] = quality_level
+                    #galaxy_row[f"{filt}_qc_reasons"] = quality_reasons
+                    
+                    # --- Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
                     galaxy_row[f"{filt}_ap_x"] = ap_params["x"].item()
                     galaxy_row[f"{filt}_ap_y"] = ap_params["y"].item()
                     
-                    # This returns exactly True or False
-                    is_artifact = target_id in self.quality_config["art_filters"].get(filt, [])
-                    galaxy_row[f"{filt}_flag_art"] = target_id in self.quality_config["art_filters"].get(filt, [])
-                    
-                    # Store "Scalar" values once
+                    # --- Store "Scalar" values once ---
                     if not ap_geometry_stored:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
                         galaxy_row["MIRI_ap_npix"] = n_pix
                         ap_geometry_stored = True
-                    
+            
                 except Exception as e:
                     print(f"Error processing {target_id} in {filt}: {e}")
+            
+            stored_ids += 1
             
             # Only add the row if we actually measured something
             if len(galaxy_row) > 1:
                 all_rows.append(galaxy_row)
 
+        print(f"\nMedian local background across {stored_ids} analysed galaxies: ", np.median(bkg_floor)*1e6, "µJy")
+
         # Convert to DataFrame and save to file
         df = pd.DataFrame(all_rows)
         
-        table_dir = os.path.join(self.output_dir, "phot_tables")
-        os.makedirs(table_dir, exist_ok=True)
-        
-        phot_table_path = os.path.join(table_dir, write_to)
-        self.save_catalogue(df, phot_table_path)
+        self.save_catalogue(df, write_to)
         
                     
     def save_catalogue(self, df, base_filename):
         """Saves the result in both FITS (Science) and CSV (Human-Readable)."""
         # Save CSV
-        csv_path = f"{base_filename}.csv"
+        csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
+        os.makedirs(csv_dir, exist_ok=True)
+        csv_path = os.path.join(csv_dir, f"{base_filename}.csv")
         df.to_csv(csv_path, index=False)
         
         # Save FITS
-        fits_path = f"{base_filename}.fits"
+        fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")
+        os.makedirs(fits_dir, exist_ok=True)
+        fits_path = os.path.join(fits_dir, f"{base_filename}.fits")
         table = Table.from_pandas(df)
         
         for col_name in table.colnames:
@@ -1192,9 +1275,9 @@ class MIRIPipeline:
                 # Replace the column with a MaskedColumn
                 table[col_name] = MaskedColumn(data, name=col_name, mask=mask, fill_value=np.nan)
             
-        table.write(fits_path, format='fits', overwrite=True)
+        table.write(fits_path, format='fits', overwrite=True, name='MIRI_PHOTOMETRY')
         
-        print(f"Catalog exported to:\n1. {csv_path}\n2. {fits_path}")
+        print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {fits_path}")
 
 
 
