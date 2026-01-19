@@ -11,6 +11,7 @@
 #     "photutils",
 #     "scipy",
 #     "stpsf",
+#     "seaborn",
 # ]
 # ///
 """
@@ -37,6 +38,8 @@ Key Capabilities
     - Quality flagging for detector artefacts and companion contamination.
     - Stores data for visualising the background modelling in h5py format
       and provides functions for easy reading and plotting.
+    - Provides functions for visualising systematics introduced due to the
+      choice of aperture sizes for MIRI.
 
 Workflow
 --------
@@ -75,8 +78,10 @@ import warnings
 import random
 import glob
 import json
+import re
 import pickle as pkl
 from pathlib import Path
+import seaborn as sns
 
 import numpy as np
 import pandas as pd
@@ -89,7 +94,7 @@ from scipy.stats import skew, kurtosis
 import astropy.units as u
 from astropy.io import fits
 from astropy.wcs import WCS, FITSFixedWarning
-from astropy.table import Table, MaskedColumn
+from astropy.table import Table, MaskedColumn, join, vstack
 from astropy.stats import sigma_clip, sigma_clipped_stats
 
 import stpsf
@@ -1280,8 +1285,206 @@ class MIRIPipeline:
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {fits_path}")
 
 
+# ==================================================================================================
+# ====================== END OF PHOTOMETRY - START OF ANALYSIS =====================================
+# ==================================================================================================
+
+    @staticmethod
+    def compare_aperture_statistics(table_small_path, table_big_path, rescale_config_path=None, 
+                                    fig_path=None, summary_doc_path=None, 
+                                    target_scalings=[1.0, 2.0]):
+        """
+        Compare and contrast two photometric tables WITHOUT APERTURE CORRECTION APPLIED
+        and create a comprehensive summary plot of all important statistics and write
+        the output to a text file.
+
+        Args:
+            table_small_path (str):
+                Path to table using small apertures
+            table_big_path (str):
+                Path to table using big apertures
+            fig_path (str):
+                Output path of the summary plot
+            summary_doc_path (str):
+                Output path of the summary text file
+            scaling (str) optional:
+                'log' for logarithmic, default is linear
+        """
+
+        # Set style for better plots
+        plt.style.use("default")
+        sns.set_palette("husl")
+
+        ts = Table.read(table_small_path)
+        tb = Table.read(table_big_path)
+
+        # Convert ID columns to string for alignment
+        ids_small = [
+            id.decode() if isinstance(id, bytes) else str(id) for id in ts["ID"]
+        ]
+        ids_big = [
+            id.decode() if isinstance(id, bytes) else str(id) for id in tb["ID"]
+        ]
+
+        # 1. Filter IDs by scaling factor from config
+        config = pd.read_csv(rescale_config_path, comment="#")
+        # Ensure ID column in config is string for matching
+        config['ID'] = config['ID'].astype(str)
+        
+        # Identify which galaxies have the scaling we care about
+        filtered_config = config[config['Scale_Factor'].isin(target_scalings)]
+        valid_ids = filtered_config['ID'].tolist()
+
+        # Match common IDs
+        common_ids = sorted(set(ids_small) & set(ids_big) & set(valid_ids))
+        print(f"Found {len(common_ids)} common galaxies")
+        
+        # Reduce table to common IDs
+        ts = ts[np.isin(ts['ID'], valid_ids)]
+        tb = tb[np.isin(tb['ID'], valid_ids)]
+        
+        # Read bands from either catalogue (should be identical!)
+        filters = [c.replace('_flux', '') for c in ts.colnames if c.endswith('_flux') and not c.startswith('ap')]
+        
+        # Final list to store per-band tables
+        all_band_data = []
+        
+        for filt in filters:    
+            # Join tables on ID for this specific band
+            # Rename columns during join to avoid collisions
+            cols_s = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apcorr']
+            cols_b = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apcorr']
+            
+            # Select and rename
+            ts_filt = ts[cols_s]
+            for c in cols_s[1:]: ts_filt.rename_column(c, c + "_small")
+            
+            tb_filt = tb[cols_b]
+            for c in cols_b[1:]: tb_filt.rename_column(c, c + "_big")
+
+            # Join ensures IDs match perfectly
+            matched = join(ts_filt, tb_filt, keys='ID', join_type='inner')
+            
+            # VECTORIZED CALCULATIONS (No loops!)
+            flux_s = matched[f'{filt}_flux_small']
+            flux_b = matched[f'{filt}_flux_big']
+            apcorr_s = matched[f'{filt}_apcorr_small']
+            apcorr_b = matched[f'{filt}_apcorr_big']
+            
+            # Clean NaNs/Negatives
+            mask = (flux_s > 0) & (flux_b > 0) & np.isfinite(apcorr_s) & np.isfinite(apcorr_b)
+            res = matched[mask]
+            
+            # Add the calculated columns
+            res['Band'] = filt
+            res['Flux_Ratio'] = res[f'{filt}_flux_big'] / res[f'{filt}_flux_small']
+            res['Corrected_Flux_Ratio'] = (res[f'{filt}_flux_big'] * res[f'{filt}_apcorr_big']) / \
+                                        (res[f'{filt}_flux_small'] * res[f'{filt}_apcorr_small'])
+            
+            # Now contains one compressed table per band!
+            all_band_data.append(res)
+        
+        # Combine everything into one master table
+        final_table = vstack(all_band_data)
+        
+        # Convert to dictionary for your existing pickle/plot functions if needed
+        data_comparison = {col: final_table[col].tolist() for col in final_table.colnames}
+            
+        print(data_comparison.keys())
+            
+        if fig_path:
+            MIRIPipeline.plot_aperture_comparison(data_comparison, fig_path)
+            print(f"Saved output plot to {fig_path}")
+
+        if summary_doc_path:
+            write_aperture_summary(data_comparison, common_ids, summary_doc_path)
 
 
+    @staticmethod
+    def plot_aperture_comparison(data_comparison, fig_dir, scaling='log'):
+        # Convert to arrays for vectorized masking
+        for key in data_comparison:
+            data_comparison[key] = np.array(data_comparison[key])
+
+        # Dynamic filter identification
+        bands = np.unique(data_comparison["Band"])
+        n_bands = len(bands)
+        
+        # Create a grid: 3 columns (Comparison, Ratio, Systematic Trend) x n_bands rows
+        fig, axes = plt.subplots(n_bands, 3, figsize=(15, 4 * n_bands), squeeze=False)
+        
+        colors = {'scatter': '#1f77b4', 'ratio': '#e377c2', 'trend': '#2ca02c'}
+
+        for i, band in enumerate(bands):
+            mask = data_comparison["Band"] == band
+            
+            # Data extraction for brevity
+            f_s_corr = data_comparison["Flux_Small_Corrected"][mask] * 1e6
+            print(f_s_corr)
+            f_b_corr = data_comparison["Flux_Big_Corrected"][mask] * 1e6
+            ratio_corr = data_comparison["Corrected_Flux_Ratio"][mask]
+
+            # --- PANEL 1: Corrected Flux Comparison (1:1) ---
+            ax = axes[i, 0]
+            ax.scatter(f_s_corr, f_b_corr, alpha=0.6, s=25, color=colors['scatter'], edgecolors='white', linewidth=0.3)
+            
+            # 1:1 Line logic
+            lims = [np.min([f_s_corr, f_b_corr]), np.max([f_s_corr, f_b_corr])]
+            ax.plot(lims, lims, 'r--', alpha=0.8, zorder=0, label='1:1')
+            
+            if scaling == 'log':
+                ax.set_xscale('log')
+                ax.set_yscale('log')
+                
+            ax.set_title(f"{band}: Corrected Flux Agreement", fontweight='bold')
+            ax.set_xlabel("Small Aperture [µJy]")
+            ax.set_ylabel("Large Aperture [µJy]")
+            ax.grid(True, alpha=0.2)
+
+            # --- PANEL 2: Corrected Flux Ratio Distribution ---
+            ax = axes[i, 1]
+            ax.hist(ratio_corr, bins=np.linspace(0.5, 1.5, 30), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
+            ax.axvline(1.0, color="red", linestyle="--", linewidth=1.5)
+            
+            med = np.median(ratio_corr)
+            std = np.std(ratio_corr)
+            ax.axvline(med, color="darkred", linestyle="-", linewidth=1.5, label=f'Med: {med:.3f}')
+            
+            ax.set_title(f"{band}: Ratio Distribution", fontweight='bold')
+            ax.set_xlabel("Ratio (Large/Small)")
+            ax.set_ylabel("N Sources")
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.2)
+
+            # --- PANEL 3: Corrected Ratio vs Brightness (Systematics) ---
+            ax = axes[i, 2]
+            # Color code by the magnitude of the aperture correction to see if PSF issues drive scatter
+            sc = ax.scatter(f_s_corr, ratio_corr, alpha=0.7, s=30, 
+                            c=data_comparison["Apr_Corr_Big"][mask], cmap='viridis', edgecolors='none')
+            ax.axhline(1.0, color="red", linestyle="--", alpha=0.8)
+            
+            ax.set_xscale('log')
+            ax.set_ylim(0.5, 1.5) # Focus on the 50% deviation window
+            ax.set_title(f"{band}: Systematic Trends", fontweight='bold')
+            ax.set_xlabel("Flux [µJy]")
+            ax.set_ylabel("Ratio (Large/Small)")
+            ax.grid(True, alpha=0.2)
+            
+            if i == 0: # Add colorbar only to top row to save space
+                cbar = plt.colorbar(sc, ax=ax)
+                cbar.set_label('Apr Corr (Big)', fontsize=10)
+
+        plt.suptitle("Aperture Consistency Diagnostic (Corrected Fluxes Only)", fontsize=16, y=1.02)
+        plt.tight_layout()
+        
+        if fig_dir:
+            os.makedirs(fig_dir, exist_ok=True)
+            save_path = os.path.join(fig_dir, "apercorrs.png")
+            plt.savefig(save_path, dpi=200, bbox_inches='tight')
+            print(f"Saved condensed aperture diagnostic to {save_path}")
+        
+        plt.show()
+        plt.close()
 
 
 
@@ -1682,13 +1885,13 @@ def plot_galaxy_filter_matrix(
     for ax, g_ids in zip(axes, chunks):
         matrix = np.zeros((len(g_ids), len(filter_order)), dtype=int)
         g_index_map = {gid: i for i, gid in enumerate(g_ids)}
-        table_id_to_row = {str(row["ID"]): idx for idx, row in enumerate(table)}
+        table_id_to_row = {str(row["ID"]): ii for ii, row in enumerate(table)}
 
         for row in table:
             gid = str(row["ID"])
             if gid not in g_index_map:
                 continue
-            g_idx = g_index_map[gid]
+            g_ii = g_index_map[gid]
             filters = row["Filters"]
             if isinstance(filters, (list, np.ndarray)):
                 filters = [
@@ -1699,14 +1902,14 @@ def plot_galaxy_filter_matrix(
 
             for filt in filters:
                 if filt in filter_order:
-                    f_idx = filter_order.index(filt)
+                    f_ii = filter_order.index(filt)
 
                     # Inverted logic:
                     # Galaxy is marked if it's covered AND not in nondetections for that filter
                     if nondetections is None or int(gid) not in nondetections.get(
                         filt, []
                     ):
-                        matrix[g_idx, f_idx] = 1
+                        matrix[g_ii, f_ii] = 1
 
         # Draw rectangles
         for i in range(matrix.shape[0]):
@@ -1772,161 +1975,6 @@ def plot_galaxy_filter_matrix(
     plt.show()
 
 
-def compare_aperture_statistics(
-    table_small_path,
-    table_big_path,
-    fig_path=None,
-    summary_doc_path=None,
-    non_detections=None,
-    scaling=None,
-):
-    """
-    Compare and contrast two photometric tables WITHOUT APERTURE CORRECTION APPLIED
-    and create a comprehensive summary plot of all important statistics and write
-    the output to a text file.
-
-    Args:
-        table_small_path (str):
-            Path to table using small apertures
-        table_big_path (str):
-            Path to table using big apertures
-        fig_path (str):
-            Output path of the summary plot
-        summary_doc_path (str):
-            Output path of the summary text file
-        scaling (str) optional:
-            'log' for logarithmic, default is linear
-    """
-    # Enhanced Aperture Photometry Comparison
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import seaborn as sns
-    from astropy.table import Table
-
-    # Set style for better plots
-    plt.style.use("default")
-    sns.set_palette("husl")
-
-    table_small = Table.read(table_small_path)
-    table_big = Table.read(table_big_path)
-
-    # Convert ID columns to string for alignment
-    ids_small = [
-        id.decode() if isinstance(id, bytes) else str(id) for id in table_small["ID"]
-    ]
-    ids_big = [
-        id.decode() if isinstance(id, bytes) else str(id) for id in table_big["ID"]
-    ]
-
-    # Match common IDs
-    common_ids = sorted(set(ids_small) & set(ids_big))
-    print(f"Found {len(common_ids)} common galaxies")
-
-    # Prepare data structures
-    bands = ["F770W", "F1000W", "F1800W", "F2100W"]
-    data_comparison = {
-        "ID": [],
-        "Band": [],
-        "Flux_Small_Raw": [],
-        "Flux_Big_Raw": [],
-        "Flux_Err_Small_Raw": [],
-        "Flux_Big_Raw_Err": [],
-        "Flux_Small_Corrected": [],
-        "Flux_Big_Corrected": [],
-        "Flux_Err_Small_Corrected": [],
-        "Flux_Big_Corrected_Err": [],
-        "Apr_Corr_Small": [],
-        "Apr_Corr_Big": [],
-        "Flux_Ratio": [],
-        "Corrected_Flux_Ratio": [],
-        "Flux_Difference": [],
-        "Corrected_Flux_Difference": [],
-    }
-
-    # Collect all data for comprehensive analysis
-    for idx, band in enumerate(
-        bands
-    ):  # bands = ["F770W", "F1000W", "F1800W", "F2100W"]
-        for gid in common_ids:
-            index_s = ids_small.index(gid)
-            index_b = ids_big.index(gid)
-
-            # Raw fluxes (convert to µJy)
-            flux_small = table_small["Flux"][index_s][idx] * 1e6
-            flux_big = table_big["Flux"][index_b][idx] * 1e6
-            flux_err_small = table_small["Flux_Err"][index_s][idx] * 1e6
-            flux_err_big = table_big["Flux_Err"][index_b][idx] * 1e6
-
-            # Aperture corrections
-            corr_small = (
-                table_small["Apr_Corr"][index_s][idx]
-                if "Apr_Corr" in table_small.colnames
-                else np.nan
-            )
-            corr_big = (
-                table_big["Apr_Corr"][index_b][idx]
-                if "Apr_Corr" in table_big.colnames
-                else np.nan
-            )
-
-            # Skip if any crucial value is invalid
-            if not (
-                np.isfinite(flux_small)
-                and np.isfinite(flux_big)
-                and (flux_small > 0)
-                and (flux_big > 0)
-                and np.isfinite(flux_err_small)
-                and np.isfinite(flux_err_big)
-                and np.isfinite(corr_small)
-                and np.isfinite(corr_big)
-            ):
-                continue
-
-            # Calculate corrected fluxes
-            flux_small_corr = flux_small * corr_small
-            flux_big_corr = flux_big * corr_big
-            flux_err_small_corr = flux_err_small * corr_small
-            flux_err_big_corr = flux_err_big * corr_big
-
-            # Store all data
-            data_comparison["ID"].append(gid)
-            data_comparison["Band"].append(band)
-            data_comparison["Flux_Small_Raw"].append(flux_small)
-            data_comparison["Flux_Big_Raw"].append(flux_big)
-            data_comparison["Flux_Err_Small_Raw"].append(flux_err_small)
-            data_comparison["Flux_Big_Raw_Err"].append(flux_err_big)
-            data_comparison["Flux_Small_Corrected"].append(flux_small_corr)
-            data_comparison["Flux_Big_Corrected"].append(flux_big_corr)
-            data_comparison["Flux_Err_Small_Corrected"].append(flux_err_small_corr)
-            data_comparison["Flux_Big_Corrected_Err"].append(flux_err_big_corr)
-            data_comparison["Apr_Corr_Small"].append(corr_small)
-            data_comparison["Apr_Corr_Big"].append(corr_big)
-            data_comparison["Flux_Ratio"].append(flux_big / flux_small)
-            data_comparison["Corrected_Flux_Ratio"].append(
-                flux_big_corr / flux_small_corr
-            )
-            data_comparison["Flux_Difference"].append(flux_big - flux_small)
-            data_comparison["Corrected_Flux_Difference"].append(
-                flux_big_corr - flux_small_corr
-            )
-
-    filename = os.path.join(
-        "/Users/benjamincollins/University/Master/Red_Cardinal/photometry/apertures/aperture_comparisons/comparison_data.pkl"
-    )
-
-    # Write output to a pickle file
-    with open(filename, "wb") as f:
-        pkl.dump(data_comparison, f)
-        print(f"Saved pickle file to {filename}")
-
-    if fig_path:
-        plot_aperture_comparison(data_comparison, fig_path, scaling)
-        print(f"Saved output plot to {fig_path}")
-
-    if summary_doc_path:
-        write_aperture_summary(
-            data_comparison, common_ids, summary_doc_path, non_detections=non_detections
-        )
 
 
 def plot_aperture_comparison(data_comparison, fig_path, scaling=None):
@@ -2173,8 +2221,7 @@ def plot_aperture_comparison(data_comparison, fig_path, scaling=None):
         )
         plt.colorbar(label="Small Aperture Correction")
         plt.axhline(1.0, color="red", linestyle="--", alpha=0.8, label="Unity")
-        if scaling:
-            plt.xscale("log")
+        plt.xscale("log")
         plt.xlabel(f"{band} Small Aperture Raw Flux [µJy]")
         plt.ylabel("Flux Ratio (Large/Small)")
         plt.title(f"{band} Flux Ratio vs Brightness")
@@ -2192,8 +2239,7 @@ def plot_aperture_comparison(data_comparison, fig_path, scaling=None):
         )
         plt.colorbar(label="Large Aperture Correction")
         plt.axhline(1.0, color="red", linestyle="--", alpha=0.8, label="Unity")
-        if scaling:
-            plt.xscale("log")
+        plt.xscale("log")
         plt.xlabel(f"{band} Small Aperture Corrected Flux [µJy]")
         plt.ylabel("Corrected Flux Ratio (Large/Small)")
         plt.title(f"{band} Corrected Flux Ratio vs Brightness")
