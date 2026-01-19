@@ -1352,8 +1352,8 @@ class MIRIPipeline:
         for filt in filters:    
             # Join tables on ID for this specific band
             # Rename columns during join to avoid collisions
-            cols_s = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apcorr']
-            cols_b = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apcorr']
+            cols_s = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr']
+            cols_b = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr']
             
             # Select and rename
             ts_filt = ts[cols_s]
@@ -1368,21 +1368,25 @@ class MIRIPipeline:
             # VECTORIZED CALCULATIONS (No loops!)
             flux_s = matched[f'{filt}_flux_small']
             flux_b = matched[f'{filt}_flux_big']
+            apflux_s = matched[f'{filt}_apflux_small']
+            apflux_b = matched[f'{filt}_apflux_big']
             apcorr_s = matched[f'{filt}_apcorr_small']
             apcorr_b = matched[f'{filt}_apcorr_big']
             
             # Clean NaNs/Negatives
-            mask = (flux_s > 0) & (flux_b > 0) & np.isfinite(apcorr_s) & np.isfinite(apcorr_b)
+            mask = (flux_s > 0) & (flux_b > 0) & (apflux_s > 0) & (apflux_b > 0) \
+                    & np.isfinite(apcorr_s) & np.isfinite(apcorr_b)
             res = matched[mask]
             
             # Add the calculated columns
             res['Band'] = filt
-            res['Flux_Ratio'] = res[f'{filt}_flux_big'] / res[f'{filt}_flux_small']
-            res['Corrected_Flux_Ratio'] = (res[f'{filt}_flux_big'] * res[f'{filt}_apcorr_big']) / \
-                                        (res[f'{filt}_flux_small'] * res[f'{filt}_apcorr_small'])
+            res['Corrected_Flux_Ratio'] = res[f'{filt}_flux_big'] / res[f'{filt}_flux_small']
+            res['Raw_Flux_Ratio'] = res[f'{filt}_apflux_big'] / res[f'{filt}_apflux_small']
             
             # Now contains one compressed table per band!
             all_band_data.append(res)
+        
+            print(res[res["Corrected_Flux_Ratio"] > 3.0])
         
         # Combine everything into one master table
         final_table = vstack(all_band_data)
@@ -1390,7 +1394,8 @@ class MIRIPipeline:
         # Convert to dictionary for your existing pickle/plot functions if needed
         data_comparison = {col: final_table[col].tolist() for col in final_table.colnames}
             
-        print(data_comparison.keys())
+        
+        
             
         if fig_path:
             MIRIPipeline.plot_aperture_comparison(data_comparison, fig_path)
@@ -1407,11 +1412,15 @@ class MIRIPipeline:
             data_comparison[key] = np.array(data_comparison[key])
 
         # Dynamic filter identification
-        bands = np.unique(data_comparison["Band"])
+        bands = []
+        for band in data_comparison["Band"]:
+            if band not in bands:
+                bands.append(band)
+        
         n_bands = len(bands)
         
         # Create a grid: 3 columns (Comparison, Ratio, Systematic Trend) x n_bands rows
-        fig, axes = plt.subplots(n_bands, 3, figsize=(15, 4 * n_bands), squeeze=False)
+        fig, axes = plt.subplots(n_bands, 3, figsize=(13, 4 * n_bands), squeeze=False)
         
         colors = {'scatter': '#1f77b4', 'ratio': '#e377c2', 'trend': '#2ca02c'}
 
@@ -1419,17 +1428,17 @@ class MIRIPipeline:
             mask = data_comparison["Band"] == band
             
             # Data extraction for brevity
-            f_s_corr = data_comparison["Flux_Small_Corrected"][mask] * 1e6
-            print(f_s_corr)
-            f_b_corr = data_comparison["Flux_Big_Corrected"][mask] * 1e6
+            flux_s = data_comparison[f"{band}_flux_small"][mask] * 1e6
+            
+            flux_b = data_comparison[f"{band}_flux_big"][mask] * 1e6
             ratio_corr = data_comparison["Corrected_Flux_Ratio"][mask]
 
             # --- PANEL 1: Corrected Flux Comparison (1:1) ---
             ax = axes[i, 0]
-            ax.scatter(f_s_corr, f_b_corr, alpha=0.6, s=25, color=colors['scatter'], edgecolors='white', linewidth=0.3)
+            ax.scatter(flux_s, flux_b, alpha=0.6, s=25, color=colors['scatter'], edgecolors='white', linewidth=0.3)
             
             # 1:1 Line logic
-            lims = [np.min([f_s_corr, f_b_corr]), np.max([f_s_corr, f_b_corr])]
+            lims = [np.min([flux_s, flux_b]), np.max([flux_s, flux_b])]
             ax.plot(lims, lims, 'r--', alpha=0.8, zorder=0, label='1:1')
             
             if scaling == 'log':
@@ -1443,7 +1452,8 @@ class MIRIPipeline:
 
             # --- PANEL 2: Corrected Flux Ratio Distribution ---
             ax = axes[i, 1]
-            ax.hist(ratio_corr, bins=np.linspace(0.5, 1.5, 30), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
+            #ax.hist(ratio_corr, bins=np.linspace(0.5, 1.5, 30), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
+            ax.hist(ratio_corr, bins=25, alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
             ax.axvline(1.0, color="red", linestyle="--", linewidth=1.5)
             
             med = np.median(ratio_corr)
@@ -1459,12 +1469,12 @@ class MIRIPipeline:
             # --- PANEL 3: Corrected Ratio vs Brightness (Systematics) ---
             ax = axes[i, 2]
             # Color code by the magnitude of the aperture correction to see if PSF issues drive scatter
-            sc = ax.scatter(f_s_corr, ratio_corr, alpha=0.7, s=30, 
-                            c=data_comparison["Apr_Corr_Big"][mask], cmap='viridis', edgecolors='none')
+            sc = ax.scatter(flux_s, ratio_corr, alpha=0.7, s=30, 
+                            c=data_comparison[f"{band}_apcorr_big"][mask], cmap='viridis', edgecolors='none')
             ax.axhline(1.0, color="red", linestyle="--", alpha=0.8)
             
             ax.set_xscale('log')
-            ax.set_ylim(0.5, 1.5) # Focus on the 50% deviation window
+            #ax.set_ylim(0.5, 3.0) # Focus on the 50% deviation window
             ax.set_title(f"{band}: Systematic Trends", fontweight='bold')
             ax.set_xlabel("Flux [µJy]")
             ax.set_ylabel("Ratio (Large/Small)")
