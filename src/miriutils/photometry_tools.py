@@ -89,6 +89,7 @@ import h5py
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
+import matplotlib.cm as cm
 from scipy.stats import skew, kurtosis
 
 import astropy.units as u
@@ -480,20 +481,22 @@ class MIRIPipeline:
         local statistics in an elliptical annulus.
         """
         data = aperture_params["data"]
-        x, y = aperture_params["x"], aperture_params["y"]
+        x_cen, y_cen = aperture_params["x"], aperture_params["y"]
         a, b = aperture_params["a"], aperture_params["b"]
         theta = aperture_params["theta"] # Already in Radians from prepare_aperture
         galaxy_id = aperture_params["id"]
         
         filt = aperture_params["meta"]["filter"]
+        
+        yi, xi = np.indices(data.shape)
 
         # 1. Create an two source masks (buffer around the aperture)
-        source_ap = EllipticalAperture((x, y), a=a, b=b, theta=theta)
+        source_ap = EllipticalAperture((x_cen, y_cen), a=a, b=b, theta=theta)
         source_mask = source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
         
         # The large source mask prevents the target's own light from biasing the background
         a_in, b_in = a + 8, b + 8
-        bkg_source_ap = EllipticalAperture((x, y), a=a_in, b=b_in, theta=theta)
+        bkg_source_ap = EllipticalAperture((x_cen, y_cen), a=a_in, b=b_in, theta=theta)
         source_mask_large = bkg_source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
 
         # 2. Aggressive Neighbor Detection
@@ -510,13 +513,27 @@ class MIRIPipeline:
         # 3. Final Combined Mask 
         combined_mask = source_mask_large | segm_mask | np.isnan(data)
         
-        # 4. Compute 2D plane fit 
-        # 4a. Initial rough Fit Mask (Source + Large Neighbors masked)
-        yi, xi = np.indices(data.shape)
-        fit_mask = ~combined_mask 
+        # 1. Calculate Elliptical Distance for weighting
+        # Transform coordinates to align with aperture rotation
+        dx = xi - x_cen
+        dy = yi - y_cen
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        
+        x_rot = dx * cos_t + dy * sin_t
+        y_rot = -dx * sin_t + dy * cos_t
+        
+        # Normalised elliptical distance (d=1 is the edge of the 'a' radius)
+        d_ell = np.sqrt(x_rot**2 + (y_rot / (b/a))**2)
 
+        # 2. Define the Weighting Scale (sigma)
+        # For F1800W/F2100W, we want to focus on a region ~2-3x the aperture size
+        # to avoid edge artifacts like in ID 12175
+        sigma = a * 2.5 if filt in ["F1800W", "F2100W"] else a * 5.0
+        weights = np.exp(-(d_ell**2) / (2 * sigma**2))
+        
         # Initialise coefficients for the loop
         coeffs = [0, 0, median_init] 
+        fit_mask = ~combined_mask 
         
         print(f"  > Starting iterative plane fit ({n_iters} iterations)...")
         
@@ -524,12 +541,19 @@ class MIRIPipeline:
             # 1. Prepare the design matrix for pixels in the current mask
             A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
             z = data[fit_mask]
+            w = weights[fit_mask]
             
             if len(z) < 10:
                 break # Safety break if we mask too much
-                
+            
+            # Apply weights to the design matrix and target vector
+            # This is the 'Weighted Least Squares' solution: (A^T W A)^-1 A^T W z
+            W = np.diag(w) # For large images, use A * w[:, np.newaxis] for memory efficiency
+            Aw = A * w[:, np.newaxis]
+            zw = z * w
+            
             # 2. Solve for Plane: z = alpha*x + beta*y + gamma
-            coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+            coeffs, _, _, _ = np.linalg.lstsq(Aw, zw, rcond=None)
             alpha, beta, gamma = coeffs
             
             # 3. Calculate residuals of this specific fit
@@ -553,6 +577,11 @@ class MIRIPipeline:
                 
             fit_mask = new_fit_mask
 
+        # Create mask for CoG analysis
+        non_sky_mask = ~fit_mask
+        kill_mask = non_sky_mask.copy()
+        kill_mask[source_mask_large] = False
+                
         # Final Plane Generation
         background_plane = alpha * xi + beta * yi + gamma
         data_bkgsub = data - background_plane        
@@ -560,11 +589,11 @@ class MIRIPipeline:
         # 5. Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
-        dist_to_edge = min(x, img_w - x, y, img_h - y)
+        dist_to_edge = min(x_cen, img_w - x_cen, y_cen, img_h - y_cen)
         a_out = dist_to_edge - 2    # 2 pixel buffer at the image boundaries
         b_out = a_out * 0.9 # Maintain aspect ratio
         
-        annulus = EllipticalAnnulus((x, y), a_in=a_in, a_out=a_out, 
+        annulus = EllipticalAnnulus((x_cen, y_cen), a_in=a_in, a_out=a_out, 
                                     b_in=b_in, b_out=b_out, theta=theta)
         
         ann_mask = annulus.to_mask(method='center').to_image(data.shape).astype(bool)
@@ -573,17 +602,25 @@ class MIRIPipeline:
         bkg_pixels_mask = ann_mask & ~combined_mask
         
         # 6. Final Stats
-        bkg_residuals = data_bkgsub[bkg_pixels_mask]
-        
-         # 2. Extract stats from the unclipped portions
-        background_median = np.ma.median(bkg_residuals)
-        background_std = np.ma.std(bkg_residuals)
+        # Extract the 1D arrays of pixels
+        plane_vals = np.asarray(background_plane[bkg_pixels_mask])
+        res_vals = np.asarray(data_bkgsub[bkg_pixels_mask])
+
+        # Remove any NaNs that might have snuck in
+        res_vals = res_vals[~np.isnan(res_vals)]
+
+        # 1. The Level (The pedestal subtracted)
+        background_median = np.median(plane_vals)
+
+        # 2. The Noise (Robust RMS / Sigma)
+        # We use 1.4826 * MAD to match the scale of a standard deviation
+        mad = np.median(np.abs(res_vals - np.median(res_vals)))
+        background_rms = 1.4826 * mad 
         
         # Perform quality checks for the background residuals
         global_bkg_res = data_bkgsub[~combined_mask]
         quality_level, quality_reasons, quality_metrics = self.apply_quality_flagging(global_bkg_res)
         
-                
         # Initialise mask visualisation for plotting
         mask_vis = np.zeros_like(data, dtype=int)        
         # 1. Start with everything as "0" (Excluded)
@@ -639,12 +676,14 @@ class MIRIPipeline:
             "id": galaxy_id,
             "filter": filt,
             "median": background_median,
-            "std": background_std,
+            "median_res": np.median(res_vals),
+            "rms": background_rms,
             "plane": background_plane,
             "subtracted": data_bkgsub,
             "annulus": annulus,
             "source_ap": source_ap,
             "mask_vis": mask_vis,
+            "kill_mask": kill_mask,
             "quality_level": quality_level,
             "quality_reasons": quality_reasons,
             "quality_metrics": quality_metrics
@@ -724,7 +763,7 @@ class MIRIPipeline:
         # 1. Determine the destination
         if save_path is None:
             # Default organizational structure
-            aperture_dir = os.path.join(self.output_dir, "mosaic_plots", filt)
+            aperture_dir = os.path.join(self.output_dir, "mosaic_plots_weighted", filt)
             os.makedirs(aperture_dir, exist_ok=True)
             save_path = os.path.join(aperture_dir, f"{gid}_bkg.png")
 
@@ -951,6 +990,7 @@ class MIRIPipeline:
         # Get background-subtracted data
         data_bkgsub = bkg_results["subtracted"]
         source_ap = bkg_results["source_ap"]
+        median_bkg_residuals = bkg_results["median_res"]
         
         # Perform photometry
         phot_table = aperture_photometry(data_bkgsub, source_ap, method='exact')
@@ -964,7 +1004,7 @@ class MIRIPipeline:
         
         # B. Background modelling uncertainty already calculated in estimate_background
         # bkg_std = clean_std * np.sqrt(source_ap.area)
-        bkg_err_mjysr = bkg_results["std"]
+        bkg_err_mjysr = bkg_results["rms"]
         
         # C. Combine in quadrature
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
@@ -981,6 +1021,7 @@ class MIRIPipeline:
         # Obtain local background and error
         bkg_median_jy = bkg_results["median"] * conv
         bkg_err_jy = bkg_err_mjysr * conv
+        median_bkg_res_jy = median_bkg_residuals * conv
         
         # 6. Final Results Dictionary
         return {
@@ -990,8 +1031,81 @@ class MIRIPipeline:
             "area_pix": source_ap.area,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
+            "median_bkg_res_jy": median_bkg_res_jy,
             "nominal_err_jy": nominal_err_jy
         }
+    
+    def measure_flux_cog(self, aperture_params, bkg_results, radii, cog_dir=None):
+        """
+        Performs multi-aperture photometry to generate a Curve of Growth.
+        """
+        
+        # 1. Setup Data and Metadata        
+        kill_mask = bkg_results["kill_mask"]
+        filt = bkg_results["filter"]
+
+        gid = aperture_params["meta"]["id"]
+        err_map = aperture_params["err"]
+        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
+        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"]
+        conv = 1e6 * pixel_area_sr
+        
+        # Create a version of the residuals where EVERYTHING except your target is hidden
+        # This uses your existing combined_mask (segm_mask | neighbor_masks | NaNs)
+        cog_data = bkg_results["subtracted"].copy()
+
+        # Ensure neighbors are zeroed out so they don't add to the sum
+        # We use combined_mask, but we MUST make sure the target aperture is EXCLUDED from the mask
+        # otherwise we mask the very galaxy we are trying to measure!
+
+        cog_data[kill_mask] = 0.0
+        
+        # Plot and save single filter images
+        if cog_dir:
+            plt.imshow(cog_data, origin='lower', cmap='viridis')
+            plt.title(f"{filt}: Neighbors Zeroed, Target Intact")
+            
+            fname = os.path.join(cog_dir, f"{filt}_masked.png")
+            plt.savefig(fname, dpi=200, bbox_inches='tight')
+            plt.close()
+        
+        # Extract fixed geometry from the small/original aperture
+        x, y = aperture_params["x"], aperture_params["y"]
+        theta = aperture_params["theta"]
+        b_over_a = aperture_params["b"] / aperture_params["a"]
+        
+        cog_results = []
+
+        # 2. Loop over radii to create the Curve of Growth
+        for a_val in radii:
+            # Scale b proportionally to maintain the galaxy's shape
+            b_val = a_val * b_over_a
+            temp_ap = EllipticalAperture((x, y), a=a_val, b=b_val, theta=theta)
+            
+            # A. Sum Flux
+            phot_table = aperture_photometry(cog_data, temp_ap, method='exact')
+            raw_flux_mjysr = phot_table['aperture_sum'][0]
+            
+            # B. Propagate Errors for this specific aperture size
+            ap_mask = temp_ap.to_mask(method='exact')
+            # Detector variance
+            det_var = np.nansum(ap_mask.multiply(err_map**2))
+            # Background uncertainty scales with the Area of the aperture
+            # Area = pi * a * b
+            bkg_err_mjysr = bkg_results["rms"] * np.sqrt(temp_ap.area)
+            
+            total_err_mjysr = np.sqrt(det_var + bkg_err_mjysr**2)
+            
+            # C. Store measurements for this radius
+            cog_results.append({
+                "radius_a": a_val,
+                "area_pix": temp_ap.area,
+                "flux_jy": raw_flux_mjysr * conv,
+                "flux_err_jy": total_err_mjysr * conv,
+                "snr": (raw_flux_mjysr / total_err_mjysr) if total_err_mjysr > 0 else 0
+            })
+
+        return cog_results
     
     def get_filter_column_template(self, filt):
         """Defines the standard set of columns for any single MIRI band."""
@@ -1198,11 +1312,10 @@ class MIRIPipeline:
                     
                     # Get local bkg estimates (median + error)
                     n_pix = measurements["area_pix"]
-                    bkg_median_jy = measurements["bkg_median_jy"]                    
-                    local_bkg = bkg_median_jy * n_pix
+                    local_bkg = measurements["bkg_median_jy"] * n_pix
                     bkg_err = measurements["bkg_err_jy"]
                     
-                    bkg_floor.append(local_bkg)
+                    bkg_floor.append(measurements["median_bkg_res_jy"])
                     
                     # Get quality flagging
                     quality_level = bkg_res["quality_level"]
@@ -1292,7 +1405,8 @@ class MIRIPipeline:
     @staticmethod
     def compare_aperture_statistics(table_small_path, table_big_path, rescale_config_path=None, 
                                     fig_path=None, summary_doc_path=None, 
-                                    target_scalings=[1.0, 2.0]):
+                                    target_scalings=[1.0, 2.0],
+                                    snr=3.0):
         """
         Compare and contrast two photometric tables WITHOUT APERTURE CORRECTION APPLIED
         and create a comprehensive summary plot of all important statistics and write
@@ -1352,8 +1466,8 @@ class MIRIPipeline:
         for filt in filters:    
             # Join tables on ID for this specific band
             # Rename columns during join to avoid collisions
-            cols_s = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr']
-            cols_b = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr']
+            cols_s = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr', f'{filt}_bkg_err']
+            cols_b = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr', f'{filt}_bkg_err']
             
             # Select and rename
             ts_filt = ts[cols_s]
@@ -1370,12 +1484,19 @@ class MIRIPipeline:
             flux_b = matched[f'{filt}_flux_big']
             apflux_s = matched[f'{filt}_apflux_small']
             apflux_b = matched[f'{filt}_apflux_big']
+            apflux_err_s = matched[f'{filt}_apflux_err_small']            
+            apflux_err_b = matched[f'{filt}_apflux_err_big']            
             apcorr_s = matched[f'{filt}_apcorr_small']
             apcorr_b = matched[f'{filt}_apcorr_big']
             
+            # Rough detection filtering based on SNR
+            snr_s = apflux_s / apflux_err_s
+            snr_b = apflux_b / apflux_err_b
+            
             # Clean NaNs/Negatives
             mask = (flux_s > 0) & (flux_b > 0) & (apflux_s > 0) & (apflux_b > 0) \
-                    & np.isfinite(apcorr_s) & np.isfinite(apcorr_b)
+                    & np.isfinite(apcorr_s) & np.isfinite(apcorr_b) \
+                    & (snr_s > snr) & (snr_b > snr)
             res = matched[mask]
             
             # Add the calculated columns
@@ -1385,7 +1506,7 @@ class MIRIPipeline:
             
             # Now contains one compressed table per band!
             all_band_data.append(res)
-        
+
             print(res[res["Corrected_Flux_Ratio"] > 3.0])
         
         # Combine everything into one master table
@@ -1393,9 +1514,6 @@ class MIRIPipeline:
         
         # Convert to dictionary for your existing pickle/plot functions if needed
         data_comparison = {col: final_table[col].tolist() for col in final_table.colnames}
-            
-        
-        
             
         if fig_path:
             MIRIPipeline.plot_aperture_comparison(data_comparison, fig_path)
@@ -1452,8 +1570,8 @@ class MIRIPipeline:
 
             # --- PANEL 2: Corrected Flux Ratio Distribution ---
             ax = axes[i, 1]
-            #ax.hist(ratio_corr, bins=np.linspace(0.5, 1.5, 30), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
-            ax.hist(ratio_corr, bins=25, alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
+            ax.hist(ratio_corr, bins=np.linspace(0.5, 3.5, 25), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
+            #ax.hist(ratio_corr, bins=25, alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
             ax.axvline(1.0, color="red", linestyle="--", linewidth=1.5)
             
             med = np.median(ratio_corr)
@@ -1497,11 +1615,93 @@ class MIRIPipeline:
         plt.close()
 
 
+    def run_cog_analysis(self, gid, radii, cog_dir):
+        """Function to perform Curve of Growth analysis for extended sources"""
 
+        # Find files associated with galaxy ID
+        files = self.find_files(gid)
+        
+        if files is None:
+            return None
+        
+        if len(files) < 2:
+            return None
+        
+        # Define output directory
+        cog_dir = os.path.join(self.output_dir, "apertures", cog_dir)
+        os.makedirs(cog_dir, exist_ok=True)
+        
+        cog_results = {}
+        
+        for filt, file in files.items():
+            try:
+                # 1. Prepare the apertures for MIRI
+                ap_params = self.prepare_aperture(file, rescale=True)
+                
+                # 2. Create background model
+                bkg_res = self.estimate_background(ap_params)
+                
+                # 3. Measure fluxes by performing Curve of Growth (CoG) analysis
+                measurements = self.measure_flux_cog(ap_params, bkg_res, radii)
+                
+                cog_results[filt] = measurements
+                cog_results["meta"] = ap_params
+                
+            except Exception as e:
+                print(f"Error processing {gid} in {filt}: {e}")
+                
+        # Plotting Logic
+        if not cog_results:
+            return
+        
+        save_path = os.path.join(cog_dir, f"{gid}_cog_weighted.png")
+        plt.figure(figsize=(8, 5))
+        
+        # --- AUTOMATED COLOUR LOGIC ---
+        # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
+        norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
+        colormap = cm.get_cmap('jet')
+        
+        # Track available filters to avoid plotting the 'meta' key
+        available_filters = [f for f in cog_results.keys() if f != "meta"]
+        ap_meta = cog_results["meta"]
+        
+        # Sort filters by wavelength so the legend looks organized
+        available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
+     
+        for filt in available_filters:
+            # Get the color based on the wavelength
+            w_val = self.wavelength_map.get(filt, 15.0) # Default to middle if unknown
+            line_color = colormap(norm(w_val))
+            
+            # Extract flux in microJanskys
+            flux_ujy = [r['flux_jy'] * 1e6 for r in cog_results[filt]]
+            plt.plot(radii, flux_ujy, label=filt, color=line_color, 
+                    marker='o', markersize=3, lw=2, alpha=0.9)
 
+        # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
+        # Adjust these keys based on how you stored them in prepare_aperture
+        small_limit = ap_meta["a_orig"]
+        big_limit = ap_meta["a"]
 
+        plt.axvline(small_limit, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
+        plt.axvline(big_limit, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
+        
+        plt.xlabel("Semi-major axis (pixels)")
+        plt.ylabel("Cumulative Flux [µJy]")
+        plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close() # Close figure to free memory
+        
+        return cog_results
+                
+                
 
-
+        
+        
 
 
 
