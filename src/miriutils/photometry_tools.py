@@ -486,7 +486,9 @@ class MIRIPipeline:
         theta = aperture_params["theta"] # Already in Radians from prepare_aperture
         galaxy_id = aperture_params["id"]
         
+        # Load filter and determine if it is a long (>15µm) or short wavelength band
         filt = aperture_params["meta"]["filter"]
+        is_long_wl = True if self.wavelength_map[filt] > 14.0 else False
         
         yi, xi = np.indices(data.shape)
 
@@ -513,23 +515,25 @@ class MIRIPipeline:
         # 3. Final Combined Mask 
         combined_mask = source_mask_large | segm_mask | np.isnan(data)
         
-        # 1. Calculate Elliptical Distance for weighting
-        # Transform coordinates to align with aperture rotation
-        dx = xi - x_cen
-        dy = yi - y_cen
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
-        
-        x_rot = dx * cos_t + dy * sin_t
-        y_rot = -dx * sin_t + dy * cos_t
-        
-        # Normalised elliptical distance (d=1 is the edge of the 'a' radius)
-        d_ell = np.sqrt(x_rot**2 + (y_rot / (b/a))**2)
+        if is_long_wl:
+            # 1. Calculate Elliptical Distance for weighting
+            # Transform coordinates to align with aperture rotation
+            dx = xi - x_cen
+            dy = yi - y_cen
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            
+            # Account for angle of rotation
+            x_rot = dx * cos_t + dy * sin_t
+            y_rot = -dx * sin_t + dy * cos_t
+            
+            # Normalised elliptical distance (d=1 is the edge of the 'a' radius)
+            d_ell = np.sqrt(x_rot**2 + (y_rot / (b/a))**2)
 
-        # 2. Define the Weighting Scale (sigma)
-        # For F1800W/F2100W, we want to focus on a region ~2-3x the aperture size
-        # to avoid edge artifacts like in ID 12175
-        sigma = a * 2.5 if filt in ["F1800W", "F2100W"] else a * 5.0
-        weights = np.exp(-(d_ell**2) / (2 * sigma**2))
+            # 2. Define the Weighting Scale (sigma)
+            # For F1800W/F2100W, we want to focus on a region ~2-3x the aperture size
+            # to avoid edge artifacts like in ID 12175
+            sigma = a * 2.5
+            weights = np.exp(-(d_ell**2) / (2 * sigma**2))
         
         # Initialise coefficients for the loop
         coeffs = [0, 0, median_init] 
@@ -538,34 +542,40 @@ class MIRIPipeline:
         print(f"  > Starting iterative plane fit ({n_iters} iterations)...")
         
         for i in range(n_iters):
-            # 1. Prepare the design matrix for pixels in the current mask
+            # Prepare the design matrix for pixels in the current mask
             A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
             z = data[fit_mask]
-            w = weights[fit_mask]
             
             if len(z) < 10:
                 break # Safety break if we mask too much
             
-            # Apply weights to the design matrix and target vector
-            # This is the 'Weighted Least Squares' solution: (A^T W A)^-1 A^T W z
-            W = np.diag(w) # For large images, use A * w[:, np.newaxis] for memory efficiency
-            Aw = A * w[:, np.newaxis]
-            zw = z * w
-            
-            # 2. Solve for Plane: z = alpha*x + beta*y + gamma
-            coeffs, _, _, _ = np.linalg.lstsq(Aw, zw, rcond=None)
+            # For all wavelengths above 15 microns use weighted plane fit!
+            if is_long_wl:
+                # Apply weights to the design matrix and target vector
+                # This is the 'Weighted Least Squares' solution: (A^T W A)^-1 A^T W z
+                w = weights[fit_mask]
+                W = np.diag(w) # For large images, use A * w[:, np.newaxis] for memory efficiency
+                Aw = A * w[:, np.newaxis]
+                zw = z * w
+                
+                # Solve for Plane: z = alpha*x + beta*y + gamma
+                coeffs, _, _, _ = np.linalg.lstsq(Aw, zw, rcond=None)
+            else:
+                # Solve for Plane: z = alpha*x + beta*y + gamma
+                coeffs, _, _, _ = np.linalg.lstsq(A, z, rcond=None)
+                
             alpha, beta, gamma = coeffs
             
-            # 3. Calculate residuals of this specific fit
+            # Calculate residuals of this specific fit
             current_plane = alpha * xi + beta * yi + gamma
             residuals = data - current_plane
             
-            # 4. Update the mask using sigma clipping on the residuals
+            # Update the mask using sigma clipping on the residuals
             # We only look at the pixels currently in fit_mask to find new outliers
             res_to_clip = residuals[fit_mask]
             clipped_res = sigma_clip(res_to_clip, sigma=sigma_val, maxiters=5, cenfunc=np.median)
             
-            # 5. Refine the fit_mask for the NEXT iteration
+            # Refine the fit_mask for the NEXT iteration
             # This removes pixels that were rejected by the sigma clip
             new_fit_mask = fit_mask.copy()
             new_fit_mask[fit_mask] = ~clipped_res.mask
@@ -586,7 +596,7 @@ class MIRIPipeline:
         background_plane = alpha * xi + beta * yi + gamma
         data_bkgsub = data - background_plane        
     
-        # 5. Define elliptical annulus for local background estimate 
+        # Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
         dist_to_edge = min(x_cen, img_w - x_cen, y_cen, img_h - y_cen)
@@ -601,7 +611,7 @@ class MIRIPipeline:
         # Only use pixels that are in the annulus AND not a detected source
         bkg_pixels_mask = ann_mask & ~combined_mask
         
-        # 6. Final Stats
+        # Final Stats
         # Extract the 1D arrays of pixels
         plane_vals = np.asarray(background_plane[bkg_pixels_mask])
         res_vals = np.asarray(data_bkgsub[bkg_pixels_mask])
@@ -609,10 +619,10 @@ class MIRIPipeline:
         # Remove any NaNs that might have snuck in
         res_vals = res_vals[~np.isnan(res_vals)]
 
-        # 1. The Level (The pedestal subtracted)
+        # The Level (The pedestal subtracted)
         background_median = np.median(plane_vals)
 
-        # 2. The Noise (Robust RMS / Sigma)
+        # The Noise (Robust RMS / Sigma)
         # We use 1.4826 * MAD to match the scale of a standard deviation
         mad = np.median(np.abs(res_vals - np.median(res_vals)))
         background_rms = 1.4826 * mad 
@@ -623,13 +633,13 @@ class MIRIPipeline:
         
         # Initialise mask visualisation for plotting
         mask_vis = np.zeros_like(data, dtype=int)        
-        # 1. Start with everything as "0" (Excluded)
+        # Start with everything as "0" (Excluded)
 
-        # 2. Assign the "Sky" pixels (all pixels used in the final iterative fit)
+        # Assign the "Sky" pixels (all pixels used in the final iterative fit)
         # This includes the annulus pixels that survived clipping
         mask_vis[new_fit_mask] = 1 
 
-        # 3. Assign the "Source" pixels (your photometry aperture)
+        # Assign the "Source" pixels (your photometry aperture)
         # We do this last so it overwrites anything else
         mask_vis[source_mask] = 2
         
@@ -763,7 +773,7 @@ class MIRIPipeline:
         # 1. Determine the destination
         if save_path is None:
             # Default organizational structure
-            aperture_dir = os.path.join(self.output_dir, "mosaic_plots_weighted", filt)
+            aperture_dir = os.path.join(self.output_dir, "mosaic_plots", filt)
             os.makedirs(aperture_dir, exist_ok=True)
             save_path = os.path.join(aperture_dir, f"{gid}_bkg.png")
 
@@ -1341,8 +1351,8 @@ class MIRIPipeline:
                     
                     # --- Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
-                    galaxy_row[f"{filt}_ap_x"] = ap_params["x"].item()
-                    galaxy_row[f"{filt}_ap_y"] = ap_params["y"].item()
+                    galaxy_row[f"{filt}_ap_x"] = float(ap_params["x"])
+                    galaxy_row[f"{filt}_ap_y"] = float(ap_params["y"])
                     
                     # --- Store "Scalar" values once ---
                     if not ap_geometry_stored:
@@ -1369,33 +1379,50 @@ class MIRIPipeline:
         
                     
     def save_catalogue(self, df, base_filename):
-        """Saves the result in both FITS (Science) and CSV (Human-Readable)."""
-        # Save CSV
+        """Save photometric catalogue with explicit Astropy masking."""
+
+        # ---------- CSV ----------
         csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
         os.makedirs(csv_dir, exist_ok=True)
         csv_path = os.path.join(csv_dir, f"{base_filename}.csv")
         df.to_csv(csv_path, index=False)
-        
-        # Save FITS
+
+        # ---------- FITS ----------
         fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")
         os.makedirs(fits_dir, exist_ok=True)
         fits_path = os.path.join(fits_dir, f"{base_filename}.fits")
-        table = Table.from_pandas(df)
-        
-        for col_name in table.colnames:
-            # We only want to mask numerical data (Fluxes, Mags, etc.)
-            if any(key in col_name for key in ['flux', 'abmag', 'bkg', 'err']):
-                data = table[col_name].data
-                
-                # Create a mask where values are NaN
+
+        table = Table()
+
+        for col_name in df.columns:
+            # Convert series to a standard numpy array first
+            col_data = df[col_name].values 
+
+            # 1. Handle Floats (Fluxes, Mags, Coords) -> MaskedColumn
+            if np.issubdtype(df[col_name].dtype, np.floating):
+                data = col_data.astype(float)
                 mask = np.isnan(data)
-                
-                # Replace the column with a MaskedColumn
-                table[col_name] = MaskedColumn(data, name=col_name, mask=mask, fill_value=np.nan)
-            
-        table.write(fits_path, format='fits', overwrite=True, name='MIRI_PHOTOMETRY')
-        
+                table[col_name] = MaskedColumn(data=data, name=col_name, mask=mask, fill_value=np.nan)
+
+            # 2. Handle Integers (IDs) -> Ensure 1D Array
+            elif np.issubdtype(df[col_name].dtype, np.integer):
+                table[col_name] = col_data.astype(int)
+
+            # 3. Handle Everything Else (Strings, Booleans, Flags)
+            else:
+                # Converting to list and then array solves the "unsized object" error
+                # for string-based or object-based columns
+                table[col_name] = np.array(df[col_name].tolist())
+
+        table.write(
+            fits_path,
+            format="fits",
+            overwrite=True,
+            name="MIRI_PHOTOMETRY"
+        )
+
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {fits_path}")
+
 
 
 # ==================================================================================================
@@ -1654,7 +1681,7 @@ class MIRIPipeline:
         if not cog_results:
             return
         
-        save_path = os.path.join(cog_dir, f"{gid}_cog_weighted.png")
+        save_path = os.path.join(cog_dir, f"{gid}_cog.png")
         plt.figure(figsize=(8, 5))
         
         # --- AUTOMATED COLOUR LOGIC ---
