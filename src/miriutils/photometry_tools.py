@@ -1045,13 +1045,12 @@ class MIRIPipeline:
             "nominal_err_jy": nominal_err_jy
         }
     
-    def measure_flux_cog(self, aperture_params, bkg_results, radii, cog_dir=None):
+    def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None, cog_dir=None):
         """
         Performs multi-aperture photometry to generate a Curve of Growth.
         """
         
         # 1. Setup Data and Metadata        
-        kill_mask = bkg_results["kill_mask"]
         filt = bkg_results["filter"]
 
         gid = aperture_params["meta"]["id"]
@@ -1060,15 +1059,23 @@ class MIRIPipeline:
         pixel_area_sr = aperture_params["meta"]["pixel_area_sr"]
         conv = 1e6 * pixel_area_sr
         
-        # Create a version of the residuals where EVERYTHING except your target is hidden
-        # This uses your existing combined_mask (segm_mask | neighbor_masks | NaNs)
-        cog_data = bkg_results["subtracted"].copy()
-
-        # Ensure neighbors are zeroed out so they don't add to the sum
-        # We use combined_mask, but we MUST make sure the target aperture is EXCLUDED from the mask
-        # otherwise we mask the very galaxy we are trying to measure!
-
-        cog_data[kill_mask] = 0.0
+        # Extract fixed geometry from the small/original aperture
+        x, y = aperture_params["x"], aperture_params["y"]
+        theta = aperture_params["theta"]
+        b_over_a = aperture_params["b"] / aperture_params["a"]
+        
+        
+        # DYNAMIC DATA SELECTION: Use PSF if provided, otherwise use masked science data
+        if psf_data is not None:
+            cog_data = psf_data
+            # Make sure the aperture is centred on the PSF
+            x, y = centroid_com(psf_data)
+            is_psf = True
+        else:
+            kill_mask = bkg_results["kill_mask"]
+            cog_data = bkg_results["subtracted"].copy()
+            cog_data[kill_mask] = 0.0
+            is_psf = False
         
         # Plot and save single filter images
         if cog_dir:
@@ -1079,40 +1086,35 @@ class MIRIPipeline:
             plt.savefig(fname, dpi=200, bbox_inches='tight')
             plt.close()
         
-        # Extract fixed geometry from the small/original aperture
-        x, y = aperture_params["x"], aperture_params["y"]
-        theta = aperture_params["theta"]
-        b_over_a = aperture_params["b"] / aperture_params["a"]
-        
         cog_results = []
 
         # 2. Loop over radii to create the Curve of Growth
         for a_val in radii:
             # Scale b proportionally to maintain the galaxy's shape
-            b_val = a_val * b_over_a
-            temp_ap = EllipticalAperture((x, y), a=a_val, b=b_val, theta=theta)
+            effective_a = a_val * 4 if is_psf else a_val
+            effective_b = effective_a * b_over_a
+            temp_ap = EllipticalAperture((x, y), a=effective_a, b=effective_b, theta=theta)
             
             # A. Sum Flux
             phot_table = aperture_photometry(cog_data, temp_ap, method='exact')
             raw_flux_mjysr = phot_table['aperture_sum'][0]
             
-            # B. Propagate Errors for this specific aperture size
-            ap_mask = temp_ap.to_mask(method='exact')
-            # Detector variance
-            det_var = np.nansum(ap_mask.multiply(err_map**2))
-            # Background uncertainty scales with the Area of the aperture
-            # Area = pi * a * b
-            bkg_err_mjysr = bkg_results["rms"] * np.sqrt(temp_ap.area)
-            
-            total_err_mjysr = np.sqrt(det_var + bkg_err_mjysr**2)
+            # B. Error Propagation (Skip for PSF as it has no detector noise)
+            if not is_psf:
+                err_map = np.nan_to_num(aperture_params["err"], nan=0.0, posinf=0.0, neginf=0.0)
+                ap_mask = temp_ap.to_mask(method='exact')
+                det_var = np.nansum(ap_mask.multiply(err_map**2))
+                bkg_err_mjysr = bkg_results["rms"] * np.sqrt(temp_ap.area)
+                total_err_jy = np.sqrt(det_var + bkg_err_mjysr**2) * conv
+            else:
+                total_err_jy = 0.0
             
             # C. Store measurements for this radius
             cog_results.append({
                 "radius_a": a_val,
                 "area_pix": temp_ap.area,
-                "flux_jy": raw_flux_mjysr * conv,
-                "flux_err_jy": total_err_mjysr * conv,
-                "snr": (raw_flux_mjysr / total_err_mjysr) if total_err_mjysr > 0 else 0
+                "flux_jy": raw_flux_mjysr * conv if not is_psf else raw_flux_mjysr,
+                "flux_err_jy": total_err_jy * conv
             })
 
         return cog_results
@@ -1642,7 +1644,7 @@ class MIRIPipeline:
         plt.close()
 
 
-    def run_cog_analysis(self, gid, radii, cog_dir):
+    def run_cog_analysis(self, gid, radii, cog_dir, overplot_psf=False):
         """Function to perform Curve of Growth analysis for extended sources"""
 
         # Find files associated with galaxy ID
@@ -1659,6 +1661,7 @@ class MIRIPipeline:
         os.makedirs(cog_dir, exist_ok=True)
         
         cog_results = {}
+        cog_results_psf = {}
         
         for filt, file in files.items():
             try:
@@ -1670,10 +1673,19 @@ class MIRIPipeline:
                 
                 # 3. Measure fluxes by performing Curve of Growth (CoG) analysis
                 measurements = self.measure_flux_cog(ap_params, bkg_res, radii)
-                
+            
                 cog_results[filt] = measurements
                 cog_results["meta"] = ap_params
-                
+            
+                if overplot_psf:
+                    psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
+                    with fits.open(psf_path) as psf_hdul:
+                        psf_data = psf_hdul[3].data
+                    measurements_psf = self.measure_flux_cog(ap_params, bkg_res, radii, psf_data=psf_data)
+
+                    cog_results_psf[filt] = measurements_psf
+                    cog_results_psf["meta"] = ap_params
+                    
             except Exception as e:
                 print(f"Error processing {gid} in {filt}: {e}")
                 
@@ -1681,7 +1693,6 @@ class MIRIPipeline:
         if not cog_results:
             return
         
-        save_path = os.path.join(cog_dir, f"{gid}_cog.png")
         plt.figure(figsize=(8, 5))
         
         # --- AUTOMATED COLOUR LOGIC ---
@@ -1695,16 +1706,30 @@ class MIRIPipeline:
         
         # Sort filters by wavelength so the legend looks organized
         available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
-     
+
         for filt in available_filters:
-            # Get the color based on the wavelength
-            w_val = self.wavelength_map.get(filt, 15.0) # Default to middle if unknown
+            w_val = self.wavelength_map.get(filt, 15.0)
             line_color = colormap(norm(w_val))
             
-            # Extract flux in microJanskys
-            flux_ujy = [r['flux_jy'] * 1e6 for r in cog_results[filt]]
-            plt.plot(radii, flux_ujy, label=filt, color=line_color, 
-                    marker='o', markersize=3, lw=2, alpha=0.9)
+            if overplot_psf:
+                # Use normalised flux for direct shape comparison
+                galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
+                psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
+                
+                y_galaxy = galaxy_flux / np.max(galaxy_flux)
+                y_psf = psf_flux / np.max(psf_flux)
+                
+                plt.plot(radii, y_galaxy, label=f'{filt} (Galaxy)', color=line_color, 
+                        marker='o', markersize=3, lw=2, alpha=0.9)
+                plt.plot(radii, y_psf, label=f'{filt} (PSF)', color=line_color, 
+                        linestyle='--', lw=1.5, alpha=0.7)
+                plt.ylabel("Normalised Cumulative Flux")
+            else:
+                # Use absolute units if not overplotting
+                y_galaxy = [r['flux_jy'] * 1e6 for r in cog_results[filt]]
+                plt.plot(radii, y_galaxy, label=filt, color=line_color, 
+                        marker='o', markersize=3, lw=2, alpha=0.9)
+                plt.ylabel("Cumulative Flux [µJy]")
 
         # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
         # Adjust these keys based on how you stored them in prepare_aperture
@@ -1720,12 +1745,13 @@ class MIRIPipeline:
         plt.legend()
         plt.grid(alpha=0.2)
         
+        fname = f"{gid}_cog_psf.png" if overplot_psf else f"{gid}_cog.png"
+        save_path = os.path.join(cog_dir, fname)
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
         plt.close() # Close figure to free memory
         
         return cog_results
-                
-                
+        
 
         
         
