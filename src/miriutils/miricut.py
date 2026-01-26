@@ -10,21 +10,24 @@
 # ///
 """
 MIRI Utils: Astronomical Image Cutout Generator
-==============================================
+===============================================
 
 A professional, class-based utility for extracting multi-extension FITS cutouts 
 from JWST mosaics. Optimised for astronomical research workflows.
 
+Classes:
+--------
+    - CutoutManager: The main engine handling the cutout production
+
 Core Functionalities:
 ---------------------
-* Class-based 'CutoutManager' for stateful survey processing.
-* Dual-stage quality control: Global NaN ratio and Central Circular Mask (2" radius).
-* Intelligent Directory I/O: Automatic folder nesting and selective cleanup.
-* Visualisation: Orientation-aware PNG previews with N-E and X-Y compasses.
-* Flexible Overwrite Logic: User-defined control over existing file handling.
+    - Dual-stage quality control: Global NaN ratio and Central Circular Mask (2" radius).
+    - Intelligent Directory I/O: Automatic folder nesting and selective cleanup.
+    - Visualisation: Orientation-aware PNG previews with N-E and X-Y compasses.
+    - Flexible Overwrite Logic: User-defined control over existing file handling.
 
-Example usage
--------------
+Example Usage:
+--------------
     from miriutils import CutoutManager
     import os
     
