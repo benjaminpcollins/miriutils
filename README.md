@@ -57,3 +57,8 @@ pipeline = MiriPipeline(
 pipeline.run_photometry(write_to="Phot_Table_MIRI")
 ```
 
+## 📫 Contact
+
+For questions or collaborations, feel free to reach out via email or GitHub.
+
+Email: benjamin.p.collins@icloud.com
