@@ -59,7 +59,7 @@ Example usage
     ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
     
     # Initialise the pipeline
-    pipeline = BlueJayMiriPipeline(
+    pipeline = MiriPipeline(
         all_ids=ids_to_process,
         cutout_dir="./data/cutouts",
         output_dir="./miri_photometry",
@@ -72,14 +72,12 @@ Example usage
     
 
 Author: Benjamin P. Collins
-Date: January 15, 2026
-Version: 3.2.0
+Date: Jan 2026
+Version: 1.0.0
 """
 
 import os
 import warnings
-import random
-import glob
 import json
 from pathlib import Path
 import seaborn as sns

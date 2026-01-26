@@ -47,9 +47,10 @@ Example usage
         rgb_data = composer.create_rgb(arrays, stretch=0.5)
         composer.save_stamp("18332", rgb_data, recipe)
 
+
 Author: Benjamin P. Collins
-Date: January 10, 2026
-Version: 3.1
+Date: Jan 2026
+Version: 1.0.0
 """
 
 import os

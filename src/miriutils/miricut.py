@@ -23,9 +23,37 @@ Core Functionalities:
 * Visualisation: Orientation-aware PNG previews with N-E and X-Y compasses.
 * Flexible Overwrite Logic: User-defined control over existing file handling.
 
+Example usage
+-------------
+    from miriutils import CutoutManager
+    import os
+    
+    base_dir = './cutouts/'
+    catalogue = './catalogues/target_coordinates.fits'
+    data_path = './Data/'
+
+    # Define directories
+    survey_dict = {
+        'primer1': os.path.join(data_path, 'PRIMER/PRIMER_1'),
+        'primer2': os.path.join(data_path, 'PRIMER/PRIMER_2'),
+        'cos3d1': os.path.join(data_path, 'COSMOS-3D/COSMOS-3D_1'),
+        'cos3d2': os.path.join(data_path, 'COSMOS-3D/COSMOS-3D_2'),
+    }
+
+    # Add filters as needed
+    filters = ['F770W', 'F1000W', 'F1800W', 'F2100W']
+
+    # Initialise the CutoutManager
+    cm = CutoutManager(base_dir, survey_dict, catalogue)
+
+    for survey in survey_dict.keys():
+        for filt in filters:
+        cm.run_survey(survey, filt, size_arcsec=8.0, png=True, overwrite=True)
+
+
 Author: Benjamin P. Collins
 Date: Jan 2026
-Version: 4.0
+Version: 1.0.0
 """
 
 import os
