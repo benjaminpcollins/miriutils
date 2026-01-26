@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miriutils"
-version = "1.0.0"
+version = "1.0.1"
 authors = [
   { name="Benjamin Philip Collins", email="benjamin.p.collins@icloud.com" },
 ]

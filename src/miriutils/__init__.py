@@ -2,8 +2,7 @@
 miriutils: A suite of tools for JWST/MIRI aperture photometry.
 """
 
-__version__ = "1.0.0"
-__date__ = "Jan 2026"
+__version__ = "1.0.1"
 __author__ = "Benjamin P. Collins"
 __email__ = "benjamin.p.collins@icloud.com"
 __license__ = "BSD-3-Clause"
