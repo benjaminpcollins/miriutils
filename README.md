@@ -1,40 +1,59 @@
-# red\_cardinal
+# miriutils
 
-The `red_cardinal` repository stores all work related to my master's thesis and supporting Jupyter notebooks, as well as a custom-made Python package called `miri_utils/`. The repository serves as both a development environment and a backup, ensuring that all critical code is safely stored and version-controlled. The main focus is on the analysis of dust emission in galaxies at cosmic noon using JWST/MIRI observations from the PRIMER, COSMOS-Web, and COSMOS-3D surveys. Additionally, it includes the `prospector_utils/` library containing all helper scripts regarding the loading and manipulation of Prospector outputs. See overplot_miri.ipynb as a reference.
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18378612.svg)](https://doi.org/10.5281/zenodo.18378612)
+[![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-## 📁 Project Structure
+**miriutils** is a Python library designed for high-fidelity processing, astrometric alignment, and photometric analysis of JWST/MIRI data. Originally developed for the Blue Jay survey, it provides a streamlined pipeline to move from fully calibrated product level 3 mosaics to publication-ready photometric catalogues for JWST/MIRI.
 
+## 🚀 Key Features
+
+* **Aperture Photometry:** Automated end-to-end pipeline (`MIRIPipeline`) with local background modeling and PSF aperture corrections.
+* **Astrometric Calibration:** Specialised tools to correct systematic WCS offsets between MIRI and NIRCam.
+* **Data Management:** Efficient multi-extension FITS cutout generation via `CutoutManager`.
+* **Visualisation:** Publication-quality RGB composition and diagnostic plotting for mid-infrared datasets.
+
+## 📁 Repository Structure
+
+```text
+miriutils/
+├── miriutils/               # Core Package
+│   ├── __init__.py          # Version & Top-level exports
+│   ├── astrometry_utils.py  # WCS alignment & Offset tools
+│   ├── miricut.py           # CutoutManager & Quality Control
+│   ├── photometry_tools.py  # MIRIPipeline & Flux Calibration
+│   └── vis.py               # RGBComposer & Plotting
+├── CITATION.cff             # Citation metadata for Zenodo
+├── LICENSE                  # BSD-3-Clause License
+└── README.md
 ```
-red_cardinal/
-├── miri_utils/                    # Utilities related to MIRI data preparation and photometry
-│   ├── __init__.py
-│   ├── astrometry_utils.py        
-│   ├── cutout_tools.py
-│   ├── photometry_tools.py
-│   └── stamp_maker.py
-│
-├── prospector_utils/              # Utilities related to reconstructing Prospector outputs
-│   ├── __init__.py                # and investigating its agreement with MIRI photometry
-│   ├── analysis.py        
-│   ├── params.py
-│   └── plotting.py
-│
-├── astrometry.ipynb         
-├── make_stamps.ipynb
-├── overplot_miri.ipynb        
-├── photometry.ipynb         
-├── produce_cutouts.ipynb
-├── prosparams.py       
-├── README.md
-├── rotate_fits.ipynb
-└── webbpsf_tutorial.ipynb
+
+## 🛠 Installation
+
+Currently, `miriutils` can be installed by cloning the repository:
+
+```bash
+git clone [https://github.com/benjaminpcollins/miriutils.git](https://github.com/benjaminpcollins/miriutils.git)
+cd miriutils
+pip install -e .
 ```
-## 📄 License
 
-This project is intended for academic use. It will undergo further refinement and will soon be available for public use. If you wish to use it in the meantime, beware of potential library conflicts, depending on the version of Prospector you are using. In the near future, I will compile a list of the exact packages and versions used in these scripts.
+## 📖 Quick Start
+```python
+from miri_utils import MiriPipeline
 
-## 📫 Contact
+ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
 
-For questions or collaborations, feel free to reach out via email or GitHub.
+# Initialise the pipeline
+pipeline = MiriPipeline(
+    all_ids=ids_to_process,
+    cutout_dir="./data/cutouts",
+    output_dir="./miri_photometry",
+    nircam_dir="./NIRCam/cutouts",
+    aperture_table="./data/aperture_table.fits"
+)
 
-benjaminphilip.collins@studio.unibo.it
+# Run full survey photometry and store FITS and CSV format output tables
+pipeline.run_photometry(write_to="Phot_Table_MIRI")
+```
+
