@@ -38,8 +38,11 @@ Key Capabilities
     - Quality flagging for detector artefacts and companion contamination.
     - Stores data for visualising the background modelling in h5py format
       and provides functions for easy reading and plotting.
+    - Automatically generates detection statistics
     - Provides functions for visualising systematics introduced due to the
       choice of aperture sizes for MIRI.
+    - Includes tools for Curve of Growth (CoG) analysis to compare the 
+      physical values to PSF model predictions
 
 Workflow
 --------
@@ -78,8 +81,6 @@ import warnings
 import random
 import glob
 import json
-import re
-import pickle as pkl
 from pathlib import Path
 import seaborn as sns
 
@@ -118,18 +119,13 @@ warnings.filterwarnings('ignore', category=NoDetectionsWarning)
 
 # --- Standalone Utility Functions ---
 class MIRIPipeline:
-    def __init__(self, all_ids, cutouts_dir, output_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
-        
-        # Initialise directories
-        self.cutouts_dir = cutouts_dir
-        self.output_dir = output_dir
-        self.nircam_dir = nircam_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+    def __init__(self, ids_to_process, cutouts_dir, photometry_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
         
         # Load aperture table
         self.master_table = Table.read(aperture_table)
+        self.table_path = None  # To be overwritten in save_catalogue()
         
-        self.all_ids = all_ids
+        self.all_ids = ids_to_process
         
          # 1. Map filters to central wavelengths (microns) for correct physical sorting
         self.wavelength_map = {
@@ -144,6 +140,11 @@ class MIRIPipeline:
             'F2550W': 25.5
         }
         
+        # Initialise directories
+        self.cutouts_dir = cutouts_dir
+        self.output_dir = photometry_dir
+        self.nircam_dir = nircam_dir        
+        
         # Default PSF directory if none provided
         if psf_dir is None:
             self.psf_dir = os.path.join(self.output_dir, "psfs")
@@ -151,9 +152,16 @@ class MIRIPipeline:
         else:
             self.psf_dir = psf_dir
             print(f"Found PSF directory {self.psf_dir}")
-            
-        # Ensure the PSF directory exists
-        os.makedirs(self.psf_dir, exist_ok=True)
+        
+        self.aperture_dir = os.path.join(self.output_dir, "apertures")
+        self.mosaic_dir = os.path.join(self.output_dir, "mosaic_plots")
+        self.phot_table_dir = os.path.join(self.output_dir, "phot_tables")
+        self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
+        self.vis_dir = os.path.join(self.output_dir, "vis_data")
+        self.detection_dir = os.path.join(self.output_dir, "vis_data")
+        
+        for dir in [self.aperture_dir, self.mosaic_dir, self.phot_table_dir, self.detection_dir]:
+            os.makedirs(dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
         if scaling_exceptions_file is None:
@@ -467,15 +475,13 @@ class MIRIPipeline:
         galaxy_id = results_list[0]['id']
         
         plt.suptitle(f"Galaxy ID: {galaxy_id}", fontsize=14)
-        if output_dir is None:
-            aperture_dir = os.path.join(self.output_dir, "aperture_plots")
-        os.makedirs(aperture_dir, exist_ok=True)
+        aperture_dir = self.aperture_dir
         out_path = os.path.join(aperture_dir, f"{galaxy_id}_all.png")
         plt.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3):
+    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3, save_vis=False):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -676,11 +682,12 @@ class MIRIPipeline:
         }
         
         # Save visualisation data to .h5 file
-        vis_dir = os.path.join(self.output_dir, "vis_data")
-        os.makedirs(vis_dir, exist_ok=True)
+        if save_vis:
+            vis_dir = self.vis_dir
+            os.makedirs(vis_dir, exist_ok=True)
 
-        vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filt}.h5")
-        self.save_vis(vis_data, vis_path)
+            vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filt}.h5")
+            self.save_vis(vis_data, vis_path)
         
         return {
             "id": galaxy_id,
@@ -773,9 +780,9 @@ class MIRIPipeline:
         # 1. Determine the destination
         if save_path is None:
             # Default organizational structure
-            aperture_dir = os.path.join(self.output_dir, "mosaic_plots", filt)
-            os.makedirs(aperture_dir, exist_ok=True)
-            save_path = os.path.join(aperture_dir, f"{gid}_bkg.png")
+            filt_dir = os.path.join(self.mosaic_dir, filt)
+            os.makedirs(filt_dir, exist_ok=True)
+            save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
@@ -1379,6 +1386,13 @@ class MIRIPipeline:
         
         self.save_catalogue(df, write_to)
         
+        # Continue by creating detection statistics and storing them in a separate directory
+        
+        
+        
+        
+        
+        
                     
     def save_catalogue(self, df, base_filename):
         """Save photometric catalogue with explicit Astropy masking."""
@@ -1392,7 +1406,7 @@ class MIRIPipeline:
         # ---------- FITS ----------
         fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")
         os.makedirs(fits_dir, exist_ok=True)
-        fits_path = os.path.join(fits_dir, f"{base_filename}.fits")
+        self.table_path = os.path.join(fits_dir, f"{base_filename}.fits")
 
         table = Table()
 
@@ -1417,15 +1431,13 @@ class MIRIPipeline:
                 table[col_name] = np.array(df[col_name].tolist())
 
         table.write(
-            fits_path,
+            self.table_path,
             format="fits",
             overwrite=True,
             name="MIRI_PHOTOMETRY"
         )
 
-        print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {fits_path}")
-
-
+        print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
 
 # ==================================================================================================
 # ====================== END OF PHOTOMETRY - START OF ANALYSIS =====================================
@@ -1547,10 +1559,7 @@ class MIRIPipeline:
         if fig_path:
             MIRIPipeline.plot_aperture_comparison(data_comparison, fig_path)
             print(f"Saved output plot to {fig_path}")
-
-        if summary_doc_path:
-            write_aperture_summary(data_comparison, common_ids, summary_doc_path)
-
+            
 
     @staticmethod
     def plot_aperture_comparison(data_comparison, fig_dir, scaling='log'):
@@ -1569,7 +1578,7 @@ class MIRIPipeline:
         # Create a grid: 3 columns (Comparison, Ratio, Systematic Trend) x n_bands rows
         fig, axes = plt.subplots(n_bands, 3, figsize=(13, 4 * n_bands), squeeze=False)
         
-        colors = {'scatter': '#1f77b4', 'ratio': '#e377c2', 'trend': '#2ca02c'}
+        colors = {'scatter': '#1f77b4', 'ratio': "#af77e3", 'trend': '#2ca02c'}
 
         for i, band in enumerate(bands):
             mask = data_comparison["Band"] == band
@@ -1582,7 +1591,7 @@ class MIRIPipeline:
 
             # --- PANEL 1: Corrected Flux Comparison (1:1) ---
             ax = axes[i, 0]
-            ax.scatter(flux_s, flux_b, alpha=0.6, s=25, color=colors['scatter'], edgecolors='white', linewidth=0.3)
+            ax.scatter(flux_s, flux_b, alpha=0.6, s=25, color=colors['scatter'], edgecolors='black', linewidth=0.3)
             
             # 1:1 Line logic
             lims = [np.min([flux_s, flux_b]), np.max([flux_s, flux_b])]
@@ -1601,7 +1610,7 @@ class MIRIPipeline:
             ax = axes[i, 1]
             ax.hist(ratio_corr, bins=np.linspace(0.5, 3.5, 25), alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
             #ax.hist(ratio_corr, bins=25, alpha=0.7, color=colors['ratio'], edgecolor='black', linewidth=0.5)
-            ax.axvline(1.0, color="red", linestyle="--", linewidth=1.5)
+            ax.axvline(1.0, color="red", linestyle="--", linewidth=1.5, label="Unity")
             
             med = np.median(ratio_corr)
             std = np.std(ratio_corr)
@@ -1616,15 +1625,18 @@ class MIRIPipeline:
             # --- PANEL 3: Corrected Ratio vs Brightness (Systematics) ---
             ax = axes[i, 2]
             # Color code by the magnitude of the aperture correction to see if PSF issues drive scatter
-            sc = ax.scatter(flux_s, ratio_corr, alpha=0.7, s=30, 
-                            c=data_comparison[f"{band}_apcorr_big"][mask], cmap='viridis', edgecolors='none')
-            ax.axhline(1.0, color="red", linestyle="--", alpha=0.8)
+            sc = ax.scatter(flux_s, ratio_corr, alpha=0.7, s=30, edgecolor="black",
+                            c=data_comparison[f"{band}_apcorr_big"][mask], cmap='viridis')
+            ax.axhline(1.0, color="red", linestyle="--", alpha=0.8, label="Unity")
+            ax.axhline(med, color="darkred", linestyle="-", linewidth=1.5, label=f'Med: {med:.3f}', alpha=0.6)
             
             ax.set_xscale('log')
             #ax.set_ylim(0.5, 3.0) # Focus on the 50% deviation window
             ax.set_title(f"{band}: Systematic Trends", fontweight='bold')
             ax.set_xlabel("Flux [µJy]")
             ax.set_ylabel("Ratio (Large/Small)")
+            ax.set_ylim(0.5)
+            ax.legend(fontsize=9)
             ax.grid(True, alpha=0.2)
             
             if i == 0: # Add colorbar only to top row to save space
@@ -1719,9 +1731,9 @@ class MIRIPipeline:
                 y_galaxy = galaxy_flux / np.max(galaxy_flux)
                 y_psf = psf_flux / np.max(psf_flux)
                 
-                plt.plot(radii, y_galaxy, label=f'{filt} (Galaxy)', color=line_color, 
+                plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
                         marker='o', markersize=3, lw=2, alpha=0.9)
-                plt.plot(radii, y_psf, label=f'{filt} (PSF)', color=line_color, 
+                plt.plot(radii, y_psf, color=line_color, 
                         linestyle='--', lw=1.5, alpha=0.7)
                 plt.ylabel("Normalised Cumulative Flux")
             else:
@@ -1751,10 +1763,241 @@ class MIRIPipeline:
         plt.close() # Close figure to free memory
         
         return cog_results
+    
+    @staticmethod
+    def get_detection_stats(table_path, out_dir, snr=3.0):
+        """Code to generate detection statistics of a given photometric table"""
         
+        # Read table and generate output directory
+        table = Table.read(table_path)
+        os.makedirs(out_dir, exist_ok=True)
 
+        # Read bands from either catalogue (should be identical!)
+        filters = [c.replace('_flux', '') for c in table.colnames if c.endswith('_flux') and not c.startswith('ap')]
         
+        nondetections = {}
         
+        for filt in filters:    
+            # Join tables on ID for this specific band
+            # Rename columns during join to avoid collisions
+            cols = ['ID', f'{filt}_flux', f'{filt}_flux_err', f'{filt}_apflux', f'{filt}_apflux_err', f'{filt}_apcorr', f'{filt}_bkg_err']
+            
+            # VECTORISED CALCULATIONS (No loops!)
+            flux = table[f'{filt}_flux']
+            flux_err = table[f'{filt}_flux_err']
+            apflux = table[f'{filt}_apflux']
+            apflux_err = table[f'{filt}_apflux_err']            
+            
+            # Rough detection filtering based on SNR
+            signal_to_noise = apflux / apflux_err
+            
+            # Clean NaNs/Negatives
+            mask = (flux > 0) & (apflux > 0) & (signal_to_noise >= snr)
+            
+            nondetected = table[~mask]
+            
+            # Extract table IDs
+            ids = [id.decode() if isinstance(id, bytes) else str(id) for id in nondetected["ID"]]
+            
+            nondetections[filt] = ids
+            
+        return nondetections
+            
+    @staticmethod
+    def plot_galaxy_filter_matrix(
+        table_path, fig_path, title=None, nondetections=None, cols=4
+    ):
+        """
+        Visualise which galaxies are observed and detected in which filters,
+        but using a dictionary of *non-detections* instead of detections.
+
+        Parameters:
+        -----------
+        table_path : str
+            Path to the FITS file.
+        fig_path : str
+            Path to the output file.
+        title : str, optional
+            Title of the plot.
+        nondetections : dict, optional
+            Dictionary mapping filter names to lists of galaxy IDs that were NOT detected.
+        cols : int
+            Number of subplot columns.
+        """
+        table = Table.read(table_path, format="fits")
+        table.info()
+        filter_order = ["F770W", "F1000W", "F1800W", "F2100W"]
+        pastel_colours = {
+            "F770W": "#a6cee3",
+            "F1000W": "#b2df8a",
+            "F1800W": "#fdbf6f",
+            "F2100W": "#fb9a99",
+        }
+
+        galaxy_ids = [str(gid) for gid in table["ID"]]
+        num_galaxies = len(galaxy_ids)
+        chunk_size = (num_galaxies + 3) // cols
+        chunks = [
+            galaxy_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)
+        ]
+
+        print(f"Number of unique IDs in table: {len(set(str(row['ID']) for row in table))}")
+        print(f"Number of IDs in galaxy_ids: {len(galaxy_ids)}")
+        print(f"Chunks: {[len(c) for c in chunks]}")
+
+        cell_size = 0.5
+        num_cols = len(filter_order)
+        num_rows = chunk_size
+        fig_width = cell_size * num_cols * cols
+        fig_height = cell_size * num_rows * 0.7
+
+        fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
+        axes = axes[0]
+
+        for ax, g_ids in zip(axes, chunks):
+            matrix = np.zeros((len(g_ids), len(filter_order)), dtype=int)
+            g_index_map = {gid: i for i, gid in enumerate(g_ids)}
+            table_id_to_row = {str(row["ID"]): ii for ii, row in enumerate(table)}
+
+            for row in table:
+                gid = str(row["ID"])
+                if gid not in g_index_map:
+                    continue
+                g_ii = g_index_map[gid]
+                filters = row["Filters"]
+                if isinstance(filters, (list, np.ndarray)):
+                    filters = [
+                        f.decode() if isinstance(f, bytes) else str(f) for f in filters
+                    ]
+                else:
+                    filters = [f.strip() for f in str(filters).split(",") if f.strip()]
+
+                for filt in filters:
+                    if filt in filter_order:
+                        f_ii = filter_order.index(filt)
+
+                        # Inverted logic:
+                        # Galaxy is marked if it's covered AND not in nondetections for that filter
+                        if nondetections is None or int(gid) not in nondetections.get(
+                            filt, []
+                        ):
+                            matrix[g_ii, f_ii] = 1
+
+            # Draw rectangles
+            for i in range(matrix.shape[0]):
+                for j in range(matrix.shape[1]):
+                    if matrix[i, j] == 1:
+                        base_colour = pastel_colours[filter_order[j]]
+                        gid = g_ids[i]
+                        row = table[table_id_to_row[gid]]
+
+                        flag_art_array = row["Flag_Art"]
+                        flag_art = False
+                        if flag_art_array is not None and len(flag_art_array) == len(
+                            filter_order
+                        ):
+                            flag_art = flag_art_array[j]
+
+                        if flag_art:
+                            rgb = np.array(mcolors.to_rgb(base_colour))
+                            darker_rgb = np.clip(rgb * 0.7, 0, 1)
+                            colour = darker_rgb
+                        else:
+                            colour = base_colour
+
+                        ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+
+            # Labels with asterisk for companions
+            y_labels = []
+            for i, gid in enumerate(g_ids):
+                row = table[table_id_to_row[gid]]
+                label = gid
+                if row["Flag_Com"] == True:
+                    label += "*"
+                y_labels.append(label)
+
+            ax.set_xlim(0, len(filter_order))
+            ax.set_ylim(len(g_ids), 0)
+            ax.set_xticks(np.arange(len(filter_order)) + 0.5)
+            ax.set_xticklabels(filter_order, rotation=45, ha="right", fontsize=11)
+            ax.set_yticks(np.arange(len(g_ids)) + 0.5)
+            ax.set_yticklabels(y_labels, fontsize=11)
+
+            # Add horizontal grid lines
+            for y in np.arange(len(g_ids)):
+                ax.axhline(
+                    y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10
+                )
+
+            # Vertical lines at column boundaries
+            for x in np.arange(len(filter_order) + 1):
+                ax.axvline(
+                    x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10
+                )
+
+            print(f"Plotting {len(g_ids)} galaxies in this panel")
+
+        total_plotted = sum(len(c) for c in chunks)
+        print(f"Total plotted galaxies: {total_plotted}")
+
+        # plt.suptitle(title, fontsize=28)
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(fig_path), exist_ok=True)
+        plt.savefig(fig_path, dpi=150)
+        plt.show()
+ 
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -2095,147 +2338,6 @@ def write_detection_stats(table_path, stats_path=None, nondetections=None):
     print(f"Wrote galaxy statistics to {stats_path}")
 
 
-def plot_galaxy_filter_matrix(
-    table_path, fig_path, title=None, nondetections=None, cols=4
-):
-    """
-    Visualise which galaxies are observed and detected in which filters,
-    but using a dictionary of *non-detections* instead of detections.
-
-    Parameters:
-    -----------
-    table_path : str
-        Path to the FITS file.
-    fig_path : str
-        Path to the output file.
-    title : str, optional
-        Title of the plot.
-    nondetections : dict, optional
-        Dictionary mapping filter names to lists of galaxy IDs that were NOT detected.
-    cols : int
-        Number of subplot columns.
-    """
-    table = Table.read(table_path, format="fits")
-    table.info()
-    filter_order = ["F770W", "F1000W", "F1800W", "F2100W"]
-    pastel_colours = {
-        "F770W": "#a6cee3",
-        "F1000W": "#b2df8a",
-        "F1800W": "#fdbf6f",
-        "F2100W": "#fb9a99",
-    }
-
-    galaxy_ids = [str(gid) for gid in table["ID"]]
-    num_galaxies = len(galaxy_ids)
-    chunk_size = (num_galaxies + 3) // cols
-    chunks = [
-        galaxy_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)
-    ]
-
-    print(f"Number of unique IDs in table: {len(set(str(row['ID']) for row in table))}")
-    print(f"Number of IDs in galaxy_ids: {len(galaxy_ids)}")
-    print(f"Chunks: {[len(c) for c in chunks]}")
-
-    cell_size = 0.5
-    num_cols = len(filter_order)
-    num_rows = chunk_size
-    fig_width = cell_size * num_cols * cols
-    fig_height = cell_size * num_rows * 0.7
-
-    fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
-    axes = axes[0]
-
-    for ax, g_ids in zip(axes, chunks):
-        matrix = np.zeros((len(g_ids), len(filter_order)), dtype=int)
-        g_index_map = {gid: i for i, gid in enumerate(g_ids)}
-        table_id_to_row = {str(row["ID"]): ii for ii, row in enumerate(table)}
-
-        for row in table:
-            gid = str(row["ID"])
-            if gid not in g_index_map:
-                continue
-            g_ii = g_index_map[gid]
-            filters = row["Filters"]
-            if isinstance(filters, (list, np.ndarray)):
-                filters = [
-                    f.decode() if isinstance(f, bytes) else str(f) for f in filters
-                ]
-            else:
-                filters = [f.strip() for f in str(filters).split(",") if f.strip()]
-
-            for filt in filters:
-                if filt in filter_order:
-                    f_ii = filter_order.index(filt)
-
-                    # Inverted logic:
-                    # Galaxy is marked if it's covered AND not in nondetections for that filter
-                    if nondetections is None or int(gid) not in nondetections.get(
-                        filt, []
-                    ):
-                        matrix[g_ii, f_ii] = 1
-
-        # Draw rectangles
-        for i in range(matrix.shape[0]):
-            for j in range(matrix.shape[1]):
-                if matrix[i, j] == 1:
-                    base_colour = pastel_colours[filter_order[j]]
-                    gid = g_ids[i]
-                    row = table[table_id_to_row[gid]]
-
-                    flag_art_array = row["Flag_Art"]
-                    flag_art = False
-                    if flag_art_array is not None and len(flag_art_array) == len(
-                        filter_order
-                    ):
-                        flag_art = flag_art_array[j]
-
-                    if flag_art:
-                        rgb = np.array(mcolors.to_rgb(base_colour))
-                        darker_rgb = np.clip(rgb * 0.7, 0, 1)
-                        colour = darker_rgb
-                    else:
-                        colour = base_colour
-
-                    ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
-
-        # Labels with asterisk for companions
-        y_labels = []
-        for i, gid in enumerate(g_ids):
-            row = table[table_id_to_row[gid]]
-            label = gid
-            if row["Flag_Com"] == True:
-                label += "*"
-            y_labels.append(label)
-
-        ax.set_xlim(0, len(filter_order))
-        ax.set_ylim(len(g_ids), 0)
-        ax.set_xticks(np.arange(len(filter_order)) + 0.5)
-        ax.set_xticklabels(filter_order, rotation=45, ha="right", fontsize=11)
-        ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-        ax.set_yticklabels(y_labels, fontsize=11)
-
-        # Add horizontal grid lines
-        for y in np.arange(len(g_ids)):
-            ax.axhline(
-                y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10
-            )
-
-        # Vertical lines at column boundaries
-        for x in np.arange(len(filter_order) + 1):
-            ax.axvline(
-                x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10
-            )
-
-        print(f"Plotting {len(g_ids)} galaxies in this panel")
-
-    total_plotted = sum(len(c) for c in chunks)
-    print(f"Total plotted galaxies: {total_plotted}")
-
-    # plt.suptitle(title, fontsize=28)
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(fig_path), exist_ok=True)
-    plt.savefig(fig_path, dpi=150)
-    plt.show()
 
 
 
