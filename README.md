@@ -17,14 +17,16 @@
 
 ```text
 miriutils/
-├── miriutils/               # Core Package
-│   ├── __init__.py          # Version & Top-level exports
-│   ├── astrometry_utils.py  # WCS alignment & Offset tools
-│   ├── miricut.py           # CutoutManager & Quality Control
-│   ├── photometry_tools.py  # MIRIPipeline & Flux Calibration
-│   └── vis.py               # RGBComposer & Plotting
-├── CITATION.cff             # Citation metadata for Zenodo
-├── LICENSE                  # BSD-3-Clause License
+├── src/
+│   └── miriutils/           # Core Package
+│       ├── __init__.py      
+│       ├── astrometry_utils.py  
+│       ├── miricut.py           
+│       ├── photometry_tools.py  
+│       └── vis.py               
+├── CITATION.cff             
+├── LICENSE                  
+├── pyproject.toml
 └── README.md
 ```
 
