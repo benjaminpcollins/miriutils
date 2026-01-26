@@ -1,19 +1,50 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
 cff-version: 1.2.0
-message: "If you use this software, please cite it as below."
+title: 'miriutils: A Python library for JWST/MIRI photometry'
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
 authors:
-- family-names: "Collins"
-  given-names: "Benjamin P."
-  affiliation: "Dipartimento di Fisica e Astronomia, Università di Bologna, Bologna, Italy"
-  # orcid: "https://orcid.org/0009-0005-9328-6283"
-title: "miri_utils: A Python library for JWST/MIRI photometry"
-version: 1.0.0
-# doi: 10.5281/zenodo.XXXXXXX  # You will get this from Zenodo after your first release
-date-released: 2025-12-26
-url: "https://github.com/benjaminpcollins/miri_utils"
-repository-code: "https://github.com/benjaminpcollins/miri_utils"
+  - given-names: Benjamin Philip
+    family-names: Collins
+    email: benjamin.p.collins@icloud.com
+    orcid: 'https://orcid.org/0009-0005-9328-6283'
+    affiliation: >-
+      Dipartimento di Fisica e Astronomia, Università di
+      Bologna, Bologna, Italy
+repository-code: 'https://github.com/benjaminpcollins/miriutils'
+abstract: >-
+  miriutils is a Python library designed for the processing
+  and analysis of JWST/MIRI (Mid-Infrared Instrument) data.
+  The package provides a streamlined workflow through the
+  following core components:
+
+
+  - Cutout Production: miricut.py includes the CutoutManager
+  class which handles file selection, coordinate matching of
+  sources and cutout production in a straightforward way,
+  preserving all relevant FITS extensions of the original
+  mosaics.
+
+   - RGB Image Visualisation: All tools related to the creation of RGB composite images are stored in vis.py with a fallback on NIRCam/F444W images when multiple MIRI bands are not available
+
+  - Astrometric Calibration: The astrometry_utils.py module
+  provides specialised tools for precise coordinate
+  alignment and header updates.
+
+
+  - Photometry & Pipeline Management: Centered around the
+  MIRIPipeline class and photometry_tools.py, it automates
+  end-to-end photometric analysis and plotting tasks.
 keywords:
-  - "astronomy"
-  - "JWST"
-  - "MIRI"
-  - "photometry"
+  - Aperture photometry
+  - Photometry
+  - JWST/MIRI
+  - JWST/NIRCam
 license: BSD-3-Clause
+commit: 34de58a448a1cd5be56fa378ea17ca724373305b
+version: 1.0.0
+date-released: '2026-01-26'
