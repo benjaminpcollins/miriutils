@@ -12,25 +12,25 @@
 # ///
 """
 MIRI Utils: Visualisation & RGB Composition Module
-=================================================
+==================================================
 
 This module provides the RGBComposer class, designed to automate the creation 
 of 3-color composite stamps from multi-instrument JWST data (MIRI & NIRCam). 
 It handles spatial alignment via reprojection, North-up rotation, asinh scaling, 
 and automated labeling with filter legends and scale bars.
 
-Classes
--------
+Classes:
+--------
     - RGBComposer: The main engine for finding, aligning, and rendering RGB stamps.
 
-Key Capabilities
-----------------
+Key Capabilities:
+-----------------
     - Automatic filter-to-channel mapping (Recipe generation).
     - Sub-pixel alignment using Astropy Reproject.
     - Publication-ready plotting with color-coded legends.
 
-Example usage
--------------
+Example Usage:
+--------------
     from miri_utils.vis import RGBComposer
 
     # Initialise the composer
@@ -47,9 +47,10 @@ Example usage
         rgb_data = composer.create_rgb(arrays, stretch=0.5)
         composer.save_stamp("18332", rgb_data, recipe)
 
+
 Author: Benjamin P. Collins
-Date: January 10, 2026
-Version: 3.1
+Date: Jan 2026
+Version: 1.0.0
 """
 
 import os

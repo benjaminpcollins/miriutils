@@ -23,12 +23,12 @@ to produce publication-ready mid-infrared photometry for the Blue Jay survey.
 It automates the transition from raw FITS cutouts in the '_i2d.fits' format to
 aperture-corrected Janskys.
 
-Class
--------
+Classes:
+--------
     - MiriPipeline: The core engine for batch processing MIRI photometry.
 
-Key Capabilities
-----------------
+Key Capabilities:
+-----------------
     - Automated "Wide" Table generation (one row per ID, columns per band).
     - Multi-instrument WCS alignment and automated aperture adjustment.
     - Local background modeling using iterative sigma-clipped 2D statistics.
@@ -44,22 +44,22 @@ Key Capabilities
     - Includes tools for Curve of Growth (CoG) analysis to compare the 
       physical values to PSF model predictions
 
-Workflow
---------
-    1. Pre-scans directories to initialize a type-safe, wavelength-ordered table structure.
+Workflow:
+---------
+    1. Pre-scans directories to initialise a type-safe, wavelength-ordered table structure.
     2. Aligns science apertures based on Blue Jay (NIRCam F444W) morphology.
     3. Performs exact aperture photometry and background estimation.
     4. Calculates band-specific PSF corrections on an oversampled grid.
     5. Exports a dual-format (FITS/CSV) catalogue with standardised columns.
 
-Example usage
--------------
+Example usage:
+--------------
     from miri_utils import MiriPipeline
 
     ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
     
     # Initialise the pipeline
-    pipeline = BlueJayMiriPipeline(
+    pipeline = MiriPipeline(
         all_ids=ids_to_process,
         cutout_dir="./data/cutouts",
         output_dir="./miri_photometry",
@@ -72,14 +72,12 @@ Example usage
     
 
 Author: Benjamin P. Collins
-Date: January 15, 2026
-Version: 3.2.0
+Date: Jan 2026
+Version: 1.0.0
 """
 
 import os
 import warnings
-import random
-import glob
 import json
 from pathlib import Path
 import seaborn as sns
