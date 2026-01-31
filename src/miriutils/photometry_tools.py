@@ -81,6 +81,7 @@ import warnings
 import json
 from pathlib import Path
 import seaborn as sns
+import random
 
 import numpy as np
 import pandas as pd
@@ -89,7 +90,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
 import matplotlib.cm as cm
-from scipy.stats import skew, kurtosis
+from scipy.stats import skew, kurtosis, median_abs_deviation
 
 import astropy.units as u
 from astropy.io import fits
@@ -479,7 +480,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3, save_vis=False):
+    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3, n_random=200, save_vis=False):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -595,11 +596,34 @@ class MIRIPipeline:
         non_sky_mask = ~fit_mask
         kill_mask = non_sky_mask.copy()
         kill_mask[source_mask_large] = False
-                
+        
         # Final Plane Generation
         background_plane = alpha * xi + beta * yi + gamma
-        data_bkgsub = data - background_plane        
-    
+        data_bkgsub = data - background_plane
+        
+        # Insert section for empirical rms caculation
+        noise_image = data_bkgsub.copy()
+        noise_image[kill_mask] = np.nan        
+        
+        emp_rms = self.empirical_aperture_rms(
+            noise_image, 
+            aperture_params, 
+            n_random=n_random
+            )
+          
+        
+        # To Do:
+        # x Measure background flux from median value of the bkg-plane within the aperture times aperture.area
+        # x Include SNR in the final catalogue (which one?)
+        # x Implement a CoG based flagging routine for detector artefacts
+        
+        
+        
+        
+        
+        
+        
+
         # Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
         img_h, img_w = data.shape
@@ -658,34 +682,36 @@ class MIRIPipeline:
                    else aperture_params.get("theta")),
         }
         
-        # Store visualisation data
-        vis_data = {
-            "galaxy_id": galaxy_id,
-            "filter": filt,
-            "original_data": data,
-            "background_plane": background_plane,
-            "background_subtracted": data_bkgsub,
-            "mask_vis": mask_vis,
-            "segmentation_mask": segm_mask,
-            "background_region_mask": ann_mask,
-            "region_name": "Annulus",
-            "source_mask": source_mask_large,
-            "aperture_params": aperture_map,
-            "a_in": a_in,
-            "b_in": b_in,
-            "a_out": a_out,
-            "b_out": b_out,
-            "sigma": sigma_val,
-            "coeffs": (alpha, beta, gamma),
-        }
         
         # Save visualisation data to .h5 file
         if save_vis:
             vis_dir = self.vis_dir
             os.makedirs(vis_dir, exist_ok=True)
+            
+            # Store visualisation data
+            vis_data = {
+                "galaxy_id": galaxy_id,
+                "filter": filt,
+                "original_data": data,
+                "background_plane": background_plane,
+                "background_subtracted": data_bkgsub,
+                "mask_vis": mask_vis,
+                "segmentation_mask": segm_mask,
+                "background_region_mask": ann_mask,
+                "region_name": "Annulus",
+                "source_mask": source_mask_large,
+                "aperture_params": aperture_map,
+                "a_in": a_in,
+                "b_in": b_in,
+                "a_out": a_out,
+                "b_out": b_out,
+                "sigma": sigma_val,
+                "coeffs": (alpha, beta, gamma),
+            }
 
             vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filt}.h5")
             self.save_vis(vis_data, vis_path)
+        
         
         return {
             "id": galaxy_id,
@@ -693,6 +719,7 @@ class MIRIPipeline:
             "median": background_median,
             "median_res": np.median(res_vals),
             "rms": background_rms,
+            "emp_rms": emp_rms,
             "plane": background_plane,
             "subtracted": data_bkgsub,
             "annulus": annulus,
@@ -1006,6 +1033,7 @@ class MIRIPipeline:
         data_bkgsub = bkg_results["subtracted"]
         source_ap = bkg_results["source_ap"]
         median_bkg_residuals = bkg_results["median_res"]
+        emp_rms = bkg_results["emp_rms"]
         
         # Perform photometry
         phot_table = aperture_photometry(data_bkgsub, source_ap, method='exact')
@@ -1029,6 +1057,7 @@ class MIRIPipeline:
         conv = 1e6 * pixel_area_sr
         flux_jy = raw_flux_mjysr * conv
         err_jy = total_err_mjysr * conv
+        emp_rms_jy = emp_rms * conv
         
         # This is the "Nominal" error in Jy
         nominal_err_jy = np.sqrt(detector_variance) * conv
@@ -1043,6 +1072,7 @@ class MIRIPipeline:
             "flux_jy": flux_jy,
             "flux_err_jy": err_jy,
             "snr": flux_jy / err_jy if err_jy > 0 else 0,
+            "empirical_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
             "area_pix": source_ap.area,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
@@ -1387,11 +1417,6 @@ class MIRIPipeline:
         # Continue by creating detection statistics and storing them in a separate directory
         
         
-        
-        
-        
-        
-                    
     def save_catalogue(self, df, base_filename):
         """Save photometric catalogue with explicit Astropy masking."""
 
@@ -1436,6 +1461,7 @@ class MIRIPipeline:
         )
 
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
+
 
 # ==================================================================================================
 # ====================== END OF PHOTOMETRY - START OF ANALYSIS =====================================
@@ -1801,6 +1827,89 @@ class MIRIPipeline:
             
         return nondetections
             
+    
+
+    @staticmethod
+    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.5):
+        """
+        Estimate RMS by placing random elliptical apertures on the image.
+
+        Parameters
+        ----------
+        img : 2D array
+            Background-subtracted + masked cutout image.
+        aperture_params : dict
+            Dictionary with keys ['a', 'b', 'theta', 'x_center', 'y_center'].
+        n_random : int
+            Number of random apertures to place.
+        valid_frac : float
+            Minimum fraction of aperture pixels that must be valid (not NaN)
+        Returns
+        -------
+        rms : float
+            Empirical RMS of aperture fluxes.
+        """
+        ny, nx = img.shape
+        aperturesums = []
+        attempts = 0
+        max_attempts = n_random * 20
+
+        # aperture shape (scale only, will move centres + vary theta)
+        a = aperture_params["a"]
+        b = aperture_params["b"]
+        theta_ref = aperture_params["theta"]
+        x0, y0 = aperture_params["x_center"], aperture_params["y_center"]
+
+        while len(aperturesums) < n_random and attempts < max_attempts:
+            attempts += 1
+
+            # random centre inside image (avoid edges)
+            x = random.uniform(a + 2, nx - a - 2)
+            y = random.uniform(b + 2, ny - b - 2)
+
+            # skip if centre falls on masked pixel
+            if np.isnan(
+                img[int(y), int(x)]
+            ):  # NaN is the only value not similar to itself! Important!
+                continue
+
+            # random angle variation (around reference theta)
+            theta = random.uniform(0, 2 * np.pi)
+
+            aperture = EllipticalAperture((x, y), a, b, theta)
+            aperture_mask = aperture.to_mask(method="exact")
+            aperture_data = aperture_mask.multiply(img)
+            aperture_data_mask = aperture_mask.data
+
+            # Accept apertures with sufficient valid pixels
+            n_valid = np.sum(np.isfinite(aperture_data[aperture_data_mask > 0]))
+            n_total = np.sum(aperture_data_mask > 0)
+            frac_valid = n_valid / n_total if n_total > 0 else 0
+            if frac_valid < valid_frac:
+                continue
+
+            phot_table = aperture_photometry(img, aperture, method="exact")
+            flux = phot_table["aperture_sum"][0]
+
+            if n_valid > 0:
+                flux *= n_total / n_valid  # scale correction
+
+            if np.isfinite(flux):
+                aperturesums.append(flux)
+
+        if len(aperturesums) < max(10, n_random // 4):
+            # fallback: pixel rms scaled to aperture area
+            print("📉 Too few valid random apertures, using pixel RMS fallback")
+            return None
+        
+        return median_abs_deviation(aperturesums, scale='normal')
+            
+            
+            
+            
+            
+            
+            
     @staticmethod
     def plot_galaxy_filter_matrix(
         table_path, fig_path, title=None, nondetections=None, cols=4
@@ -1943,4 +2052,4 @@ class MIRIPipeline:
         os.makedirs(os.path.dirname(fig_path), exist_ok=True)
         plt.savefig(fig_path, dpi=150)
         plt.show()
- 
+
