@@ -1145,6 +1145,7 @@ class MIRIPipeline:
             # --- Background Statistics (Annulus) ---
             f"{filt}_bkg": np.nan,
             f"{filt}_bkg_err": np.nan,
+            f"{filt}_emp_rms": np.nan,
             
             # --- Quality Control (QC) Flags ---
             #f"{filt}_qc_level": "UNKNOWN",   # CLEAN, WARNING, or CRITICAL
@@ -1356,6 +1357,7 @@ class MIRIPipeline:
                     # --- Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
+                    galaxy_row[f"{filt}_emp_snr"] = measurements["empirical_snr"]
                     
                     # --- Store quality flags ---
                     #galaxy_row[f"{filt}_qc_level"] = quality_level
