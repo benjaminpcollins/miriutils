@@ -609,20 +609,7 @@ class MIRIPipeline:
             noise_image, 
             aperture_params, 
             n_random=n_random
-            )
-          
-        
-        # To Do:
-        # x Measure background flux from median value of the bkg-plane within the aperture times aperture.area
-        # x Include SNR in the final catalogue (which one?)
-        # x Implement a CoG based flagging routine for detector artefacts
-        
-        
-        
-        
-        
-        
-        
+            )        
 
         # Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
@@ -644,10 +631,6 @@ class MIRIPipeline:
         plane_vals = np.asarray(background_plane[bkg_pixels_mask])
         res_vals = np.asarray(data_bkgsub[bkg_pixels_mask])
 
-        # Remove any NaNs that might have snuck in
-        res_vals = res_vals[~np.isnan(res_vals)]
-
-        # The Level (The pedestal subtracted)
         background_median = np.median(plane_vals)
 
         # The Noise (Robust RMS / Sigma)
@@ -655,23 +638,10 @@ class MIRIPipeline:
         mad = np.median(np.abs(res_vals - np.median(res_vals)))
         background_rms = 1.4826 * mad 
         
-        # Perform quality checks for the background residuals
-        global_bkg_res = data_bkgsub[~combined_mask]
-        quality_level, quality_reasons, quality_metrics = self.apply_quality_flagging(global_bkg_res)
-        
         # Initialise mask visualisation for plotting
-        mask_vis = np.zeros_like(data, dtype=int)        
-        # Start with everything as "0" (Excluded)
-
-        # Assign the "Sky" pixels (all pixels used in the final iterative fit)
-        # This includes the annulus pixels that survived clipping
-        mask_vis[new_fit_mask] = 1 
-
-        # Assign the "Source" pixels (your photometry aperture)
-        # We do this last so it overwrites anything else
-        mask_vis[source_mask] = 2
-        
-        # All other pixels are 0 -> Excluded/NaN       
+        mask_vis = np.zeros_like(data, dtype=int)   # Invalid pixels
+        mask_vis[new_fit_mask] = 1                  # Annulus without sigma clipping
+        mask_vis[source_mask] = 2                   # Aperture   
         
         aperture_map = {
             "x": float(aperture_params.get("x")),
@@ -720,15 +690,13 @@ class MIRIPipeline:
             "median_res": np.median(res_vals),
             "rms": background_rms,
             "emp_rms": emp_rms,
-            "plane": background_plane,
+            "data": data,
+            "bkg_plane": background_plane,
             "subtracted": data_bkgsub,
             "annulus": annulus,
             "source_ap": source_ap,
             "mask_vis": mask_vis,
-            "kill_mask": kill_mask,
-            "quality_level": quality_level,
-            "quality_reasons": quality_reasons,
-            "quality_metrics": quality_metrics
+            "kill_mask": kill_mask
         }
 
     def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
@@ -1024,38 +992,45 @@ class MIRIPipeline:
         Performs aperture photometry, unit conversion, and error propagation.
         """
         # Extract data from dictionaries
-        data = aperture_params["data"]
         err_map = aperture_params["err"] 
         err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
         pixel_area_sr = aperture_params["meta"]["pixel_area_sr"] # From PIXAR_SR header
         
         # Get background-subtracted data
+        background_plane = bkg_results["bkg_plane"]
         data_bkgsub = bkg_results["subtracted"]
         source_ap = bkg_results["source_ap"]
         median_bkg_residuals = bkg_results["median_res"]
         emp_rms = bkg_results["emp_rms"]
         
-        # Perform photometry
+        # Perform photometry on the background-subtracted data
         phot_table = aperture_photometry(data_bkgsub, source_ap, method='exact')
         raw_flux_mjysr = phot_table['aperture_sum'][0]
         
-        # 4. Error Propagation
-        # A. Detector/Poisson noise from the ERR extension
+        # Perform photometry on the background plane
+        phot_table_plane = aperture_photometry(background_plane, source_ap, method='exact')
+        raw_flux_mjysr_plane = phot_table_plane['aperture_sum'][0]
+        
+        # Error Propagation
+        # Detector/Poisson noise from the ERR extension
         ap_mask = source_ap.to_mask(method='exact')
+        
         # Weighted sum of variance (method='exact' accounts for fractional pixels)
         detector_variance = np.nansum(ap_mask.multiply(err_map**2))
         
-        # B. Background modelling uncertainty already calculated in estimate_background
+        # Background modelling uncertainty already calculated in estimate_background
         # bkg_std = clean_std * np.sqrt(source_ap.area)
-        bkg_err_mjysr = bkg_results["rms"]
+        bkg_err_mjysr = bkg_results["rms"] * source_ap.area
         
-        # C. Combine in quadrature
+        # Combine in quadrature
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
         
-        # 5. Unit Conversion (MJy/sr -> Jy)
         # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
         conv = 1e6 * pixel_area_sr
+        
+        # Unit Conversion (MJy/sr -> Jy)
         flux_jy = raw_flux_mjysr * conv
+        bkg_flux_jy = raw_flux_mjysr_plane * conv
         err_jy = total_err_mjysr * conv
         emp_rms_jy = emp_rms * conv
         
@@ -1071,6 +1046,7 @@ class MIRIPipeline:
         return {
             "flux_jy": flux_jy,
             "flux_err_jy": err_jy,
+            "source_flux_jy": bkg_flux_jy,
             "snr": flux_jy / err_jy if err_jy > 0 else 0,
             "empirical_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
             "area_pix": source_ap.area,
@@ -1306,8 +1282,7 @@ class MIRIPipeline:
                 "ID": target_id,
                 "MIRI_ap_a": np.nan,
                 "MIRI_ap_b": np.nan,
-                "MIRI_ap_npix": np.nan,
-                #"Flag_Com": target_id in self.quality_config["has_companion"]
+                "MIRI_ap_npix": np.nan
             }
             
             # Pre-populate with columns for all filters ALREADY discovered
@@ -1359,15 +1334,15 @@ class MIRIPipeline:
                     
                     # Get local bkg estimates (median + error)
                     n_pix = measurements["area_pix"]
-                    local_bkg = measurements["bkg_median_jy"] * n_pix
+                    local_bkg = measurements["source_flux_jy"]
                     bkg_err = measurements["bkg_err_jy"]
                     
                     bkg_floor.append(measurements["median_bkg_res_jy"])
                     
                     # Get quality flagging
-                    quality_level = bkg_res["quality_level"]
-                    quality_reasons = bkg_res["quality_reasons"]
-                    quality_metrics = bkg_res["quality_metrics"]
+                    #quality_level = bkg_res["quality_level"]
+                    #quality_reasons = bkg_res["quality_reasons"]
+                    #quality_metrics = bkg_res["quality_metrics"]
                     
                     # --- Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
@@ -1858,7 +1833,7 @@ class MIRIPipeline:
         a = aperture_params["a"]
         b = aperture_params["b"]
         theta_ref = aperture_params["theta"]
-        x0, y0 = aperture_params["x_center"], aperture_params["y_center"]
+        x0, y0 = aperture_params["x"], aperture_params["y"]
 
         while len(aperturesums) < n_random and attempts < max_attempts:
             attempts += 1
