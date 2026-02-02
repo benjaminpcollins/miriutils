@@ -169,17 +169,6 @@ class MIRIPipeline:
 
         self.scaling_exceptions_path = scaling_exceptions_file
         self.scaling_exceptions = self._initialise_scaling_config()
-        
-        # Place these in your __init__ or as a config block
-        self.quality_config = {
-            "art_filters": {
-                "F770W": [7185, 8013, 8469, 8500, 8843, 9517, 11136, 11137, 11494, 11716, 16516, 17793, 19098, 21451],
-                "F1000W": [],
-                "F1800W": [7102, 11716, 12202, 17793, 19098, 21451],
-                "F2100W": [11723, 12175, 12213, 16874, 17984],
-            },
-            "has_companion": [7136, 7904, 7922, 7934, 8469, 10314, 16424, 17517, 18332, 21452]
-        }
 
 
     def _initialise_scaling_config(self):
