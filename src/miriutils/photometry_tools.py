@@ -966,32 +966,8 @@ class MIRIPipeline:
         }
     
     
-    def _plot_cog_diagnostic(self, radii, s_flux, p_flux, status, ap_meta):
-        gid = ap_meta["id"]
-        filt = ap_meta["filter"]
-        
-        plt.figure(figsize=(7, 5))
-        y_s = np.array(s_flux) / np.nanmax(s_flux)
-        y_p = np.array(p_flux) / np.nanmax(p_flux)
-        
-        plt.plot(radii, y_s, 'o-', label=f"{filt}")
-        plt.plot(radii, y_p, '--', color='gray')
-        
-        plt.axvline(ap_meta["a_orig"], color='orange', alpha=0.5, label='Small aperture')
-        plt.axvline(ap_meta["a"], color='dodgerblue', alpha=0.5, label='Big aperture')
-        
-        plt.title(f"CoG Diagnostic: {gid}")# | Status: {status}")
-        plt.xlabel("Radius (pix)")
-        plt.ylabel("Normalised Flux")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        out = os.path.join(self.cog_dir, f"{gid}_{filt}_psf.png")
-        plt.savefig(out, dpi=150)
-        plt.close()
     
-    
-    def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None, cog_dir=None):
+    def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None):
         """
         Performs multi-aperture photometry to generate a Curve of Growth.
         """
@@ -999,7 +975,7 @@ class MIRIPipeline:
         # 1. Setup Data and Metadata        
         filt = bkg_results["filter"]
 
-        gid = aperture_params["meta"]["id"]
+        galaxy_id = aperture_params["meta"]["id"]
         err_map = aperture_params["err"]
         err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
         pixel_area_sr = aperture_params["meta"]["pixel_area_sr"]
@@ -1009,7 +985,6 @@ class MIRIPipeline:
         x, y = aperture_params["x"], aperture_params["y"]
         theta = aperture_params["theta"]
         b_over_a = aperture_params["b"] / aperture_params["a"]
-        
         
         # DYNAMIC DATA SELECTION: Use PSF if provided, otherwise use masked science data
         if psf_data is not None:
@@ -1022,15 +997,8 @@ class MIRIPipeline:
             cog_data = bkg_results["subtracted"].copy()
             cog_data[kill_mask] = 0.0
             is_psf = False
-        
-        # Plot and save single filter images
-        if cog_dir:
-            plt.imshow(cog_data, origin='lower', cmap='viridis')
-            plt.title(f"{filt}: Neighbors Zeroed, Target Intact")
             
-            fname = os.path.join(cog_dir, f"{filt}_masked.png")
-            plt.savefig(fname, dpi=200, bbox_inches='tight')
-            plt.close()
+            # ✅ Verified that the kill_mask works as intended  
         
         cog_results = []
 
@@ -1064,6 +1032,67 @@ class MIRIPipeline:
             })
 
         return cog_results
+
+    def _plot_cog(self, cog_results, cog_results_psf):
+        """Function to perform Curve of Growth analysis for extended sources"""
+
+        plt.figure(figsize=(8, 5))
+        
+        # --- AUTOMATED COLOUR LOGIC ---
+        # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
+        norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
+        colormap = cm.get_cmap('jet')
+        
+        # Track available filters to avoid plotting the 'meta' key
+        available_filters = [f for f in cog_results.keys() if f != "meta"]
+        ap_meta = cog_results["meta"]
+        gid = ap_meta["id"]
+        
+        # Sort filters by wavelength so the legend looks organized
+        available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
+
+        for filt in available_filters:
+            w_val = self.wavelength_map.get(filt, 15.0)
+            line_color = colormap(norm(w_val))
+            
+            # Use normalised flux for direct shape comparison
+            galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
+            psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
+            radii = [r['radius_a'] for r in cog_results[filt]]
+            
+            y_galaxy = galaxy_flux / np.max(galaxy_flux)
+            y_psf = psf_flux / np.max(psf_flux)
+            
+            plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
+                    marker='o', markersize=3, lw=2, alpha=0.9)
+            plt.plot(radii, y_psf, color=line_color, 
+                    linestyle='--', lw=1.5, alpha=0.7)
+            plt.ylabel("Normalised Cumulative Flux")
+        
+        # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
+        # Adjust these keys based on how you stored them in prepare_aperture
+        small_limit = ap_meta["a_orig"]
+        big_limit = ap_meta["a"]
+
+        plt.axvline(small_limit, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
+        plt.axvline(big_limit, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
+        
+        plt.xlabel("Semi-major axis (pixels)")
+        plt.ylabel("Cumulative Flux [µJy]")
+        plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        
+        # Save file to cog directory
+        os.makedirs(self.cog_dir, exist_ok=True)
+        fname = f"{gid}_cog_psf.png"
+        save_path = os.path.join(self.cog_dir, fname)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close() 
+        
+        return cog_results
+
+    
     
     def get_filter_column_template(self, filt):
         """Defines the standard set of columns for any single MIRI band."""
@@ -1175,7 +1204,8 @@ class MIRIPipeline:
             "imbalance": imbalance
         }
 
-    def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False):
+    def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False, 
+                       radii=np.linspace(2,25,25), save_cog=False):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
@@ -1228,52 +1258,73 @@ class MIRIPipeline:
             # Track if we've stored general aperture yet
             ap_geometry_stored = False
             
+            cog_res = {}
+            cog_res_psf = {}
+            
             for filt, file in files.items():
-                print(f"{filt}:")
+                #print(f"{filt}:")
                 
                 try:
                     # Perform the photometry steps:
                     
-                    # 1. Prepare the apertures for MIRI
+                    # --- 1. Prepare the apertures for MIRI ---
                     ap_params = self.prepare_aperture(file, rescale=rescale)
                     
-                    # 2. Create background model
-                    bkg_res = self.estimate_background(ap_params)
+                    # --- 2. Create and subtract background model ---
+                    bkg_dict = self.estimate_background(ap_params)
                     
                     if plot_mosaics is True:
-                        self.plot_background_diagnostic(ap_params, bkg_res)
+                        self.plot_background_diagnostic(ap_params, bkg_dict)
                     
-                    # 3. Measure fluxes
-                    measurements = self.measure_flux(ap_params, bkg_res)
+                    # --- 3. Measure fluxes ---
+                    flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
-                    # 4. Compute PSF correction
+                    # --- 4. Perform Curve of Growth analysis ---
+                    cog_measurements = self.measure_flux_cog(ap_params, bkg_dict, radii)
+                    
+                    cog_res[filt] = cog_measurements
+                    cog_res["meta"] = ap_params
+                
+                    psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
+                    with fits.open(psf_path) as psf_hdul:
+                        psf_data = psf_hdul[3].data
+                    measurements_psf = self.measure_flux_cog(ap_params, bkg_dict, radii, psf_data=psf_data)
+
+                    cog_res_psf[filt] = measurements_psf
+                    cog_res_psf["meta"] = ap_params
+                    
+                    # Optionally save curve of growth plots
+                    if save_cog:
+                        self._plot_cog(cog_res, cog_res_psf)                    
+                    
+                    # --- 5. Compute PSF correction ---
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
+                    # --- 6. Group all results and add them to the row
                     # Get (uncorrected) aperture fluxes
-                    apflux = measurements["flux_jy"]                    
-                    apflux_err = measurements["flux_err_jy"]
+                    apflux = flux_dict["flux_jy"]                    
+                    apflux_err = flux_dict["flux_err_jy"]
                     
                     # Get PSF-corrected fluxes
-                    flux_corr = measurements["flux_jy"] * psf_corr 
-                    flux_err_corr = measurements["flux_err_jy"] * psf_corr
+                    flux_corr = flux_dict["flux_jy"] * psf_corr 
+                    flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     
-                    # --- Convert fluxes into AB magnitudes ---
+                    # Convert fluxes into AB magnitudes
                     if flux_corr > 0:
                         # constant is 8.90 for Jy and 23.90 for µJy
                         ab_mag = -2.5 * np.log10(flux_corr) + 8.90
                     else:
                         ab_mag = np.nan
 
-                    
                     # Get nominal flux error (from ERR extension)
-                    apflux_errnominal = measurements["nominal_err_jy"]
+                    apflux_errnominal = flux_dict["nominal_err_jy"]
                     
                     # Get local bkg estimates (median + error)
-                    n_pix = measurements["n_pix"]
-                    local_bkg = measurements["source_flux_jy"]
-                    bkg_err = measurements["bkg_err_jy"]
+                    n_pix = flux_dict["n_pix"]
+                    local_bkg = flux_dict["source_flux_jy"]
+                    bkg_err = flux_dict["bkg_err_jy"]
                     
-                    bkg_floor.append(measurements["median_bkg_res_jy"])
+                    bkg_floor.append(flux_dict["median_bkg_res_jy"])
                     
                     # Get quality flagging
                     #quality_level = bkg_res["quality_level"]
@@ -1292,7 +1343,7 @@ class MIRIPipeline:
                     # --- Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
-                    galaxy_row[f"{filt}_emp_snr"] = measurements["empirical_snr"]
+                    galaxy_row[f"{filt}_emp_snr"] = flux_dict["empirical_snr"]
                     
                     # --- Store quality flags ---
                     #galaxy_row[f"{filt}_qc_level"] = quality_level
@@ -1321,7 +1372,7 @@ class MIRIPipeline:
 
         print(f"\nMedian local background across {stored_ids} analysed galaxies: ", np.median(bkg_floor)*1e6, "µJy")
 
-        # Convert to DataFrame and save to file
+        # --- 7. Convert to DataFrame and save to file ---
         df = pd.DataFrame(all_rows)
         
         self.save_catalogue(df, write_to)
@@ -1591,102 +1642,6 @@ class MIRIPipeline:
         plt.show()
         plt.close()
 
-
-    def run_cog_analysis(self, gid, radii):
-        """Function to perform Curve of Growth analysis for extended sources"""
-
-        # Find files associated with galaxy ID
-        files = self.find_files(gid)
-        
-        if files is None:
-            return None
-        
-        if len(files) < 2:
-            return None
-        
-        cog_results = {}
-        cog_results_psf = {}
-        
-        for filt, file in files.items():
-            try:
-                # 1. Prepare the apertures for MIRI
-                ap_params = self.prepare_aperture(file, rescale=True)
-                
-                # 2. Create background model
-                bkg_res = self.estimate_background(ap_params)
-                
-                # 3. Measure fluxes by performing Curve of Growth (CoG) analysis
-                measurements = self.measure_flux_cog(ap_params, bkg_res, radii)
-            
-                cog_results[filt] = measurements
-                cog_results["meta"] = ap_params
-            
-                psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
-                with fits.open(psf_path) as psf_hdul:
-                    psf_data = psf_hdul[3].data
-                measurements_psf = self.measure_flux_cog(ap_params, bkg_res, radii, psf_data=psf_data)
-
-                cog_results_psf[filt] = measurements_psf
-                cog_results_psf["meta"] = ap_params
-                    
-            except Exception as e:
-                print(f"Error processing {gid} in {filt}: {e}")
-                
-        # Plotting Logic
-        if not cog_results:
-            return
-        
-        plt.figure(figsize=(8, 5))
-        
-        # --- AUTOMATED COLOUR LOGIC ---
-        # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
-        norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
-        colormap = cm.get_cmap('jet')
-        
-        # Track available filters to avoid plotting the 'meta' key
-        available_filters = [f for f in cog_results.keys() if f != "meta"]
-        ap_meta = cog_results["meta"]
-        
-        # Sort filters by wavelength so the legend looks organized
-        available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
-
-        for filt in available_filters:
-            w_val = self.wavelength_map.get(filt, 15.0)
-            line_color = colormap(norm(w_val))
-            
-            # Use normalised flux for direct shape comparison
-            galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
-            psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
-            
-            y_galaxy = galaxy_flux / np.max(galaxy_flux)
-            y_psf = psf_flux / np.max(psf_flux)
-            
-            plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
-                    marker='o', markersize=3, lw=2, alpha=0.9)
-            plt.plot(radii, y_psf, color=line_color, 
-                    linestyle='--', lw=1.5, alpha=0.7)
-            plt.ylabel("Normalised Cumulative Flux")
-        
-        # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
-        # Adjust these keys based on how you stored them in prepare_aperture
-        small_limit = ap_meta["a_orig"]
-        big_limit = ap_meta["a"]
-
-        plt.axvline(small_limit, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
-        plt.axvline(big_limit, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
-        
-        plt.xlabel("Semi-major axis (pixels)")
-        plt.ylabel("Cumulative Flux [µJy]")
-        plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
-        plt.legend()
-        plt.grid(alpha=0.2)
-        
-        fname = f"{gid}_cog_psf.png"
-        save_path = os.path.join(self.cog_dir, fname)
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.close() 
-        
-        return cog_results
     
     @staticmethod
     def get_detection_stats(table_path, out_dir, snr=3.0):
