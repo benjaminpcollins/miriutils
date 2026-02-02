@@ -1009,7 +1009,7 @@ class MIRIPipeline:
         
         # Background modelling uncertainty already calculated in estimate_background
         # bkg_std = clean_std * np.sqrt(source_ap.area)
-        bkg_err_mjysr = bkg_results["rms"] * source_ap.area
+        bkg_err_mjysr = bkg_results["rms"] * np.sqrt(source_ap.area)
         
         # Combine in quadrature
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
@@ -1243,7 +1243,7 @@ class MIRIPipeline:
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v3.0")
+        print("                 JWST MIRI PIPELINE v1.0.0")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
