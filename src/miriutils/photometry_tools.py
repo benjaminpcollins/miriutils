@@ -533,8 +533,6 @@ class MIRIPipeline:
         coeffs = [0, 0, median_init] 
         fit_mask = ~combined_mask 
         
-        print(f"  > Starting iterative plane fit ({n_iters} iterations)...")
-        
         for i in range(n_iters):
             # Prepare the design matrix for pixels in the current mask
             A = np.vstack([xi[fit_mask], yi[fit_mask], np.ones_like(xi[fit_mask])]).T
@@ -576,7 +574,6 @@ class MIRIPipeline:
             
             # Check if we've stopped masking new pixels (convergence)
             if np.array_equal(new_fit_mask, fit_mask):
-                print(f"    - Converged after {i+1} iterations.")
                 break
                 
             fit_mask = new_fit_mask
@@ -702,7 +699,6 @@ class MIRIPipeline:
         subtracted = bkg_dict["subtracted"]
         source_ap = bkg_dict["source_ap"]
         annulus = bkg_dict["annulus"]
-        
         
         # Create the figure
         fig, axes = plt.subplots(2, 2, figsize=(10, 9), constrained_layout=True)
@@ -856,138 +852,23 @@ class MIRIPipeline:
         return correction_factor
         
         
-    
-    @staticmethod  
-    def save_vis(vis_data, filename):
-        """
-        Save visualisation data to HDF5 file.
 
-        Parameters:
-        -----------
-        vis_data : dict
-            Dictionary containing visualization data
-        filename : str
-            Output filename (should end with .h5 or .hdf5)
-        """
-        with h5py.File(filename, "w") as f:
-            # Save arrays with compression
-            for key in [
-                "original_data",
-                "background_plane",
-                "background_subtracted",
-                "mask_vis",
-                "segmentation_mask",
-                "background_region_mask",
-                "source_mask",
-            ]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.create_dataset(
-                        key, data=vis_data[key], compression="gzip", compression_opts=6
-                    )
-
-            # Save scalars
-            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.attrs[key] = vis_data[key]
-
-            # Save strings
-            for key in ["filter", "region_name"]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.attrs[key] = (
-                        vis_data[key].encode("utf-8")
-                        if isinstance(vis_data[key], str)
-                        else vis_data[key]
-                    )
-
-            # Save coefficients tuple
-            if "coeffs" in vis_data and vis_data["coeffs"] is not None:
-                f.create_dataset("coeffs", data=np.array(vis_data["coeffs"]))
-
-            # Save aperture_params dict as JSON string
-            if "aperture_params" in vis_data and vis_data["aperture_params"] is not None:
-                f.attrs["aperture_params"] = json.dumps(vis_data["aperture_params"])
-
-            # Add metadata
-            f.attrs["created_date"] = str(np.datetime64("now"))
-            f.attrs["data_type"] = "galaxy_visualisation_data"
-        
-    @staticmethod
-    def load_vis(filename):
-        """
-        Load visualisation data from HDF5 file and reconstruct Photutils objects.
-        """
-        vis_data = {}
-
-        with h5py.File(filename, "r") as f:
-            # 1. Load Arrays
-            for key in [
-                "original_data",
-                "background_plane",
-                "background_subtracted",
-                "mask_vis",
-                "segmentation_mask",
-                "background_region_mask",
-                "source_mask",
-            ]:
-                if key in f:
-                    vis_data[key] = f[key][:]
-
-            # 2. Load coefficients
-            if "coeffs" in f:
-                vis_data["coeffs"] = tuple(f["coeffs"][:])
-
-            # 3. Load scalars from attributes
-            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-                if key in f.attrs:
-                    vis_data[key] = f.attrs[key]
-
-            # 4. Load strings and decode if necessary
-            for key in ["filter", "region_name"]:
-                if key in f.attrs:
-                    val = f.attrs[key]
-                    vis_data[key] = val.decode("utf-8") if isinstance(val, bytes) else val
-
-            # 5. Load aperture_params dict
-            if "aperture_params" in f.attrs:
-                vis_data["aperture_params"] = json.loads(f.attrs["aperture_params"])
-
-            # --- RECONSTRUCTION STEP ---
-            ap = vis_data.get("aperture_params")
-            if ap:
-                # Reconstruct the Source Aperture
-                # Note: ap['x'], ap['y'] etc. are now plain floats from JSON
-                vis_data['source_ap'] = EllipticalAperture(
-                    positions=(ap['x'], ap['y']),
-                    a=ap['a'],
-                    b=ap['b'],
-                    theta=ap['theta']
-                )
-
-                # Reconstruct the Annulus
-                # Uses the a_in, b_out etc stored in the main vis_data dict
-                vis_data['annulus'] = EllipticalAnnulus(
-                    positions=(ap['x'], ap['y']),
-                    a_in=vis_data['a_in'],
-                    a_out=vis_data['a_out'],
-                    b_in=vis_data['b_in'],
-                    b_out=vis_data['b_out'],
-                    theta=ap['theta']
-                )
-
-        return vis_data
-
-    def measure_flux(self, aperture_params, bkg_results):
+    def measure_flux(self, aperture_params, bkg_results, diagnostic=False):
         """
         Performs aperture photometry, unit conversion, and error propagation.
         """
         # Extract data from dictionaries
-        err_map = aperture_params["err"] 
-        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
-        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"] # From PIXAR_SR header
+        ap_meta = aperture_params["meta"]
+        filt = ap_meta["filter"]
+        gid = ap_meta["id"]
+        pixel_area_sr = ap_meta["pixel_area_sr"] # From PIXAR_SR header
         
-        # Get background-subtracted data
-        background_plane = bkg_results["bkg_plane"]
+        # Get data from dictionaries
         data_bkgsub = bkg_results["subtracted"]
+        err_map = np.nan_to_num(aperture_params["err"], nan=0.0)
+        background_plane = bkg_results["bkg_plane"]
+        
+        # Get aperture object and background statistics
         source_ap = bkg_results["source_ap"]
         median_bkg_residuals = bkg_results["median_res"]
         emp_rms = bkg_results["emp_rms"]
@@ -998,9 +879,8 @@ class MIRIPipeline:
         
         # Perform photometry on the background plane
         phot_table_plane = aperture_photometry(background_plane, source_ap, method='exact')
-        raw_flux_mjysr_plane = phot_table_plane['aperture_sum'][0]
+        raw_bkg_flux_mjysr = phot_table_plane['aperture_sum'][0]
         
-        # Error Propagation
         # Detector/Poisson noise from the ERR extension
         ap_mask = source_ap.to_mask(method='exact')
         
@@ -1008,7 +888,6 @@ class MIRIPipeline:
         detector_variance = np.nansum(ap_mask.multiply(err_map**2))
         
         # Background modelling uncertainty already calculated in estimate_background
-        # bkg_std = clean_std * np.sqrt(source_ap.area)
         bkg_err_mjysr = bkg_results["rms"] * np.sqrt(source_ap.area)
         
         # Combine in quadrature
@@ -1019,7 +898,7 @@ class MIRIPipeline:
         
         # Unit Conversion (MJy/sr -> Jy)
         flux_jy = raw_flux_mjysr * conv
-        bkg_flux_jy = raw_flux_mjysr_plane * conv
+        bkg_flux_jy = raw_bkg_flux_mjysr * conv
         err_jy = total_err_mjysr * conv
         emp_rms_jy = emp_rms * conv
         
@@ -1031,19 +910,86 @@ class MIRIPipeline:
         bkg_err_jy = bkg_err_mjysr * conv
         median_bkg_res_jy = median_bkg_residuals * conv
         
-        # 6. Final Results Dictionary
+        # Add-in: Curve of Growth analysis!!
+        radii = np.linspace(2, 25, 25)
+        
+        # Get aperture geometry
+        x, y = aperture_params["x"], aperture_params["y"]
+        theta = aperture_params["theta"]
+        a, b = aperture_params["a"], aperture_params["b"]
+        b_over_a = b/a
+        
+        # Get kill mask and recreate noise image
+        kill_mask = bkg_results["kill_mask"]
+        cog_data = data_bkgsub.copy()
+        cog_data[kill_mask] = 0.0
+        
+        science_fluxes = []
+        science_errors = []
+        
+        for r in radii:
+            ap = EllipticalAperture((x, y), a=r, b=r*b_over_a, theta=theta)
+            phot = aperture_photometry(cog_data, ap, method='exact')
+            
+            # Error: Poisson (from map) + Bkg Regret (RMS * sqrt(Area))
+            ap_mask = ap.to_mask(method='exact')
+            det_var = np.nansum(ap_mask.multiply(err_map**2))
+            bkg_err_mjysr = bkg_results["rms"] * np.sqrt(ap.area)
+            
+            science_fluxes.append(phot['aperture_sum'][0] * conv)
+            science_errors.append(np.sqrt(det_var + bkg_err_mjysr**2) * conv)
+        
+        psf_fluxes = []
+        psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
+        with fits.open(psf_path) as psf_hdul:
+            psf_data = psf_hdul[3].data
+            px, py = centroid_com(psf_data)
+            for r in radii:
+                # Note: PSF usually scaled differently; often radii*4 for MIRI models
+                psf_ap = EllipticalAperture((px, py), a=r*4, b=r*4*b_over_a, theta=theta)
+                psf_phot = aperture_photometry(psf_data, psf_ap, method='exact')
+                psf_fluxes.append(psf_phot['aperture_sum'][0])
+                total_err_jy = 0.0
+        
+        # Final Results Dictionary
         return {
             "flux_jy": flux_jy,
             "flux_err_jy": err_jy,
             "source_flux_jy": bkg_flux_jy,
             "snr": flux_jy / err_jy if err_jy > 0 else 0,
             "empirical_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
-            "area_pix": source_ap.area,
+            "n_pix": source_ap.area,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
             "median_bkg_res_jy": median_bkg_res_jy,
             "nominal_err_jy": nominal_err_jy
         }
+    
+    
+    def _plot_cog_diagnostic(self, radii, s_flux, p_flux, status, ap_meta):
+        gid = ap_meta["id"]
+        filt = ap_meta["filter"]
+        
+        plt.figure(figsize=(7, 5))
+        y_s = np.array(s_flux) / np.nanmax(s_flux)
+        y_p = np.array(p_flux) / np.nanmax(p_flux)
+        
+        plt.plot(radii, y_s, 'o-', label=f"{filt}")
+        plt.plot(radii, y_p, '--', color='gray')
+        
+        plt.axvline(ap_meta["a_orig"], color='orange', alpha=0.5, label='Small aperture')
+        plt.axvline(ap_meta["a"], color='dodgerblue', alpha=0.5, label='Big aperture')
+        
+        plt.title(f"CoG Diagnostic: {gid}")# | Status: {status}")
+        plt.xlabel("Radius (pix)")
+        plt.ylabel("Normalised Flux")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        out = os.path.join(self.cog_dir, f"{gid}_{filt}_psf.png")
+        plt.savefig(out, dpi=150)
+        plt.close()
+    
     
     def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None, cog_dir=None):
         """
@@ -1323,7 +1269,7 @@ class MIRIPipeline:
                     apflux_errnominal = measurements["nominal_err_jy"]
                     
                     # Get local bkg estimates (median + error)
-                    n_pix = measurements["area_pix"]
+                    n_pix = measurements["n_pix"]
                     local_bkg = measurements["source_flux_jy"]
                     bkg_err = measurements["bkg_err_jy"]
                     
@@ -1646,7 +1592,7 @@ class MIRIPipeline:
         plt.close()
 
 
-    def run_cog_analysis(self, gid, radii, cog_dir, overplot_psf=False):
+    def run_cog_analysis(self, gid, radii):
         """Function to perform Curve of Growth analysis for extended sources"""
 
         # Find files associated with galaxy ID
@@ -1657,10 +1603,6 @@ class MIRIPipeline:
         
         if len(files) < 2:
             return None
-        
-        # Define output directory
-        cog_dir = os.path.join(self.output_dir, "apertures", cog_dir)
-        os.makedirs(cog_dir, exist_ok=True)
         
         cog_results = {}
         cog_results_psf = {}
@@ -1679,14 +1621,13 @@ class MIRIPipeline:
                 cog_results[filt] = measurements
                 cog_results["meta"] = ap_params
             
-                if overplot_psf:
-                    psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
-                    with fits.open(psf_path) as psf_hdul:
-                        psf_data = psf_hdul[3].data
-                    measurements_psf = self.measure_flux_cog(ap_params, bkg_res, radii, psf_data=psf_data)
+                psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
+                with fits.open(psf_path) as psf_hdul:
+                    psf_data = psf_hdul[3].data
+                measurements_psf = self.measure_flux_cog(ap_params, bkg_res, radii, psf_data=psf_data)
 
-                    cog_results_psf[filt] = measurements_psf
-                    cog_results_psf["meta"] = ap_params
+                cog_results_psf[filt] = measurements_psf
+                cog_results_psf["meta"] = ap_params
                     
             except Exception as e:
                 print(f"Error processing {gid} in {filt}: {e}")
@@ -1713,26 +1654,19 @@ class MIRIPipeline:
             w_val = self.wavelength_map.get(filt, 15.0)
             line_color = colormap(norm(w_val))
             
-            if overplot_psf:
-                # Use normalised flux for direct shape comparison
-                galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
-                psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
-                
-                y_galaxy = galaxy_flux / np.max(galaxy_flux)
-                y_psf = psf_flux / np.max(psf_flux)
-                
-                plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
-                        marker='o', markersize=3, lw=2, alpha=0.9)
-                plt.plot(radii, y_psf, color=line_color, 
-                        linestyle='--', lw=1.5, alpha=0.7)
-                plt.ylabel("Normalised Cumulative Flux")
-            else:
-                # Use absolute units if not overplotting
-                y_galaxy = [r['flux_jy'] * 1e6 for r in cog_results[filt]]
-                plt.plot(radii, y_galaxy, label=filt, color=line_color, 
-                        marker='o', markersize=3, lw=2, alpha=0.9)
-                plt.ylabel("Cumulative Flux [µJy]")
-
+            # Use normalised flux for direct shape comparison
+            galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
+            psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
+            
+            y_galaxy = galaxy_flux / np.max(galaxy_flux)
+            y_psf = psf_flux / np.max(psf_flux)
+            
+            plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
+                    marker='o', markersize=3, lw=2, alpha=0.9)
+            plt.plot(radii, y_psf, color=line_color, 
+                    linestyle='--', lw=1.5, alpha=0.7)
+            plt.ylabel("Normalised Cumulative Flux")
+        
         # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
         # Adjust these keys based on how you stored them in prepare_aperture
         small_limit = ap_meta["a_orig"]
@@ -1747,10 +1681,10 @@ class MIRIPipeline:
         plt.legend()
         plt.grid(alpha=0.2)
         
-        fname = f"{gid}_cog_psf.png" if overplot_psf else f"{gid}_cog.png"
-        save_path = os.path.join(cog_dir, fname)
+        fname = f"{gid}_cog_psf.png"
+        save_path = os.path.join(self.cog_dir, fname)
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.close() # Close figure to free memory
+        plt.close() 
         
         return cog_results
     
@@ -2019,3 +1953,123 @@ class MIRIPipeline:
         plt.savefig(fig_path, dpi=150)
         plt.show()
 
+
+
+    @staticmethod  
+    def save_vis(vis_data, filename):
+        """
+        Save visualisation data to HDF5 file.
+
+        Parameters:
+        -----------
+        vis_data : dict
+            Dictionary containing visualization data
+        filename : str
+            Output filename (should end with .h5 or .hdf5)
+        """
+        with h5py.File(filename, "w") as f:
+            # Save arrays with compression
+            for key in [
+                "original_data",
+                "background_plane",
+                "background_subtracted",
+                "mask_vis",
+                "segmentation_mask",
+                "background_region_mask",
+                "source_mask",
+            ]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.create_dataset(
+                        key, data=vis_data[key], compression="gzip", compression_opts=6
+                    )
+
+            # Save scalars
+            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.attrs[key] = vis_data[key]
+
+            # Save strings
+            for key in ["filter", "region_name"]:
+                if key in vis_data and vis_data[key] is not None:
+                    f.attrs[key] = (
+                        vis_data[key].encode("utf-8")
+                        if isinstance(vis_data[key], str)
+                        else vis_data[key]
+                    )
+
+            # Save coefficients tuple
+            if "coeffs" in vis_data and vis_data["coeffs"] is not None:
+                f.create_dataset("coeffs", data=np.array(vis_data["coeffs"]))
+
+            # Save aperture_params dict as JSON string
+            if "aperture_params" in vis_data and vis_data["aperture_params"] is not None:
+                f.attrs["aperture_params"] = json.dumps(vis_data["aperture_params"])
+
+            # Add metadata
+            f.attrs["created_date"] = str(np.datetime64("now"))
+            f.attrs["data_type"] = "galaxy_visualisation_data"
+        
+    @staticmethod
+    def load_vis(filename):
+        """
+        Load visualisation data from HDF5 file and reconstruct Photutils objects.
+        """
+        vis_data = {}
+
+        with h5py.File(filename, "r") as f:
+            # 1. Load Arrays
+            for key in [
+                "original_data",
+                "background_plane",
+                "background_subtracted",
+                "mask_vis",
+                "segmentation_mask",
+                "background_region_mask",
+                "source_mask",
+            ]:
+                if key in f:
+                    vis_data[key] = f[key][:]
+
+            # 2. Load coefficients
+            if "coeffs" in f:
+                vis_data["coeffs"] = tuple(f["coeffs"][:])
+
+            # 3. Load scalars from attributes
+            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
+                if key in f.attrs:
+                    vis_data[key] = f.attrs[key]
+
+            # 4. Load strings and decode if necessary
+            for key in ["filter", "region_name"]:
+                if key in f.attrs:
+                    val = f.attrs[key]
+                    vis_data[key] = val.decode("utf-8") if isinstance(val, bytes) else val
+
+            # 5. Load aperture_params dict
+            if "aperture_params" in f.attrs:
+                vis_data["aperture_params"] = json.loads(f.attrs["aperture_params"])
+
+            # --- RECONSTRUCTION STEP ---
+            ap = vis_data.get("aperture_params")
+            if ap:
+                # Reconstruct the Source Aperture
+                # Note: ap['x'], ap['y'] etc. are now plain floats from JSON
+                vis_data['source_ap'] = EllipticalAperture(
+                    positions=(ap['x'], ap['y']),
+                    a=ap['a'],
+                    b=ap['b'],
+                    theta=ap['theta']
+                )
+
+                # Reconstruct the Annulus
+                # Uses the a_in, b_out etc stored in the main vis_data dict
+                vis_data['annulus'] = EllipticalAnnulus(
+                    positions=(ap['x'], ap['y']),
+                    a_in=vis_data['a_in'],
+                    a_out=vis_data['a_out'],
+                    b_in=vis_data['b_in'],
+                    b_out=vis_data['b_out'],
+                    theta=ap['theta']
+                )
+
+        return vis_data
