@@ -851,9 +851,8 @@ class MIRIPipeline:
 
         return correction_factor
         
-        
 
-    def measure_flux(self, aperture_params, bkg_results, diagnostic=False):
+    def measure_flux(self, aperture_params, bkg_results):
         """
         Performs aperture photometry, unit conversion, and error propagation.
         """
@@ -911,7 +910,11 @@ class MIRIPipeline:
         median_bkg_res_jy = median_bkg_residuals * conv
         
         # Add-in: Curve of Growth analysis!!
-        radii = np.linspace(2, 25, 25)
+        nx, ny = data_bkgsub.shape
+        max_ap_size = nx//3
+        
+        # Start from 2 pixels and increase towards the max_ap_size
+        radii = np.linspace(2, max_ap_size, 25)
         
         # Get aperture geometry
         x, y = aperture_params["x"], aperture_params["y"]
@@ -924,114 +927,53 @@ class MIRIPipeline:
         cog_data = data_bkgsub.copy()
         cog_data[kill_mask] = 0.0
         
-        science_fluxes = []
-        science_errors = []
-        
-        for r in radii:
-            ap = EllipticalAperture((x, y), a=r, b=r*b_over_a, theta=theta)
-            phot = aperture_photometry(cog_data, ap, method='exact')
-            
-            # Error: Poisson (from map) + Bkg Regret (RMS * sqrt(Area))
-            ap_mask = ap.to_mask(method='exact')
-            det_var = np.nansum(ap_mask.multiply(err_map**2))
-            bkg_err_mjysr = bkg_results["rms"] * np.sqrt(ap.area)
-            
-            science_fluxes.append(phot['aperture_sum'][0] * conv)
-            science_errors.append(np.sqrt(det_var + bkg_err_mjysr**2) * conv)
-        
-        psf_fluxes = []
+        # 1. Pre-calculate PSF metadata once (outside the loop)
         psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
         with fits.open(psf_path) as psf_hdul:
             psf_data = psf_hdul[3].data
             px, py = centroid_com(psf_data)
-            for r in radii:
-                # Note: PSF usually scaled differently; often radii*4 for MIRI models
-                psf_ap = EllipticalAperture((px, py), a=r*4, b=r*4*b_over_a, theta=theta)
-                psf_phot = aperture_photometry(psf_data, psf_ap, method='exact')
-                psf_fluxes.append(psf_phot['aperture_sum'][0])
-                total_err_jy = 0.0
+
+        cog_fluxes = []
+        cog_fluxes_psf = []
+        cog_radii = []
+
+        # 2. Combined Loop
+        for r in radii:
+            # Define both apertures
+            ap_sci = EllipticalAperture((x, y), a=r, b=r*b_over_a, theta=theta)
+            ap_psf = EllipticalAperture((px, py), a=4*r, b=4*r*b_over_a, theta=theta)
+            
+            # Photometry (exact method is computationally expensive, so we group them)
+            phot_sci = aperture_photometry(cog_data, ap_sci, method='exact')
+            phot_psf = aperture_photometry(psf_data, ap_psf, method='exact')
+            
+            cog_fluxes.append(phot_sci['aperture_sum'][0] * conv)
+            cog_fluxes_psf.append(phot_psf['aperture_sum'][0])
+            cog_radii.append(r)
         
-        # Final Results Dictionary
         return {
+            # Science fluxes and uncertainties
             "flux_jy": flux_jy,
             "flux_err_jy": err_jy,
             "source_flux_jy": bkg_flux_jy,
+            
+            # Signal-to-noise ratios (standard & empirical)
             "snr": flux_jy / err_jy if err_jy > 0 else 0,
-            "empirical_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
+            "emp_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
+            
+            # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
             "median_bkg_res_jy": median_bkg_res_jy,
-            "nominal_err_jy": nominal_err_jy
+            "nominal_err_jy": nominal_err_jy,
+            
+            # CoG results
+            "cog_fluxes": cog_fluxes,
+            "cog_fluxes_psf": cog_fluxes_psf,
+            "cog_radii": cog_radii
         }
-    
-    
-    
-    def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None):
-        """
-        Performs multi-aperture photometry to generate a Curve of Growth.
-        """
         
-        # 1. Setup Data and Metadata        
-        filt = bkg_results["filter"]
-
-        galaxy_id = aperture_params["meta"]["id"]
-        err_map = aperture_params["err"]
-        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
-        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"]
-        conv = 1e6 * pixel_area_sr
-        
-        # Extract fixed geometry from the small/original aperture
-        x, y = aperture_params["x"], aperture_params["y"]
-        theta = aperture_params["theta"]
-        b_over_a = aperture_params["b"] / aperture_params["a"]
-        
-        # DYNAMIC DATA SELECTION: Use PSF if provided, otherwise use masked science data
-        if psf_data is not None:
-            cog_data = psf_data
-            # Make sure the aperture is centred on the PSF
-            x, y = centroid_com(psf_data)
-            is_psf = True
-        else:
-            kill_mask = bkg_results["kill_mask"]
-            cog_data = bkg_results["subtracted"].copy()
-            cog_data[kill_mask] = 0.0
-            is_psf = False
-            
-            # ✅ Verified that the kill_mask works as intended  
-        
-        cog_results = []
-
-        # 2. Loop over radii to create the Curve of Growth
-        for a_val in radii:
-            # Scale b proportionally to maintain the galaxy's shape
-            effective_a = a_val * 4 if is_psf else a_val
-            effective_b = effective_a * b_over_a
-            temp_ap = EllipticalAperture((x, y), a=effective_a, b=effective_b, theta=theta)
-            
-            # A. Sum Flux
-            phot_table = aperture_photometry(cog_data, temp_ap, method='exact')
-            raw_flux_mjysr = phot_table['aperture_sum'][0]
-            
-            # B. Error Propagation (Skip for PSF as it has no detector noise)
-            if not is_psf:
-                err_map = np.nan_to_num(aperture_params["err"], nan=0.0, posinf=0.0, neginf=0.0)
-                ap_mask = temp_ap.to_mask(method='exact')
-                det_var = np.nansum(ap_mask.multiply(err_map**2))
-                bkg_err_mjysr = bkg_results["rms"] * np.sqrt(temp_ap.area)
-                total_err_jy = np.sqrt(det_var + bkg_err_mjysr**2) * conv
-            else:
-                total_err_jy = 0.0
-            
-            # C. Store measurements for this radius
-            cog_results.append({
-                "radius_a": a_val,
-                "area_pix": temp_ap.area,
-                "flux_jy": raw_flux_mjysr * conv if not is_psf else raw_flux_mjysr,
-                "flux_err_jy": total_err_jy * conv
-            })
-
-        return cog_results
 
     def _plot_cog(self, cog_results, cog_results_psf):
         """Function to perform Curve of Growth analysis for extended sources"""
@@ -1121,7 +1063,7 @@ class MIRIPipeline:
             f"{filt}_ap_theta": np.nan,
         }
 
-    def pre_scan_filters(self):
+    def _pre_scan_filters(self):
         """
         Crawls the cutouts directory to identify all MIRI filters available in the dataset.
         """
@@ -1224,7 +1166,7 @@ class MIRIPipeline:
         print("="*60)
         
         # Pre-scan for catalogue visualisation
-        all_filters = self.pre_scan_filters()
+        all_filters = self._pre_scan_filters()
 
         if rescale == False:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
@@ -1343,7 +1285,7 @@ class MIRIPipeline:
                     # --- Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
-                    galaxy_row[f"{filt}_emp_snr"] = flux_dict["empirical_snr"]
+                    galaxy_row[f"{filt}_emp_snr"] = flux_dict["emp_snr"]
                     
                     # --- Store quality flags ---
                     #galaxy_row[f"{filt}_qc_level"] = quality_level
