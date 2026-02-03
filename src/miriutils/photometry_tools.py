@@ -984,6 +984,8 @@ class MIRIPipeline:
         
         # Track available filters to avoid plotting the 'meta' key
         available_filters = [f for f in cog_dict.keys() if f != "ap_params"]
+        if len(available_filters) == 0:
+            return None
         ap_params = cog_dict["ap_params"]
         gid = ap_params["meta"]["id"]
         
@@ -1030,23 +1032,68 @@ class MIRIPipeline:
         plt.close() 
         
     
-    def _apply_quality_flagging(self, flux_dict):
+    def _apply_quality_flagging(self, ap_params, flux_dict):
         """
         Performs a quality based on the curve of growth
         """
         # Extract fluxes
         fluxes = np.array(flux_dict["cog_fluxes"])
         radii = np.array(flux_dict["cog_radii"])
+        emp_snr = flux_dict["emp_snr"]
         
-        mid = len(radii) // 2
-        r_inner, f_inner = radii[:mid], fluxes[:mid]
-        r_outer, f_outer = radii[mid:], fluxes[mid:]
+        # Get maximum value and last value
+        f_max = np.max(fluxes)
+        idx_max = np.argmax(fluxes)
+        f_final = fluxes[-1]
+        num_points = len(fluxes)
+
+        # How much did the flux drop from the peak?
+        dip_ratio = f_final / f_max if f_max > 0 else 0
+
+        # Where is the peak relative to the total search radius (0.0 to 1.0)
+        peak_pos = idx_max / (num_points - 1)
+
+        if fluxes[0] <= 0 or (emp_snr is not None and emp_snr < 3.0):
+            return "NON_DETECTION", 0.0, 3 * flux_dict["bkg_err_jy"]
+
+        # Apply Flagging
+        if dip_ratio < 0.85:
+            # The flux dropped by more than 15% after reaching its maximum
+            if peak_pos < 0.5:
+                flag = "FAIL_OVER_SUB" # Background is so high it ate the galaxy's wings
+            else:
+                flag = "FAIL_BKG_GRADIENT" # Likely a local gradient or stripe issue
         
-        f_max_total = np.max(fluxes)
-        f_max_abs = np.max(np.abs(fluxes))  # in case it's useful
-        f_at_mid = f_inner[-1]
-        f_at_end = f_outer[-1]
+        # Find the index in the CoG closest to the aperture radius
+        source_a = ap_params["a"]
         
+        # Define the masks
+        mask_source = radii <= source_a
+        mask_transition = (radii > source_a) & (radii <= 1.5 * source_a)
+        mask_outer = radii > 1.5 * source_a
+        
+        # Extract Fluxes (handling empty slices if galaxy is huge)
+        f_source = fluxes[mask_source][-1] if any(mask_source) else 0
+        f_trans = fluxes[mask_transition][-1] if any(mask_transition) else f_source
+        f_outer = fluxes[mask_outer][-1] if any(mask_outer) else f_trans
+        
+        # How much did it grow in the transition? (Expect some growth)
+        trans_growth = (f_trans - f_source) / f_source if f_source > 0 else 0
+        
+        # How much did it grow in the stability zone? (Expect ZERO growth)
+        outer_slope = (f_outer - f_trans) / f_trans if f_trans > 0 else 0
+        
+        # Refined Flagging Logic
+        if outer_slope > 0.10:
+            flag = "FAIL_UNDER_SUBTRACTED" # The curve is still climbing in pure sky
+        elif outer_slope < -0.10:
+            flag = "FAIL_OVER_SUBTRACTED"  # The curve is diving in pure sky
+        elif trans_growth > 0.50:
+            flag = "WARNING_EXTENDED"      # Massive wings, possibly a neighbor bleed
+        else:
+            flag = "CLEAN"
+            
+        return flag, trans_growth, stability_slope
         # Q1: Does the flux increase where the source should be?
         # (End value - Start) / End value
         if fluxes[inner_indices[-1]] > 0:
@@ -1217,7 +1264,13 @@ class MIRIPipeline:
                     # --- 3. Measure fluxes ---
                     flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
-                    galaxy_cog_dict[filt] = flux_dict
+                    emp_snr = flux_dict["emp_snr"]
+                    
+                    galaxy_row[f"{filt}_emp_snr"] = emp_snr
+                    
+                    if emp_snr >= 3.0:
+                        print(emp_snr)
+                        galaxy_cog_dict[filt] = flux_dict
 
                     # Ensure that the aperture params are available for the plotter
                     if "meta" not in galaxy_cog_dict:
@@ -1269,7 +1322,7 @@ class MIRIPipeline:
                     # --- Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
-                    galaxy_row[f"{filt}_emp_snr"] = flux_dict["emp_snr"]
+                    
                     
                     # --- Store quality flags ---
                     #galaxy_row[f"{filt}_qc_level"] = quality_level
