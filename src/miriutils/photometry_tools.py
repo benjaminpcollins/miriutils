@@ -159,7 +159,7 @@ class MIRIPipeline:
         self.vis_dir = os.path.join(self.output_dir, "vis_data")
         self.detection_dir = os.path.join(self.output_dir, "vis_data")
         
-        for dir in [self.aperture_dir, self.mosaic_dir, self.phot_table_dir, self.detection_dir]:
+        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir]:
             os.makedirs(dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
@@ -419,7 +419,7 @@ class MIRIPipeline:
             #"pixel_conversion": pixel_conversion
         }
     
-    def plot_apertures_multiband(self, results_list, output_dir=None):
+    def plot_apertures_multiband(self, results_list):
         """
         results_list: A list of dictionaries returned by prepare_aperture for ONE galaxy.
         """
@@ -685,7 +685,7 @@ class MIRIPipeline:
             "kill_mask": kill_mask
         }
 
-    def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
+    def plot_background_diagnostic(self, aperture_params, bkg_dict):
         """
         Creates a 2x2 diagnostic mosaic to verify background modeling.
         """
@@ -695,7 +695,7 @@ class MIRIPipeline:
         survey_obs = aperture_params["meta"]["survey_obs"]
         
         # Extract calculated objects from bkg_dict
-        plane = bkg_dict["plane"]
+        plane = bkg_dict["bkg_plane"]
         subtracted = bkg_dict["subtracted"]
         source_ap = bkg_dict["source_ap"]
         annulus = bkg_dict["annulus"]
@@ -754,13 +754,11 @@ class MIRIPipeline:
 
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         plt.legend()
-        
-        # 1. Determine the destination
-        if save_path is None:
-            # Default organizational structure
-            filt_dir = os.path.join(self.mosaic_dir, filt)
-            os.makedirs(filt_dir, exist_ok=True)
-            save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
+    
+        # Default directory structure
+        filt_dir = os.path.join(self.mosaic_dir, filt)
+        os.makedirs(filt_dir, exist_ok=True)
+        save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
@@ -1146,7 +1144,7 @@ class MIRIPipeline:
 
     
 
-    def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False, 
+    def run_photometry(self, write_to, rescale=True, save_mosaic=False, plot_psf=False, 
                        radii=np.linspace(2,25,25), save_cog=False):
         """
         Function to do the heavy lifting. Runs the entire photometry
@@ -1154,14 +1152,14 @@ class MIRIPipeline:
         
         # Stylised ASCII Header
         print("\n" + "="*60)
-        print("""
+        print(r"""
  ____           _    ____              _ _             _ 
 |  _ \ ___   __| |  / ___|__ _ _ __ __| (_)_ __   __ _| |
 | |_) / _ \ / _` | | |   / _` | '__/ _` | | '_ \ / _` | |
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v1.1.0")
+        print("                 JWST MIRI PIPELINE v1.0.1")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
@@ -1175,8 +1173,6 @@ class MIRIPipeline:
         
         bkg_floor = []
         
-        galaxy_cog_dict = {}
-        
         stored_ids = 0
         
         for target_id in self.all_ids:
@@ -1184,8 +1180,10 @@ class MIRIPipeline:
             files = self.find_files(target_id)
             if not files: 
                 continue
-            print("\n")
-            print(f"========== Processing galaxy ID {target_id} ==========")
+            
+            print(f"Processing galaxy ID {target_id}...")
+            
+            galaxy_cog_dict = {}
             
             # Base identity for the galaxy
             galaxy_row = {
@@ -1202,11 +1200,7 @@ class MIRIPipeline:
             # Track if we've stored general aperture yet
             ap_geometry_stored = False
             
-            cog_res = {}
-            cog_res_psf = {}
-            
             for filt, file in files.items():
-                #print(f"{filt}:")
                 
                 try:
                     # Perform the photometry steps:
@@ -1217,14 +1211,14 @@ class MIRIPipeline:
                     # --- 2. Create and subtract background model ---
                     bkg_dict = self.estimate_background(ap_params)
                     
-                    if plot_mosaics is True:
+                    if save_mosaic is True:
                         self.plot_background_diagnostic(ap_params, bkg_dict)
                     
                     # --- 3. Measure fluxes ---
                     flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
                     galaxy_cog_dict[filt] = flux_dict
-        
+
                     # Ensure that the aperture params are available for the plotter
                     if "meta" not in galaxy_cog_dict:
                         galaxy_cog_dict["ap_params"] = ap_params                
