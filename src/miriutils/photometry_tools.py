@@ -974,8 +974,7 @@ class MIRIPipeline:
             "cog_radii": cog_radii
         }
         
-
-    def _plot_cog(self, cog_results, cog_results_psf):
+    def _plot_cog(self, cog_dict):
         """Function to perform Curve of Growth analysis for extended sources"""
 
         plt.figure(figsize=(8, 5))
@@ -983,12 +982,12 @@ class MIRIPipeline:
         # --- AUTOMATED COLOUR LOGIC ---
         # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
         norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
-        colormap = cm.get_cmap('jet')
+        colormap = cm.get_cmap('turbo')
         
         # Track available filters to avoid plotting the 'meta' key
-        available_filters = [f for f in cog_results.keys() if f != "meta"]
-        ap_meta = cog_results["meta"]
-        gid = ap_meta["id"]
+        available_filters = [f for f in cog_dict.keys() if f != "ap_params"]
+        ap_params = cog_dict["ap_params"]
+        gid = ap_params["meta"]["id"]
         
         # Sort filters by wavelength so the legend looks organized
         available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
@@ -998,29 +997,29 @@ class MIRIPipeline:
             line_color = colormap(norm(w_val))
             
             # Use normalised flux for direct shape comparison
-            galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
-            psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
-            radii = [r['radius_a'] for r in cog_results[filt]]
+            cog_data = cog_dict[filt]
+            galaxy_flux = cog_data['cog_fluxes']
+            psf_flux = cog_data['cog_fluxes_psf']
+            radii = cog_data['cog_radii']
             
-            y_galaxy = galaxy_flux / np.max(galaxy_flux)
+            # Normalise by maximum absolute value instead of just positive maximum!
+            y_galaxy = galaxy_flux / np.max(np.abs(galaxy_flux))
             y_psf = psf_flux / np.max(psf_flux)
             
             plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
                     marker='o', markersize=3, lw=2, alpha=0.9)
             plt.plot(radii, y_psf, color=line_color, 
                     linestyle='--', lw=1.5, alpha=0.7)
-            plt.ylabel("Normalised Cumulative Flux")
         
-        # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
-        # Adjust these keys based on how you stored them in prepare_aperture
-        small_limit = ap_meta["a_orig"]
-        big_limit = ap_meta["a"]
+        # Get aperture parameters
+        small_ap = ap_params["a_orig"]
+        big_ap = ap_params["a"]
 
-        plt.axvline(small_limit, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
-        plt.axvline(big_limit, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
+        plt.axvline(small_ap, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
+        plt.axvline(big_ap, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
         
         plt.xlabel("Semi-major axis (pixels)")
-        plt.ylabel("Cumulative Flux [µJy]")
+        plt.ylabel("Normalised Cumulative Flux")        
         plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
         plt.legend()
         plt.grid(alpha=0.2)
@@ -1032,11 +1031,73 @@ class MIRIPipeline:
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
         plt.close() 
         
-        return cog_results
+    
+    def _apply_quality_flagging(self, flux_dict):
+        """
+        Performs a quality based on the curve of growth
+        """
+        # Extract fluxes
+        fluxes = np.array(flux_dict["cog_fluxes"])
+        radii = np.array(flux_dict["cog_radii"])
+        
+        mid = len(radii) // 2
+        r_inner, f_inner = radii[:mid], fluxes[:mid]
+        r_outer, f_outer = radii[mid:], fluxes[mid:]
+        
+        f_max_total = np.max(fluxes)
+        f_max_abs = np.max(np.abs(fluxes))  # in case it's useful
+        f_at_mid = f_inner[-1]
+        f_at_end = f_outer[-1]
+        
+        # Q1: Does the flux increase where the source should be?
+        # (End value - Start) / End value
+        if fluxes[inner_indices[-1]] > 0:
+            growth_source = (fluxes[inner_indices[-1]] - fluxes[0]) / fluxes[inner_indices[-1]]
+        else:
+            growth_source = 0.0    
+         
+        # Q2: Does the flux keep climbing/falling in the sky region?
+        # (End value - Start of plateau) / End value
+        growth_sky = (fluxes[-1] - fluxes[outer_indices[0]]) / fluxes[-1] if fluxes[-1] > 0 else 0
+        
+        
+        # 1. Metric Calculation
+        dip_ratio = f_final / f_max if f_max > 0 else 0
+        # Growth in the outer 20% of the aperture radius
+        growth_tail = (fluxes[-1] - fluxes[-3]) / fluxes[-1] if fluxes[-1] > 0 else 0
+        
+        # Logic-based Flagging
+        reasons = []
+        
+        # Thresholds tuned for JWST/MIRI mosaics
+        if abs(res_skew) > 2.5:       reasons.append("HighSkew")
+        if res_kurt > 10.0:           reasons.append("HighKurtosis") # MIRI has high natural kurtosis
+        if std_ratio > 1.5:           reasons.append("NonGaussianWidth")
+        if tail_frac > 0.005:         reasons.append("ExtremeTails")
+        if imbalance > 0.7:           reasons.append("AsymmetricTails")
+
+        # Classification
+        if len(reasons) >= 2 or "AsymmetricTails" in reasons:
+            level = "CRITICAL"
+        elif len(reasons) == 1:
+            level = "WARNING"
+        else:
+            level = "CLEAN"
+
+        return level, "|".join(reasons), {
+            "skew": res_skew, 
+            "kurtosis": res_kurt,
+            "std_ratio": std_ratio, 
+            "tail_frac": tail_frac,
+            "imbalance": imbalance
+        }        
+        
+
 
     
     
-    def get_filter_column_template(self, filt):
+    
+    def _get_filter_column_template(self, filt):
         """Defines the standard set of columns for any single MIRI band."""
         return {
             # --- Photometry Results ---
@@ -1083,68 +1144,7 @@ class MIRIPipeline:
         return sorted_filters
     
 
-    def apply_quality_flagging(self, bkg_residuals):
-        """
-        Performs a multi-variate statistical audit of the background.
-        Returns: (str) Level, (str) Reason String, (dict) Raw Metrics
-        """
-        if len(bkg_residuals) < 200:
-            return "WARNING", "InsufficientPixels", {}
-        
-        if len(bkg_residuals) < 50:
-            return "CRITICAL", "InsufficientPixels", {}
-
-        # --- A. Basic Moments ---
-        res_skew = skew(bkg_residuals)
-        res_kurt = kurtosis(bkg_residuals, fisher=True)
-        
-        # --- B. Robust RMS Ratio (Clipped vs MAD) ---
-        std_val = np.std(bkg_residuals)
-        # MAD scaled to match 1-sigma for a Gaussian
-        mad = np.median(np.abs(bkg_residuals - np.median(bkg_residuals)))
-        robust_std = 1.4826 * mad
-        std_ratio = std_val / robust_std if robust_std > 0 else 1.0
-
-        # --- C. Extreme Tail Fraction (>5-sigma) ---
-        # Note: We use robust_std for the threshold to avoid the outliers masking themselves
-        tail_threshold = 5 * robust_std
-        outliers = np.abs(bkg_residuals) > tail_threshold
-        tail_frac = np.mean(outliers)
-
-        # --- D. Signed Tail Imbalance (Directionality) ---
-        pos_tail = np.sum(bkg_residuals > tail_threshold)
-        neg_tail = np.sum(bkg_residuals < -tail_threshold)
-        
-        # Check for imbalance if we have enough total outliers to be significant
-        imbalance = 0
-        if (pos_tail + neg_tail) > 2:
-            imbalance = abs(pos_tail - neg_tail) / (pos_tail + neg_tail)
-
-        # --- E. Logic-based Flagging ---
-        reasons = []
-        
-        # Thresholds tuned for JWST/MIRI mosaics
-        if abs(res_skew) > 2.5:       reasons.append("HighSkew")
-        if res_kurt > 10.0:           reasons.append("HighKurtosis") # MIRI has high natural kurtosis
-        if std_ratio > 1.5:           reasons.append("NonGaussianWidth")
-        if tail_frac > 0.005:         reasons.append("ExtremeTails")
-        if imbalance > 0.7:           reasons.append("AsymmetricTails")
-
-        # Classification
-        if len(reasons) >= 2 or "AsymmetricTails" in reasons:
-            level = "CRITICAL"
-        elif len(reasons) == 1:
-            level = "WARNING"
-        else:
-            level = "CLEAN"
-
-        return level, "|".join(reasons), {
-            "skew": res_skew, 
-            "kurtosis": res_kurt,
-            "std_ratio": std_ratio, 
-            "tail_frac": tail_frac,
-            "imbalance": imbalance
-        }
+    
 
     def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False, 
                        radii=np.linspace(2,25,25), save_cog=False):
@@ -1161,7 +1161,7 @@ class MIRIPipeline:
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v1.0.0")
+        print("                 JWST MIRI PIPELINE v1.1.0")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
@@ -1174,6 +1174,8 @@ class MIRIPipeline:
         all_rows = []
         
         bkg_floor = []
+        
+        galaxy_cog_dict = {}
         
         stored_ids = 0
         
@@ -1195,7 +1197,7 @@ class MIRIPipeline:
             
             # Pre-populate with columns for all filters ALREADY discovered
             for filt in all_filters:
-                galaxy_row.update(self.get_filter_column_template(filt))
+                galaxy_row.update(self._get_filter_column_template(filt))
             
             # Track if we've stored general aperture yet
             ap_geometry_stored = False
@@ -1221,23 +1223,11 @@ class MIRIPipeline:
                     # --- 3. Measure fluxes ---
                     flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
-                    # --- 4. Perform Curve of Growth analysis ---
-                    cog_measurements = self.measure_flux_cog(ap_params, bkg_dict, radii)
-                    
-                    cog_res[filt] = cog_measurements
-                    cog_res["meta"] = ap_params
-                
-                    psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
-                    with fits.open(psf_path) as psf_hdul:
-                        psf_data = psf_hdul[3].data
-                    measurements_psf = self.measure_flux_cog(ap_params, bkg_dict, radii, psf_data=psf_data)
-
-                    cog_res_psf[filt] = measurements_psf
-                    cog_res_psf["meta"] = ap_params
-                    
-                    # Optionally save curve of growth plots
-                    if save_cog:
-                        self._plot_cog(cog_res, cog_res_psf)                    
+                    galaxy_cog_dict[filt] = flux_dict
+        
+                    # Ensure that the aperture params are available for the plotter
+                    if "meta" not in galaxy_cog_dict:
+                        galaxy_cog_dict["ap_params"] = ap_params                
                     
                     # --- 5. Compute PSF correction ---
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
@@ -1305,6 +1295,10 @@ class MIRIPipeline:
             
                 except Exception as e:
                     print(f"Error processing {target_id} in {filt}: {e}")
+            
+            # Optionally save curve of growth plots
+            if save_cog:
+                self._plot_cog(galaxy_cog_dict)    
             
             stored_ids += 1
             
