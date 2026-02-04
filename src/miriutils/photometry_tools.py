@@ -967,8 +967,8 @@ class MIRIPipeline:
             "nominal_err_jy": nominal_err_jy,
             
             # CoG results
-            "cog_fluxes": cog_fluxes,
-            "cog_fluxes_psf": cog_fluxes_psf,
+            "cog_fluxes": cog_fluxes * conv,
+            "cog_fluxes_psf": cog_fluxes_psf * conv,
             "cog_radii": cog_radii
         }
         
@@ -1032,111 +1032,52 @@ class MIRIPipeline:
         plt.close() 
         
     
-    def _apply_quality_flagging(self, ap_params, flux_dict):
+    def _apply_quality_flagging(self, flux_dict):
         """
         Performs a quality based on the curve of growth
         """
-        # Extract fluxes
-        fluxes = np.array(flux_dict["cog_fluxes"])
-        radii = np.array(flux_dict["cog_radii"])
+        
+        # Return data:
+        # Quality flag, flux_jy, flux_err_jy
+        
+        # Actual flux of the observation
+        flux_jy = flux_dict["flux_jy"]
+        flux_err_jy = flux_dict["flux_err_jy"]
         emp_snr = flux_dict["emp_snr"]
         
-        # Get maximum value and last value
-        f_max = np.max(fluxes)
-        idx_max = np.argmax(fluxes)
-        f_final = fluxes[-1]
-        num_points = len(fluxes)
-
-        # How much did the flux drop from the peak?
-        dip_ratio = f_final / f_max if f_max > 0 else 0
-
+        # Check 1: Signal-to-noise ratio and positive flux
+        if flux_jy <= 0 or (emp_snr is not None and emp_snr < 3.0):
+            return "NON_DETECTION", 0.0, 3 * flux_dict["bkg_err_jy"]
+        
+        # Extract CoG-fluxes
+        fluxes = np.array(flux_dict["cog_fluxes"])
+        radii = np.array(flux_dict["cog_radii"])
+        
+        # Get important diagnostic flux values
+        f_max = np.max(fluxes)          # Peak flux in the CoG
+        idx_max = np.argmax(fluxes)     # Position of the peak
+        f_final = fluxes[-1]            # Flux value at largest aperture
+        num_points = len(fluxes)        # Number of points in the curve
+        tail_fluxes = fluxes[idx_max:]  # Flux range from the peak to the end
+        
+        # How deep is the dip after the peak
+        f_min_after_peak = np.min(tail_fluxes)
+        depth = (f_max - f_min_after_peak) / f_max if f_max > 0 else 0
+        
         # Where is the peak relative to the total search radius (0.0 to 1.0)
         peak_pos = idx_max / (num_points - 1)
 
-        if fluxes[0] <= 0 or (emp_snr is not None and emp_snr < 3.0):
-            return "NON_DETECTION", 0.0, 3 * flux_dict["bkg_err_jy"]
-
-        # Apply Flagging
-        if dip_ratio < 0.85:
-            # The flux dropped by more than 15% after reaching its maximum
-            if peak_pos < 0.5:
-                flag = "FAIL_OVER_SUB" # Background is so high it ate the galaxy's wings
-            else:
-                flag = "FAIL_BKG_GRADIENT" # Likely a local gradient or stripe issue
-        
-        # Find the index in the CoG closest to the aperture radius
-        source_a = ap_params["a"]
-        
-        # Define the masks
-        mask_source = radii <= source_a
-        mask_transition = (radii > source_a) & (radii <= 1.5 * source_a)
-        mask_outer = radii > 1.5 * source_a
-        
-        # Extract Fluxes (handling empty slices if galaxy is huge)
-        f_source = fluxes[mask_source][-1] if any(mask_source) else 0
-        f_trans = fluxes[mask_transition][-1] if any(mask_transition) else f_source
-        f_outer = fluxes[mask_outer][-1] if any(mask_outer) else f_trans
-        
-        # How much did it grow in the transition? (Expect some growth)
-        trans_growth = (f_trans - f_source) / f_source if f_source > 0 else 0
-        
-        # How much did it grow in the stability zone? (Expect ZERO growth)
-        outer_slope = (f_outer - f_trans) / f_trans if f_trans > 0 else 0
-        
-        # Refined Flagging Logic
-        if outer_slope > 0.10:
-            flag = "FAIL_UNDER_SUBTRACTED" # The curve is still climbing in pure sky
-        elif outer_slope < -0.10:
-            flag = "FAIL_OVER_SUBTRACTED"  # The curve is diving in pure sky
-        elif trans_growth > 0.50:
-            flag = "WARNING_EXTENDED"      # Massive wings, possibly a neighbor bleed
-        else:
-            flag = "CLEAN"
-            
-        return flag, trans_growth, stability_slope
-        # Q1: Does the flux increase where the source should be?
-        # (End value - Start) / End value
-        if fluxes[inner_indices[-1]] > 0:
-            growth_source = (fluxes[inner_indices[-1]] - fluxes[0]) / fluxes[inner_indices[-1]]
-        else:
-            growth_source = 0.0    
-         
-        # Q2: Does the flux keep climbing/falling in the sky region?
-        # (End value - Start of plateau) / End value
-        growth_sky = (fluxes[-1] - fluxes[outer_indices[0]]) / fluxes[-1] if fluxes[-1] > 0 else 0
-        
-        
-        # 1. Metric Calculation
+        # How much did the flux drop from the peak?
         dip_ratio = f_final / f_max if f_max > 0 else 0
-        # Growth in the outer 20% of the aperture radius
-        growth_tail = (fluxes[-1] - fluxes[-3]) / fluxes[-1] if fluxes[-1] > 0 else 0
         
-        # Logic-based Flagging
-        reasons = []
+        # Check 2: Extreme over-subtraction issue
+        if depth > 0.25:
+            return "BKG_OVER_SUB", flux_jy, flux_err_jy
         
-        # Thresholds tuned for JWST/MIRI mosaics
-        if abs(res_skew) > 2.5:       reasons.append("HighSkew")
-        if res_kurt > 10.0:           reasons.append("HighKurtosis") # MIRI has high natural kurtosis
-        if std_ratio > 1.5:           reasons.append("NonGaussianWidth")
-        if tail_frac > 0.005:         reasons.append("ExtremeTails")
-        if imbalance > 0.7:           reasons.append("AsymmetricTails")
+        # Compare peak to the aperture flux
+        runaway_ratio = f_final / f_max 
 
-        # Classification
-        if len(reasons) >= 2 or "AsymmetricTails" in reasons:
-            level = "CRITICAL"
-        elif len(reasons) == 1:
-            level = "WARNING"
-        else:
-            level = "CLEAN"
-
-        return level, "|".join(reasons), {
-            "skew": res_skew, 
-            "kurtosis": res_kurt,
-            "std_ratio": std_ratio, 
-            "tail_frac": tail_frac,
-            "imbalance": imbalance
-        }        
-        
+        return None
 
 
     
