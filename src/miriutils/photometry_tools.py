@@ -896,7 +896,7 @@ class MIRIPipeline:
         # Unit Conversion (MJy/sr -> Jy)
         flux_jy = raw_flux_mjysr * conv
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
-        err_jy = total_err_mjysr * conv
+        total_err_jy = total_err_mjysr * conv
         emp_rms_jy = emp_rms * conv
         
         # This is the "Nominal" error in Jy
@@ -952,23 +952,24 @@ class MIRIPipeline:
         return {
             # Science fluxes and uncertainties
             "flux_jy": flux_jy,
-            "flux_err_jy": err_jy,
-            "source_flux_jy": bkg_flux_jy,
+            "flux_err_jy": total_err_jy,
             
             # Signal-to-noise ratios (standard & empirical)
-            "snr": flux_jy / err_jy if err_jy > 0 else 0,
+            "snr": flux_jy / total_err_jy if total_err_jy > 0 else 0,
             "emp_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
             
             # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
+            "bkg_flux_jy": bkg_flux_jy,
+            "emp_rms_jy": emp_rms_jy,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
             "median_bkg_res_jy": median_bkg_res_jy,
             "nominal_err_jy": nominal_err_jy,
             
             # CoG results
-            "cog_fluxes": cog_fluxes * conv,
-            "cog_fluxes_psf": cog_fluxes_psf * conv,
+            "cog_fluxes": cog_fluxes,
+            "cog_fluxes_psf": cog_fluxes_psf,
             "cog_radii": cog_radii
         }
         
@@ -1034,20 +1035,17 @@ class MIRIPipeline:
     
     def _apply_quality_flagging(self, flux_dict):
         """
-        Performs a quality based on the curve of growth
+        Performs a quality based on the curve of growth.
         """
         
         # Return data:
         # Quality flag, flux_jy, flux_err_jy
         
         # Actual flux of the observation
-        flux_jy = flux_dict["flux_jy"]
-        flux_err_jy = flux_dict["flux_err_jy"]
-        emp_snr = flux_dict["emp_snr"]
-        
-        # Check 1: Signal-to-noise ratio and positive flux
-        if flux_jy <= 0 or (emp_snr is not None and emp_snr < 3.0):
-            return "NON_DETECTION", 0.0, 3 * flux_dict["bkg_err_jy"]
+        flux_jy = flux_dict["flux_jy"]          # Measured flux
+        flux_err_jy = flux_dict["flux_err_jy"]  # Propagated error
+        emp_rms_jy = flux_dict["emp_rms_jy"]    # Empirical RMS
+        emp_snr = flux_dict["emp_snr"]          # Empirical SNR
         
         # Extract CoG-fluxes
         fluxes = np.array(flux_dict["cog_fluxes"])
@@ -1055,32 +1053,47 @@ class MIRIPipeline:
         
         # Get important diagnostic flux values
         f_max = np.max(fluxes)          # Peak flux in the CoG
+        f_min = np.min(fluxes)          # Minimum flux in the CoG
         idx_max = np.argmax(fluxes)     # Position of the peak
+        idx_min = np.argmin(fluxes)     # Position of the minimum
         f_final = fluxes[-1]            # Flux value at largest aperture
         num_points = len(fluxes)        # Number of points in the curve
         tail_fluxes = fluxes[idx_max:]  # Flux range from the peak to the end
+        diffs = np.diff(fluxes)         # Differences between consecutive fluxes
+        neg_fraction = np.sum(diffs < 0) / len(diffs)   # Fraction of aperture steps adding negative flux
+        pos_fraction = np.sum(diffs > 0) / len(diffs)   # Fraction of aperture steps adding positive flux
         
-        # How deep is the dip after the peak
+        # Quality Flagging Logic
+        # ---------------------------------------------------------
+        # If the curve is strictly decreasing or the final value is a deep minimum
+        noise_floor = -3.0 * emp_rms_jy
+        
+        # If the curve is significantly negative at the end AND the majority of steps are negative, 
+        # it's likely an oversubtraction issue
+        is_deeply_negative = f_min < noise_floor
+        is_consistently_falling = neg_fraction > 0.80
+        
+        if f_final < 0 and is_deeply_negative and is_consistently_falling:
+            return "FAIL_OVERSUB"
+        
+        if emp_snr < 5.0:
+            return "NON_DETECTION"
+
+        # The dip (background gradient/stripe)
+        tail_fluxes = fluxes[idx_max:]
         f_min_after_peak = np.min(tail_fluxes)
         depth = (f_max - f_min_after_peak) / f_max if f_max > 0 else 0
-        
-        # Where is the peak relative to the total search radius (0.0 to 1.0)
-        peak_pos = idx_max / (num_points - 1)
+        if idx_max != len(fluxes)-1 and depth > 0.20:  # 20% loss after peak is highly unphysical
+            return "HANDLE_WITH_CARE"
 
-        # How much did the flux drop from the peak?
-        dip_ratio = f_final / f_max if f_max > 0 else 0
-        
-        # Check 2: Extreme over-subtraction issue
-        if depth > 0.25:
-            return "BKG_OVER_SUB", flux_jy, flux_err_jy
-        
-        # Compare peak to the aperture flux
-        runaway_ratio = f_final / f_max 
+        # If peak is at the end AND the growth in the last 3 steps is still high
+        is_consistently_rising = pos_fraction > 0.80
+        last_growth = (fluxes[-1] - fluxes[-4]) / fluxes[-1] if fluxes[-1] > 0 else 0
+        if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising:
+            return "FAIL_UNDERSUB"
 
-        return None
-
-
-    
+        # Clean data
+        return "CLEAN"   
     
     
     def _get_filter_column_template(self, filt):
@@ -1089,6 +1102,7 @@ class MIRIPipeline:
             # --- Photometry Results ---
             f"{filt}_flux": np.nan,
             f"{filt}_flux_err": np.nan,
+            f"{filt}_flux_err_corr": np.nan,
             f"{filt}_abmag": np.nan,
             f"{filt}_apflux": np.nan,
             f"{filt}_apflux_err": np.nan,
@@ -1209,9 +1223,7 @@ class MIRIPipeline:
                     
                     galaxy_row[f"{filt}_emp_snr"] = emp_snr
                     
-                    if emp_snr >= 3.0:
-                        print(emp_snr)
-                        galaxy_cog_dict[filt] = flux_dict
+                    galaxy_cog_dict[filt] = flux_dict
 
                     # Ensure that the aperture params are available for the plotter
                     if "meta" not in galaxy_cog_dict:
@@ -1228,6 +1240,7 @@ class MIRIPipeline:
                     # Get PSF-corrected fluxes
                     flux_corr = flux_dict["flux_jy"] * psf_corr 
                     flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
+                    emp_flux_err_corr = flux_dict["emp_rms_jy"] * psf_corr
                     
                     # Convert fluxes into AB magnitudes
                     if flux_corr > 0:
@@ -1241,7 +1254,7 @@ class MIRIPipeline:
                     
                     # Get local bkg estimates (median + error)
                     n_pix = flux_dict["n_pix"]
-                    local_bkg = flux_dict["source_flux_jy"]
+                    local_bkg = flux_dict["bkg_flux_jy"]
                     bkg_err = flux_dict["bkg_err_jy"]
                     
                     bkg_floor.append(flux_dict["median_bkg_res_jy"])
@@ -1254,6 +1267,7 @@ class MIRIPipeline:
                     # --- Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
+                    galaxy_row[f"{filt}_flux_err_corr"] = emp_flux_err_corr
                     galaxy_row[f"{filt}_abmag"] = ab_mag
                     galaxy_row[f"{filt}_apflux"] = apflux
                     galaxy_row[f"{filt}_apflux_err"] = apflux_err
