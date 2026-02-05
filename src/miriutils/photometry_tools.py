@@ -984,7 +984,7 @@ class MIRIPipeline:
         colormap = cm.get_cmap('turbo')
         
         # Track available filters to avoid plotting the 'meta' key
-        available_filters = [f for f in cog_dict.keys() if f != "ap_params"]
+        available_filters = [f for f in cog_dict.keys() if f != "ap_params" and f != "qc_flag"]
         if len(available_filters) == 0:
             return None
         ap_params = cog_dict["ap_params"]
@@ -1002,12 +1002,13 @@ class MIRIPipeline:
             galaxy_flux = cog_data['cog_fluxes']
             psf_flux = cog_data['cog_fluxes_psf']
             radii = cog_data['cog_radii']
+            qc_flag = cog_data["qc_flag"]
             
             # Normalise by maximum absolute value instead of just positive maximum!
             y_galaxy = galaxy_flux / np.max(np.abs(galaxy_flux))
             y_psf = psf_flux / np.max(psf_flux)
             
-            plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
+            plt.plot(radii, y_galaxy, label=f'{filt} ({qc_flag})', color=line_color, 
                     marker='o', markersize=3, lw=2, alpha=0.9)
             plt.plot(radii, y_psf, color=line_color, 
                     linestyle='--', lw=1.5, alpha=0.7)
@@ -1065,35 +1066,34 @@ class MIRIPipeline:
         
         # Quality Flagging Logic
         # ---------------------------------------------------------
-        # If the curve is strictly decreasing or the final value is a deep minimum
-        noise_floor = -3.0 * emp_rms_jy
         
         # If the curve is significantly negative at the end AND the majority of steps are negative, 
         # it's likely an oversubtraction issue
-        is_deeply_negative = f_min < noise_floor
+        is_deeply_negative = f_min < -3.0 * emp_rms_jy
         is_consistently_falling = neg_fraction > 0.80
-        
         if f_final < 0 and is_deeply_negative and is_consistently_falling:
-            return "FAIL_OVERSUB"
-        
-        if emp_snr < 5.0:
-            return "NON_DETECTION"
-
-        # The dip (background gradient/stripe)
-        tail_fluxes = fluxes[idx_max:]
-        f_min_after_peak = np.min(tail_fluxes)
-        depth = (f_max - f_min_after_peak) / f_max if f_max > 0 else 0
-        if idx_max != len(fluxes)-1 and depth > 0.20:  # 20% loss after peak is highly unphysical
-            return "HANDLE_WITH_CARE"
+            return "OVERSUB", 1
 
         # If peak is at the end AND the growth in the last 3 steps is still high
+        is_highly_positive = f_max > 3.0 * emp_rms_jy
         is_consistently_rising = pos_fraction > 0.80
         last_growth = (fluxes[-1] - fluxes[-4]) / fluxes[-1] if fluxes[-1] > 0 else 0
-        if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising:
-            return "FAIL_UNDERSUB"
+        if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising and is_highly_positive:
+            return "UNDERSUB", 1
 
+        # The dip & bump (background gradient/stripe)
+        tail_fluxes_peak = fluxes[idx_max:]        
+        f_min_after_peak = np.min(tail_fluxes_peak)
+        depth_absolute = f_max - f_min_after_peak
+        is_significant_dip = depth_absolute > (3.0 * emp_rms_jy)
+        depth_fraction = depth_absolute / f_max if f_max > 0 else 0
+        
+        # 20% loss after peak is highly unphysical
+        if idx_max != len(fluxes)-1 and depth_fraction > 0.20 and is_significant_dip:  
+            return "ARTEFACT", 2
+        
         # Clean data
-        return "CLEAN"   
+        return "CLEAN", 0
     
     
     def _get_filter_column_template(self, filt):
@@ -1102,7 +1102,6 @@ class MIRIPipeline:
             # --- Photometry Results ---
             f"{filt}_flux": np.nan,
             f"{filt}_flux_err": np.nan,
-            f"{filt}_flux_err_corr": np.nan,
             f"{filt}_abmag": np.nan,
             f"{filt}_apflux": np.nan,
             f"{filt}_apflux_err": np.nan,
@@ -1114,9 +1113,8 @@ class MIRIPipeline:
             f"{filt}_bkg_err": np.nan,
             f"{filt}_emp_rms": np.nan,
             
-            # --- Quality Control (QC) Flags ---
-            #f"{filt}_qc_level": "UNKNOWN",   # CLEAN, WARNING, or CRITICAL
-            #f"{filt}_qc_reasons": "",       # e.g., "HighSkew|ExtremeTails"
+            # --- Quality Control (QC) Flag ---
+            f"{filt}_qc": 0,
             
             # --- Aperture Geometry ---
             f"{filt}_ap_x": np.nan,
@@ -1219,14 +1217,19 @@ class MIRIPipeline:
                     # --- 3. Measure fluxes ---
                     flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
+                    qc_flag, qc_identifier = self._apply_quality_flagging(flux_dict)
+                    
+                    print(f"  - {filt}: Flux = {flux_dict['flux_jy']:.3e} Jy | SNR = {flux_dict['emp_snr']:.2f} | QC = {qc_flag} ({qc_identifier})")
+                    
                     emp_snr = flux_dict["emp_snr"]
                     
                     galaxy_row[f"{filt}_emp_snr"] = emp_snr
                     
                     galaxy_cog_dict[filt] = flux_dict
+                    galaxy_cog_dict[filt]["qc_flag"] = qc_flag
 
                     # Ensure that the aperture params are available for the plotter
-                    if "meta" not in galaxy_cog_dict:
+                    if "ap_params" not in galaxy_cog_dict:
                         galaxy_cog_dict["ap_params"] = ap_params                
                     
                     # --- 5. Compute PSF correction ---
@@ -1259,15 +1262,10 @@ class MIRIPipeline:
                     
                     bkg_floor.append(flux_dict["median_bkg_res_jy"])
                     
-                    # Get quality flagging
-                    #quality_level = bkg_res["quality_level"]
-                    #quality_reasons = bkg_res["quality_reasons"]
-                    #quality_metrics = bkg_res["quality_metrics"]
-                    
                     # --- Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
-                    galaxy_row[f"{filt}_flux_err_corr"] = emp_flux_err_corr
+                    galaxy_row[f"{filt}_emp_rms"] = emp_flux_err_corr
                     galaxy_row[f"{filt}_abmag"] = ab_mag
                     galaxy_row[f"{filt}_apflux"] = apflux
                     galaxy_row[f"{filt}_apflux_err"] = apflux_err
@@ -1278,10 +1276,8 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
-                    
-                    # --- Store quality flags ---
-                    #galaxy_row[f"{filt}_qc_level"] = quality_level
-                    #galaxy_row[f"{filt}_qc_reasons"] = quality_reasons
+                    # --- Store quality flag ---
+                    galaxy_row[f"{filt}_qc"] = qc_identifier
                     
                     # --- Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
@@ -1363,10 +1359,6 @@ class MIRIPipeline:
 
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
 
-
-# ==================================================================================================
-# ====================== END OF PHOTOMETRY - START OF ANALYSIS =====================================
-# ==================================================================================================
 
     @staticmethod
     def compare_aperture_statistics(table_small_path, table_big_path, rescale_config_path=None, 
@@ -1623,7 +1615,7 @@ class MIRIPipeline:
     
 
     @staticmethod
-    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.5):
+    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.9):
         """
         Estimate RMS by placing random elliptical apertures on the image.
 
@@ -1661,9 +1653,7 @@ class MIRIPipeline:
             y = random.uniform(b + 2, ny - b - 2)
 
             # skip if centre falls on masked pixel
-            if np.isnan(
-                img[int(y), int(x)]
-            ):  # NaN is the only value not similar to itself! Important!
+            if np.isnan(img[int(y), int(x)]):
                 continue
 
             # random angle variation (around reference theta)
@@ -1698,15 +1688,8 @@ class MIRIPipeline:
         return median_abs_deviation(aperturesums, scale='normal')
             
             
-            
-            
-            
-            
-            
     @staticmethod
-    def plot_galaxy_filter_matrix(
-        table_path, fig_path, title=None, nondetections=None, cols=4
-    ):
+    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, cols=3):
         """
         Visualise which galaxies are observed and detected in which filters,
         but using a dictionary of *non-detections* instead of detections.
@@ -1719,20 +1702,24 @@ class MIRIPipeline:
             Path to the output file.
         title : str, optional
             Title of the plot.
-        nondetections : dict, optional
-            Dictionary mapping filter names to lists of galaxy IDs that were NOT detected.
         cols : int
             Number of subplot columns.
         """
         table = Table.read(table_path, format="fits")
         table.info()
-        filter_order = ["F770W", "F1000W", "F1800W", "F2100W"]
+        
+        filter_order = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
+        
+        print("Filters:", filters)
+        
+    
         pastel_colours = {
             "F770W": "#a6cee3",
             "F1000W": "#b2df8a",
             "F1800W": "#fdbf6f",
             "F2100W": "#fb9a99",
         }
+        
 
         galaxy_ids = [str(gid) for gid in table["ID"]]
         num_galaxies = len(galaxy_ids)
