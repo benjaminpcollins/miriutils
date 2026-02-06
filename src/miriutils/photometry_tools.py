@@ -1689,7 +1689,7 @@ class MIRIPipeline:
             
             
     @staticmethod
-    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, cols=3):
+    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, snr_thresh=None, cols=3):
         """
         Visualise which galaxies are observed and detected in which filters,
         but using a dictionary of *non-detections* instead of detections.
@@ -1708,126 +1708,105 @@ class MIRIPipeline:
         table = Table.read(table_path, format="fits")
         table.info()
         
-        filter_order = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
+        all_bands = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
         
-        print("Filters:", filters)
+        print("Plotting observation heat map for the following filters:\n", all_bands)
         
-    
         pastel_colours = {
             "F770W": "#a6cee3",
             "F1000W": "#b2df8a",
             "F1800W": "#fdbf6f",
             "F2100W": "#fb9a99",
         }
-        
 
         galaxy_ids = [str(gid) for gid in table["ID"]]
+        sorted_ids = sorted(galaxy_ids, key=lambda x: int(x))
         num_galaxies = len(galaxy_ids)
         chunk_size = (num_galaxies + 3) // cols
-        chunks = [
-            galaxy_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)
-        ]
+        chunks = [sorted_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)]
 
-        print(f"Number of unique IDs in table: {len(set(str(row['ID']) for row in table))}")
+        print(f"Number of unique IDs in the table: {len(set(str(row['ID']) for row in table))}")
         print(f"Number of IDs in galaxy_ids: {len(galaxy_ids)}")
         print(f"Chunks: {[len(c) for c in chunks]}")
 
-        cell_size = 0.5
-        num_cols = len(filter_order)
+        cell_size = 0.6
+        num_filters = len(all_bands)
         num_rows = chunk_size
-        fig_width = cell_size * num_cols * cols
+        fig_width = cell_size * num_filters * cols
         fig_height = cell_size * num_rows * 0.7
 
         fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
         axes = axes[0]
 
+        # Create a mapping for quick row lookup
+        table_id_to_idx = {str(row["ID"]): i for i, row in enumerate(table)}
+
         for ax, g_ids in zip(axes, chunks):
-            matrix = np.zeros((len(g_ids), len(filter_order)), dtype=int)
-            g_index_map = {gid: i for i, gid in enumerate(g_ids)}
-            table_id_to_row = {str(row["ID"]): ii for ii, row in enumerate(table)}
+            matrix = np.zeros((len(g_ids), num_filters), dtype=int)
+            
+            y_labels = []
+            for i, gid in enumerate(g_ids):
+                
+                #Extract galaxy row from the photometric table
+                row_idx = table_id_to_idx[gid]
+                row = table[row_idx]
+                
+                # Create y-labels
+                label = gid
+                y_labels.append(label)
+                available_filters = [
+                    filt for filt in all_bands 
+                    if f"{filt}_flux" in table.colnames and not table[f"{filt}_flux"].mask[row_idx]
+                ]
+                print(gid, available_filters)
+                for j, filt in enumerate(all_bands):
+                    
+                    if filt in available_filters:
+                        # Check for Signal-to-noise and quality flag
+                        flux_jy = row[f"{filt}_flux"]
+                        flux_err_jy = row[f"{filt}_flux_err"]
+                        emp_rms_jy = row[f"{filt}_emp_rms"]
+                        qc_id = row[f"{filt}_qc"]
 
-            for row in table:
-                gid = str(row["ID"])
-                if gid not in g_index_map:
-                    continue
-                g_ii = g_index_map[gid]
-                filters = row["Filters"]
-                if isinstance(filters, (list, np.ndarray)):
-                    filters = [
-                        f.decode() if isinstance(f, bytes) else str(f) for f in filters
-                    ]
-                else:
-                    filters = [f.strip() for f in str(filters).split(",") if f.strip()]
+                        # Determine color (checking for artefacts)
+                        base_colour = pastel_colours.get(filt, "#grey")
 
-                for filt in filters:
-                    if filt in filter_order:
-                        f_ii = filter_order.index(filt)
-
-                        # Inverted logic:
-                        # Galaxy is marked if it's covered AND not in nondetections for that filter
-                        if nondetections is None or int(gid) not in nondetections.get(
-                            filt, []
-                        ):
-                            matrix[g_ii, f_ii] = 1
-
-            # Draw rectangles
-            for i in range(matrix.shape[0]):
-                for j in range(matrix.shape[1]):
-                    if matrix[i, j] == 1:
-                        base_colour = pastel_colours[filter_order[j]]
-                        gid = g_ids[i]
-                        row = table[table_id_to_row[gid]]
-
-                        flag_art_array = row["Flag_Art"]
-                        flag_art = False
-                        if flag_art_array is not None and len(flag_art_array) == len(
-                            filter_order
-                        ):
-                            flag_art = flag_art_array[j]
-
-                        if flag_art:
+                        if qc_id > 0:   # Artefact or background-subtraction issue
                             rgb = np.array(mcolors.to_rgb(base_colour))
                             darker_rgb = np.clip(rgb * 0.7, 0, 1)
                             colour = darker_rgb
                         else:
                             colour = base_colour
 
-                        ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+                        if snr_thresh:
+                            snr = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
+                            if snr >= snr_thresh:
+                                ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+                        
+                        else:
+                            ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
 
-            # Labels with asterisk for companions
-            y_labels = []
-            for i, gid in enumerate(g_ids):
-                row = table[table_id_to_row[gid]]
-                label = gid
-                if row["Flag_Com"] == True:
-                    label += "*"
-                y_labels.append(label)
-
-            ax.set_xlim(0, len(filter_order))
+            ax.set_xlim(0, num_filters)
             ax.set_ylim(len(g_ids), 0)
-            ax.set_xticks(np.arange(len(filter_order)) + 0.5)
-            ax.set_xticklabels(filter_order, rotation=45, ha="right", fontsize=11)
+            ax.set_xticks(np.arange(num_filters) + 0.5)
+            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=12)
             ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-            ax.set_yticklabels(y_labels, fontsize=11)
+            ax.set_yticklabels(y_labels, fontsize=12)
 
             # Add horizontal grid lines
             for y in np.arange(len(g_ids)):
-                ax.axhline(
-                    y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10
-                )
+                ax.axhline(y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10)
 
             # Vertical lines at column boundaries
-            for x in np.arange(len(filter_order) + 1):
-                ax.axvline(
-                    x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10
-                )
+            for x in np.arange(num_filters + 1):
+                ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
 
             print(f"Plotting {len(g_ids)} galaxies in this panel")
 
         total_plotted = sum(len(c) for c in chunks)
         print(f"Total plotted galaxies: {total_plotted}")
-
-        # plt.suptitle(title, fontsize=28)
+        if title:
+            plt.suptitle(title, fontsize=20, y=0.99)
         plt.tight_layout()
         os.makedirs(os.path.dirname(fig_path), exist_ok=True)
         plt.savefig(fig_path, dpi=150)
