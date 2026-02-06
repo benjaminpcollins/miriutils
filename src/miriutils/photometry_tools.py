@@ -1079,7 +1079,7 @@ class MIRIPipeline:
         is_consistently_rising = pos_fraction > 0.80
         last_growth = (fluxes[-1] - fluxes[-4]) / fluxes[-1] if fluxes[-1] > 0 else 0
         if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising and is_highly_positive:
-            return "UNDERSUB", 1
+            return "UNDERSUB", 2
 
         # The dip & bump (background gradient/stripe)
         tail_fluxes_peak = fluxes[idx_max:]        
@@ -1090,7 +1090,7 @@ class MIRIPipeline:
         
         # 20% loss after peak is highly unphysical
         if idx_max != len(fluxes)-1 and depth_fraction > 0.20 and is_significant_dip:  
-            return "ARTEFACT", 2
+            return "ARTEFACT", 3
         
         # Clean data
         return "CLEAN", 0
@@ -1171,8 +1171,6 @@ class MIRIPipeline:
         
         all_rows = []
         
-        bkg_floor = []
-        
         stored_ids = 0
         
         for target_id in self.all_ids:
@@ -1217,14 +1215,7 @@ class MIRIPipeline:
                     # --- 3. Measure fluxes ---
                     flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
-                    qc_flag, qc_identifier = self._apply_quality_flagging(flux_dict)
-                    
-                    print(f"  - {filt}: Flux = {flux_dict['flux_jy']:.3e} Jy | SNR = {flux_dict['emp_snr']:.2f} | QC = {qc_flag} ({qc_identifier})")
-                    
-                    emp_snr = flux_dict["emp_snr"]
-                    
-                    galaxy_row[f"{filt}_emp_snr"] = emp_snr
-                    
+                    qc_flag, qc_identifier = self._apply_quality_flagging(flux_dict)              
                     galaxy_cog_dict[filt] = flux_dict
                     galaxy_cog_dict[filt]["qc_flag"] = qc_flag
 
@@ -1245,6 +1236,10 @@ class MIRIPipeline:
                     flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     emp_flux_err_corr = flux_dict["emp_rms_jy"] * psf_corr
                     
+                    emp_snr = flux_corr / emp_flux_err_corr if emp_flux_err_corr > 0 else 0
+                    
+                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {emp_snr:.2f} | QC = {qc_flag} ({qc_identifier})")
+                    
                     # Convert fluxes into AB magnitudes
                     if flux_corr > 0:
                         # constant is 8.90 for Jy and 23.90 for µJy
@@ -1259,9 +1254,7 @@ class MIRIPipeline:
                     n_pix = flux_dict["n_pix"]
                     local_bkg = flux_dict["bkg_flux_jy"]
                     bkg_err = flux_dict["bkg_err_jy"]
-                    
-                    bkg_floor.append(flux_dict["median_bkg_res_jy"])
-                    
+                                        
                     # --- Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
@@ -1303,18 +1296,16 @@ class MIRIPipeline:
             # Only add the row if we actually measured something
             if len(galaxy_row) > 1:
                 all_rows.append(galaxy_row)
-
-        print(f"\nMedian local background across {stored_ids} analysed galaxies: ", np.median(bkg_floor)*1e6, "µJy")
-
+                
         # --- 7. Convert to DataFrame and save to file ---
         df = pd.DataFrame(all_rows)
         
-        self.save_catalogue(df, write_to)
+        self._save_catalogue(df, write_to)
         
         # Continue by creating detection statistics and storing them in a separate directory
         
         
-    def save_catalogue(self, df, base_filename):
+    def _save_catalogue(self, df, base_filename):
         """Save photometric catalogue with explicit Astropy masking."""
 
         # ---------- CSV ----------
@@ -1811,7 +1802,6 @@ class MIRIPipeline:
         os.makedirs(os.path.dirname(fig_path), exist_ok=True)
         plt.savefig(fig_path, dpi=150)
         plt.show()
-
 
 
     @staticmethod  
