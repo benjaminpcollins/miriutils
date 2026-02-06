@@ -675,7 +675,7 @@ class MIRIPipeline:
             "median": background_median,
             "median_res": np.median(res_vals),
             "rms": background_rms,
-            "emp_rms": emp_rms,
+            "emp_rms": emp_rms if emp_rms is not None else np.nan,
             "data": data,
             "bkg_plane": background_plane,
             "subtracted": data_bkgsub,
@@ -897,8 +897,12 @@ class MIRIPipeline:
         flux_jy = raw_flux_mjysr * conv
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
         total_err_jy = total_err_mjysr * conv
-        emp_rms_jy = emp_rms * conv
         
+        if np.isnan(emp_rms):
+            emp_rms_jy = np.nan  # Handle NaN case for empirical RMS
+        else:
+            emp_rms_jy = emp_rms * conv
+            
         # This is the "Nominal" error in Jy
         nominal_err_jy = np.sqrt(detector_variance) * conv
         
@@ -956,7 +960,7 @@ class MIRIPipeline:
             
             # Signal-to-noise ratios (standard & empirical)
             "snr": flux_jy / total_err_jy if total_err_jy > 0 else 0,
-            "emp_snr": flux_jy / emp_rms_jy if emp_rms_jy else None,
+            "emp_snr": flux_jy / emp_rms_jy if not np.isnan(emp_rms_jy) else np.nan,
             
             # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
@@ -1234,11 +1238,16 @@ class MIRIPipeline:
                     # Get PSF-corrected fluxes
                     flux_corr = flux_dict["flux_jy"] * psf_corr 
                     flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
-                    emp_flux_err_corr = flux_dict["emp_rms_jy"] * psf_corr
                     
-                    emp_snr = flux_corr / emp_flux_err_corr if emp_flux_err_corr > 0 else 0
+                    if np.isnan(flux_dict["emp_rms_jy"]):
+                        emp_flux_err_corr = np.nan
+                    else:
+                        emp_flux_err_corr = flux_dict["emp_rms_jy"] * psf_corr
+                                        
+                    snr_prop = flux_corr / flux_err_corr if flux_err_corr > 0 else 0
+                    snr_emp = flux_corr / emp_flux_err_corr if emp_flux_err_corr > 0 else snr_prop
                     
-                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {emp_snr:.2f} | QC = {qc_flag} ({qc_identifier})")
+                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {snr_emp:.2f} | QC = {qc_flag} ({qc_identifier})")
                     
                     # Convert fluxes into AB magnitudes
                     if flux_corr > 0:
@@ -1606,7 +1615,7 @@ class MIRIPipeline:
     
 
     @staticmethod
-    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.9):
+    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.8):
         """
         Estimate RMS by placing random elliptical apertures on the image.
 
