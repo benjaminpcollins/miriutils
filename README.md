@@ -48,6 +48,7 @@ ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
 
 # Initialise the pipeline
 pipeline = MiriPipeline(
+    table_name="Phot_Table_MIRI"
     all_ids=ids_to_process,
     cutout_dir="./data/cutouts",
     output_dir="./miri_photometry",
@@ -56,7 +57,7 @@ pipeline = MiriPipeline(
 )
 
 # Run full survey photometry and store FITS and CSV format output tables
-pipeline.run_photometry(write_to="Phot_Table_MIRI")
+pipeline.run_photometry()
 ```
 
 ## 📫 Contact
