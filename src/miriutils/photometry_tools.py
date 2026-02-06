@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "astropy",
-#     "h5py",
 #     "matplotlib",
 #     "numpy",
 #     "pandas",
@@ -42,7 +41,9 @@ Key Capabilities:
     - Provides functions for visualising systematics introduced due to the
       choice of aperture sizes for MIRI.
     - Includes tools for Curve of Growth (CoG) analysis to compare the 
-      physical values to PSF model predictions
+      physical values to PSF model predictions and identify potential detector
+      artefacts
+    - Creates heat map plots of observations and detections across all MIRI bands
 
 Workflow:
 ---------
@@ -51,6 +52,7 @@ Workflow:
     3. Performs exact aperture photometry and background estimation.
     4. Calculates band-specific PSF corrections on an oversampled grid.
     5. Exports a dual-format (FITS/CSV) catalogue with standardised columns.
+    6. Creates heat map plots for observation and detection statistics across all MIRI bands.
 
 Example usage:
 --------------
@@ -60,6 +62,7 @@ Example usage:
     
     # Initialise the pipeline
     pipeline = MiriPipeline(
+        table_name="Phot_Table_MIRI",
         all_ids=ids_to_process,
         cutout_dir="./data/cutouts",
         output_dir="./miri_photometry",
@@ -68,12 +71,12 @@ Example usage:
     )
 
     # Run full survey photometry and store FITS and CSV format output tables
-    pipeline.run_photometry(write_to="Phot_Table_MIRI")
-    
+    pipeline.run_photometry()
+
 
 Author: Benjamin P. Collins
-Date: Jan 2026
-Version: 1.0.1
+Date: Feb 2026
+Version: 2.0.0
 """
 
 import os
@@ -81,15 +84,15 @@ import warnings
 import json
 from pathlib import Path
 import seaborn as sns
+import random
 
 import numpy as np
 import pandas as pd
-import h5py
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
 import matplotlib.cm as cm
-from scipy.stats import skew, kurtosis
+from scipy.stats import skew, kurtosis, median_abs_deviation
 
 import astropy.units as u
 from astropy.io import fits
@@ -117,11 +120,15 @@ warnings.filterwarnings('ignore', category=NoDetectionsWarning)
 
 # --- Standalone Utility Functions ---
 class MIRIPipeline:
-    def __init__(self, ids_to_process, cutouts_dir, photometry_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
-        
-        # Load aperture table
-        self.master_table = Table.read(aperture_table)
-        self.table_path = None  # To be overwritten in save_catalogue()
+    def __init__(self, 
+                 table_name,
+                 ids_to_process, 
+                 cutouts_dir, 
+                 photometry_dir, 
+                 nircam_dir, 
+                 aperture_table, 
+                 psf_dir=None, 
+                 scaling_exceptions_file=None):
         
         self.all_ids = ids_to_process
         
@@ -143,6 +150,17 @@ class MIRIPipeline:
         self.output_dir = photometry_dir
         self.nircam_dir = nircam_dir        
         
+        # Load aperture table
+        self.master_table = Table.read(aperture_table)
+        
+        # Output directories for the photometry tables (both CSV and FITS)
+        self.csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
+        self.fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")   
+        
+        # Specify table path
+        self.table_path = os.path.join(self.fits_dir, f"{table_name}.fits")
+        self.table_name = table_name
+        
         # Default PSF directory if none provided
         if psf_dir is None:
             self.psf_dir = os.path.join(self.output_dir, "psfs")
@@ -156,9 +174,9 @@ class MIRIPipeline:
         self.phot_table_dir = os.path.join(self.output_dir, "phot_tables")
         self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
         self.vis_dir = os.path.join(self.output_dir, "vis_data")
-        self.detection_dir = os.path.join(self.output_dir, "vis_data")
+        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
         
-        for dir in [self.aperture_dir, self.mosaic_dir, self.phot_table_dir, self.detection_dir]:
+        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir, self.csv_dir, self.fits_dir]:
             os.makedirs(dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
@@ -168,17 +186,6 @@ class MIRIPipeline:
 
         self.scaling_exceptions_path = scaling_exceptions_file
         self.scaling_exceptions = self._initialise_scaling_config()
-        
-        # Place these in your __init__ or as a config block
-        self.quality_config = {
-            "art_filters": {
-                "F770W": [7185, 8013, 8469, 8500, 8843, 9517, 11136, 11137, 11494, 11716, 16516, 17793, 19098, 21451],
-                "F1000W": [],
-                "F1800W": [7102, 11716, 12202, 17793, 19098, 21451],
-                "F2100W": [11723, 12175, 12213, 16874, 17984],
-            },
-            "has_companion": [7136, 7904, 7922, 7934, 8469, 10314, 16424, 17517, 18332, 21452]
-        }
 
 
     def _initialise_scaling_config(self):
@@ -429,7 +436,7 @@ class MIRIPipeline:
             #"pixel_conversion": pixel_conversion
         }
     
-    def plot_apertures_multiband(self, results_list, output_dir=None):
+    def plot_apertures_multiband(self, results_list):
         """
         results_list: A list of dictionaries returned by prepare_aperture for ONE galaxy.
         """
@@ -479,7 +486,7 @@ class MIRIPipeline:
         plt.close()
         
 
-    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3, save_vis=False):
+    def estimate_background(self, aperture_params, sigma_val=2.5, n_iters=3, n_random=200):
         """
         Fits a 2D plane to the image (excluding sources) and calculates 
         local statistics in an elliptical annulus.
@@ -494,6 +501,7 @@ class MIRIPipeline:
         filt = aperture_params["meta"]["filter"]
         is_long_wl = True if self.wavelength_map[filt] > 14.0 else False
         
+        img_h, img_w = data.shape
         yi, xi = np.indices(data.shape)
 
         # 1. Create an two source masks (buffer around the aperture)
@@ -501,7 +509,7 @@ class MIRIPipeline:
         source_mask = source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
         
         # The large source mask prevents the target's own light from biasing the background
-        a_in, b_in = a + 8, b + 8
+        a_in, b_in = a + img_h//10, b + img_h//10
         bkg_source_ap = EllipticalAperture((x_cen, y_cen), a=a_in, b=b_in, theta=theta)
         source_mask_large = bkg_source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
 
@@ -542,8 +550,6 @@ class MIRIPipeline:
         # Initialise coefficients for the loop
         coeffs = [0, 0, median_init] 
         fit_mask = ~combined_mask 
-        
-        print(f"  > Starting iterative plane fit ({n_iters} iterations)...")
         
         for i in range(n_iters):
             # Prepare the design matrix for pixels in the current mask
@@ -586,7 +592,6 @@ class MIRIPipeline:
             
             # Check if we've stopped masking new pixels (convergence)
             if np.array_equal(new_fit_mask, fit_mask):
-                print(f"    - Converged after {i+1} iterations.")
                 break
                 
             fit_mask = new_fit_mask
@@ -594,15 +599,27 @@ class MIRIPipeline:
         # Create mask for CoG analysis
         non_sky_mask = ~fit_mask
         kill_mask = non_sky_mask.copy()
-        kill_mask[source_mask_large] = False
-                
+        kill_mask[source_mask_large] = True # THIS DEFINITELY HAS TO BE TRUE TO EXCLUDE THE SOURCE!!!
+        
         # Final Plane Generation
         background_plane = alpha * xi + beta * yi + gamma
-        data_bkgsub = data - background_plane        
-    
+        data_bkgsub = data - background_plane
+        
+        # Insert section for empirical rms caculation
+        noise_image = data_bkgsub.copy()
+        noise_image[kill_mask] = np.nan        
+        
+        emp_rms = self.empirical_aperture_rms(
+            noise_image, 
+            aperture_params, 
+            n_random=n_random
+            )        
+
+        # Reset kill mask for the CoG analysis
+        kill_mask[source_mask_large] = False
+        
         # Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
-        img_h, img_w = data.shape
         dist_to_edge = min(x_cen, img_w - x_cen, y_cen, img_h - y_cen)
         a_out = dist_to_edge - 2    # 2 pixel buffer at the image boundaries
         b_out = a_out * 0.9 # Maintain aspect ratio
@@ -620,10 +637,6 @@ class MIRIPipeline:
         plane_vals = np.asarray(background_plane[bkg_pixels_mask])
         res_vals = np.asarray(data_bkgsub[bkg_pixels_mask])
 
-        # Remove any NaNs that might have snuck in
-        res_vals = res_vals[~np.isnan(res_vals)]
-
-        # The Level (The pedestal subtracted)
         background_median = np.median(plane_vals)
 
         # The Noise (Robust RMS / Sigma)
@@ -631,23 +644,10 @@ class MIRIPipeline:
         mad = np.median(np.abs(res_vals - np.median(res_vals)))
         background_rms = 1.4826 * mad 
         
-        # Perform quality checks for the background residuals
-        global_bkg_res = data_bkgsub[~combined_mask]
-        quality_level, quality_reasons, quality_metrics = self.apply_quality_flagging(global_bkg_res)
-        
         # Initialise mask visualisation for plotting
-        mask_vis = np.zeros_like(data, dtype=int)        
-        # Start with everything as "0" (Excluded)
-
-        # Assign the "Sky" pixels (all pixels used in the final iterative fit)
-        # This includes the annulus pixels that survived clipping
-        mask_vis[new_fit_mask] = 1 
-
-        # Assign the "Source" pixels (your photometry aperture)
-        # We do this last so it overwrites anything else
-        mask_vis[source_mask] = 2
-        
-        # All other pixels are 0 -> Excluded/NaN       
+        mask_vis = np.zeros_like(data, dtype=int)   # Invalid pixels
+        mask_vis[new_fit_mask] = 1                  # Annulus without sigma clipping
+        mask_vis[source_mask] = 2                   # Aperture   
         
         aperture_map = {
             "x": float(aperture_params.get("x")),
@@ -656,36 +656,7 @@ class MIRIPipeline:
             "b": float(aperture_params.get("b")),
             "theta": float(aperture_params.get("theta").value if hasattr(aperture_params.get("theta"), 'value') 
                    else aperture_params.get("theta")),
-        }
-        
-        # Store visualisation data
-        vis_data = {
-            "galaxy_id": galaxy_id,
-            "filter": filt,
-            "original_data": data,
-            "background_plane": background_plane,
-            "background_subtracted": data_bkgsub,
-            "mask_vis": mask_vis,
-            "segmentation_mask": segm_mask,
-            "background_region_mask": ann_mask,
-            "region_name": "Annulus",
-            "source_mask": source_mask_large,
-            "aperture_params": aperture_map,
-            "a_in": a_in,
-            "b_in": b_in,
-            "a_out": a_out,
-            "b_out": b_out,
-            "sigma": sigma_val,
-            "coeffs": (alpha, beta, gamma),
-        }
-        
-        # Save visualisation data to .h5 file
-        if save_vis:
-            vis_dir = self.vis_dir
-            os.makedirs(vis_dir, exist_ok=True)
-
-            vis_path = os.path.join(vis_dir, f"{galaxy_id}_{filt}.h5")
-            self.save_vis(vis_data, vis_path)
+        }        
         
         return {
             "id": galaxy_id,
@@ -693,18 +664,17 @@ class MIRIPipeline:
             "median": background_median,
             "median_res": np.median(res_vals),
             "rms": background_rms,
-            "plane": background_plane,
+            "emp_rms": emp_rms if emp_rms is not None else 0.0,
+            "data": data,
+            "bkg_plane": background_plane,
             "subtracted": data_bkgsub,
             "annulus": annulus,
             "source_ap": source_ap,
             "mask_vis": mask_vis,
-            "kill_mask": kill_mask,
-            "quality_level": quality_level,
-            "quality_reasons": quality_reasons,
-            "quality_metrics": quality_metrics
+            "kill_mask": kill_mask
         }
 
-    def plot_background_diagnostic(self, aperture_params, bkg_dict, save_path=None):
+    def plot_background_diagnostic(self, aperture_params, bkg_dict):
         """
         Creates a 2x2 diagnostic mosaic to verify background modeling.
         """
@@ -714,11 +684,10 @@ class MIRIPipeline:
         survey_obs = aperture_params["meta"]["survey_obs"]
         
         # Extract calculated objects from bkg_dict
-        plane = bkg_dict["plane"]
+        plane = bkg_dict["bkg_plane"]
         subtracted = bkg_dict["subtracted"]
         source_ap = bkg_dict["source_ap"]
         annulus = bkg_dict["annulus"]
-        
         
         # Create the figure
         fig, axes = plt.subplots(2, 2, figsize=(10, 9), constrained_layout=True)
@@ -774,13 +743,11 @@ class MIRIPipeline:
 
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         plt.legend()
-        
-        # 1. Determine the destination
-        if save_path is None:
-            # Default organizational structure
-            filt_dir = os.path.join(self.mosaic_dir, filt)
-            os.makedirs(filt_dir, exist_ok=True)
-            save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
+    
+        # Default directory structure
+        filt_dir = os.path.join(self.mosaic_dir, filt)
+        os.makedirs(filt_dir, exist_ok=True)
+        save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
         plt.savefig(save_path, bbox_inches='tight', dpi=200)
@@ -871,165 +838,56 @@ class MIRIPipeline:
 
         return correction_factor
         
-        
-    
-    @staticmethod  
-    def save_vis(vis_data, filename):
-        """
-        Save visualisation data to HDF5 file.
-
-        Parameters:
-        -----------
-        vis_data : dict
-            Dictionary containing visualization data
-        filename : str
-            Output filename (should end with .h5 or .hdf5)
-        """
-        with h5py.File(filename, "w") as f:
-            # Save arrays with compression
-            for key in [
-                "original_data",
-                "background_plane",
-                "background_subtracted",
-                "mask_vis",
-                "segmentation_mask",
-                "background_region_mask",
-                "source_mask",
-            ]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.create_dataset(
-                        key, data=vis_data[key], compression="gzip", compression_opts=6
-                    )
-
-            # Save scalars
-            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.attrs[key] = vis_data[key]
-
-            # Save strings
-            for key in ["filter", "region_name"]:
-                if key in vis_data and vis_data[key] is not None:
-                    f.attrs[key] = (
-                        vis_data[key].encode("utf-8")
-                        if isinstance(vis_data[key], str)
-                        else vis_data[key]
-                    )
-
-            # Save coefficients tuple
-            if "coeffs" in vis_data and vis_data["coeffs"] is not None:
-                f.create_dataset("coeffs", data=np.array(vis_data["coeffs"]))
-
-            # Save aperture_params dict as JSON string
-            if "aperture_params" in vis_data and vis_data["aperture_params"] is not None:
-                f.attrs["aperture_params"] = json.dumps(vis_data["aperture_params"])
-
-            # Add metadata
-            f.attrs["created_date"] = str(np.datetime64("now"))
-            f.attrs["data_type"] = "galaxy_visualisation_data"
-        
-    @staticmethod
-    def load_vis(filename):
-        """
-        Load visualisation data from HDF5 file and reconstruct Photutils objects.
-        """
-        vis_data = {}
-
-        with h5py.File(filename, "r") as f:
-            # 1. Load Arrays
-            for key in [
-                "original_data",
-                "background_plane",
-                "background_subtracted",
-                "mask_vis",
-                "segmentation_mask",
-                "background_region_mask",
-                "source_mask",
-            ]:
-                if key in f:
-                    vis_data[key] = f[key][:]
-
-            # 2. Load coefficients
-            if "coeffs" in f:
-                vis_data["coeffs"] = tuple(f["coeffs"][:])
-
-            # 3. Load scalars from attributes
-            for key in ["galaxy_id", "a_in", "b_in", "a_out", "b_out", "sigma"]:
-                if key in f.attrs:
-                    vis_data[key] = f.attrs[key]
-
-            # 4. Load strings and decode if necessary
-            for key in ["filter", "region_name"]:
-                if key in f.attrs:
-                    val = f.attrs[key]
-                    vis_data[key] = val.decode("utf-8") if isinstance(val, bytes) else val
-
-            # 5. Load aperture_params dict
-            if "aperture_params" in f.attrs:
-                vis_data["aperture_params"] = json.loads(f.attrs["aperture_params"])
-
-            # --- RECONSTRUCTION STEP ---
-            ap = vis_data.get("aperture_params")
-            if ap:
-                # Reconstruct the Source Aperture
-                # Note: ap['x'], ap['y'] etc. are now plain floats from JSON
-                vis_data['source_ap'] = EllipticalAperture(
-                    positions=(ap['x'], ap['y']),
-                    a=ap['a'],
-                    b=ap['b'],
-                    theta=ap['theta']
-                )
-
-                # Reconstruct the Annulus
-                # Uses the a_in, b_out etc stored in the main vis_data dict
-                vis_data['annulus'] = EllipticalAnnulus(
-                    positions=(ap['x'], ap['y']),
-                    a_in=vis_data['a_in'],
-                    a_out=vis_data['a_out'],
-                    b_in=vis_data['b_in'],
-                    b_out=vis_data['b_out'],
-                    theta=ap['theta']
-                )
-
-        return vis_data
 
     def measure_flux(self, aperture_params, bkg_results):
         """
         Performs aperture photometry, unit conversion, and error propagation.
         """
         # Extract data from dictionaries
-        data = aperture_params["data"]
-        err_map = aperture_params["err"] 
-        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
-        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"] # From PIXAR_SR header
+        ap_meta = aperture_params["meta"]
+        filt = ap_meta["filter"]
+        gid = ap_meta["id"]
+        pixel_area_sr = ap_meta["pixel_area_sr"] # From PIXAR_SR header
         
-        # Get background-subtracted data
+        # Get data from dictionaries
         data_bkgsub = bkg_results["subtracted"]
+        err_map = np.nan_to_num(aperture_params["err"], nan=0.0)
+        background_plane = bkg_results["bkg_plane"]
+        
+        # Get aperture object and background statistics
         source_ap = bkg_results["source_ap"]
         median_bkg_residuals = bkg_results["median_res"]
+        emp_rms = bkg_results["emp_rms"]
         
-        # Perform photometry
+        # Perform photometry on the background-subtracted data
         phot_table = aperture_photometry(data_bkgsub, source_ap, method='exact')
         raw_flux_mjysr = phot_table['aperture_sum'][0]
         
-        # 4. Error Propagation
-        # A. Detector/Poisson noise from the ERR extension
+        # Perform photometry on the background plane
+        phot_table_plane = aperture_photometry(background_plane, source_ap, method='exact')
+        raw_bkg_flux_mjysr = phot_table_plane['aperture_sum'][0]
+        
+        # Detector/Poisson noise from the ERR extension
         ap_mask = source_ap.to_mask(method='exact')
+        
         # Weighted sum of variance (method='exact' accounts for fractional pixels)
         detector_variance = np.nansum(ap_mask.multiply(err_map**2))
         
-        # B. Background modelling uncertainty already calculated in estimate_background
-        # bkg_std = clean_std * np.sqrt(source_ap.area)
-        bkg_err_mjysr = bkg_results["rms"]
+        # Background modelling uncertainty already calculated in estimate_background
+        bkg_err_mjysr = bkg_results["rms"] * np.sqrt(source_ap.area)
         
-        # C. Combine in quadrature
+        # Combine in quadrature
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
         
-        # 5. Unit Conversion (MJy/sr -> Jy)
         # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
         conv = 1e6 * pixel_area_sr
-        flux_jy = raw_flux_mjysr * conv
-        err_jy = total_err_mjysr * conv
         
+        # Unit Conversion (MJy/sr -> Jy)
+        flux_jy = raw_flux_mjysr * conv
+        bkg_flux_jy = raw_bkg_flux_mjysr * conv
+        total_err_jy = total_err_mjysr * conv
+        emp_rms_jy = emp_rms * conv
+            
         # This is the "Nominal" error in Jy
         nominal_err_jy = np.sqrt(detector_variance) * conv
         
@@ -1038,93 +896,189 @@ class MIRIPipeline:
         bkg_err_jy = bkg_err_mjysr * conv
         median_bkg_res_jy = median_bkg_residuals * conv
         
-        # 6. Final Results Dictionary
+        # Add-in: Curve of Growth analysis!!
+        nx, ny = data_bkgsub.shape
+        max_ap_size = nx//3
+        
+        # Start from 2 pixels and increase towards the max_ap_size
+        radii = np.linspace(2, max_ap_size, 25)
+        
+        # Get aperture geometry
+        x, y = aperture_params["x"], aperture_params["y"]
+        theta = aperture_params["theta"]
+        a, b = aperture_params["a"], aperture_params["b"]
+        b_over_a = b/a
+        
+        # Get kill mask and recreate noise image
+        kill_mask = bkg_results["kill_mask"]
+        cog_data = data_bkgsub.copy()
+        cog_data[kill_mask] = 0.0
+        
+        # 1. Pre-calculate PSF metadata once (outside the loop)
+        psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
+        with fits.open(psf_path) as psf_hdul:
+            psf_data = psf_hdul[3].data
+            px, py = centroid_com(psf_data)
+
+        cog_fluxes = []
+        cog_fluxes_psf = []
+        cog_radii = []
+
+        # 2. Combined Loop
+        for r in radii:
+            # Define both apertures
+            ap_sci = EllipticalAperture((x, y), a=r, b=r*b_over_a, theta=theta)
+            ap_psf = EllipticalAperture((px, py), a=4*r, b=4*r*b_over_a, theta=theta)
+            
+            # Photometry (exact method is computationally expensive, so we group them)
+            phot_sci = aperture_photometry(cog_data, ap_sci, method='exact')
+            phot_psf = aperture_photometry(psf_data, ap_psf, method='exact')
+            
+            cog_fluxes.append(phot_sci['aperture_sum'][0] * conv)
+            cog_fluxes_psf.append(phot_psf['aperture_sum'][0])
+            cog_radii.append(r)
+        
         return {
+            # Science fluxes and uncertainties
             "flux_jy": flux_jy,
-            "flux_err_jy": err_jy,
-            "snr": flux_jy / err_jy if err_jy > 0 else 0,
-            "area_pix": source_ap.area,
+            "flux_err_jy": max(total_err_jy, emp_rms_jy), # Use propagated error if it's smaller than the empirical RMS
+            
+            # Background statistics and aperture area (just to be sure)
+            "n_pix": source_ap.area,
+            "bkg_flux_jy": bkg_flux_jy,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
             "median_bkg_res_jy": median_bkg_res_jy,
-            "nominal_err_jy": nominal_err_jy
+            "nominal_err_jy": nominal_err_jy,
+            
+            # CoG results
+            "cog_fluxes": cog_fluxes,
+            "cog_fluxes_psf": cog_fluxes_psf,
+            "cog_radii": cog_radii
         }
+        
+    def _plot_cog(self, cog_dict):
+        """Function to perform Curve of Growth analysis for extended sources"""
+
+        plt.figure(figsize=(8, 5))
+        
+        # --- AUTOMATED COLOUR LOGIC ---
+        # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
+        norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
+        colormap = cm.get_cmap('turbo')
+        
+        # Track available filters to avoid plotting the 'meta' key
+        available_filters = [f for f in cog_dict.keys() if f != "ap_params" and f != "qc_flag"]
+        if len(available_filters) == 0:
+            return None
+        ap_params = cog_dict["ap_params"]
+        gid = ap_params["meta"]["id"]
+        
+        # Sort filters by wavelength so the legend looks organized
+        available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
+
+        for filt in available_filters:
+            w_val = self.wavelength_map.get(filt, 15.0)
+            line_color = colormap(norm(w_val))
+            
+            # Use normalised flux for direct shape comparison
+            cog_data = cog_dict[filt]
+            galaxy_flux = cog_data['cog_fluxes']
+            psf_flux = cog_data['cog_fluxes_psf']
+            radii = cog_data['cog_radii']
+            qc_flag = cog_data["qc_flag"]
+            
+            # Normalise by maximum absolute value instead of just positive maximum!
+            y_galaxy = galaxy_flux / np.max(np.abs(galaxy_flux))
+            y_psf = psf_flux / np.max(psf_flux)
+            
+            plt.plot(radii, y_galaxy, label=f'{filt} ({qc_flag})', color=line_color, 
+                    marker='o', markersize=3, lw=2, alpha=0.9)
+            plt.plot(radii, y_psf, color=line_color, 
+                    linestyle='--', lw=1.5, alpha=0.7)
+        
+        # Get aperture parameters
+        small_ap = ap_params["a_orig"]
+        big_ap = ap_params["a"]
+
+        plt.axvline(small_ap, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
+        plt.axvline(big_ap, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
+        
+        plt.xlabel("Semi-major axis (pixels)")
+        plt.ylabel("Normalised Cumulative Flux")        
+        plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
+        plt.legend()
+        plt.grid(alpha=0.2)
+        
+        # Save file to cog directory
+        os.makedirs(self.cog_dir, exist_ok=True)
+        fname = f"{gid}_cog_psf.png"
+        save_path = os.path.join(self.cog_dir, fname)
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close() 
+        
     
-    def measure_flux_cog(self, aperture_params, bkg_results, radii, psf_data=None, cog_dir=None):
+    def _apply_quality_flagging(self, flux_dict):
         """
-        Performs multi-aperture photometry to generate a Curve of Growth.
+        Performs a quality based on the curve of growth.
         """
         
-        # 1. Setup Data and Metadata        
-        filt = bkg_results["filter"]
+        # Return data:
+        # Quality flag, flux_jy, flux_err_jy
+        
+        # Actual flux of the observation
+        flux_jy = flux_dict["flux_jy"]          # Measured flux
+        flux_err_jy = flux_dict["flux_err_jy"]  # Propagated error
+        
+        # Extract CoG-fluxes
+        fluxes = np.array(flux_dict["cog_fluxes"])
+        radii = np.array(flux_dict["cog_radii"])
+        
+        # Get important diagnostic flux values
+        f_max = np.max(fluxes)          # Peak flux in the CoG
+        f_min = np.min(fluxes)          # Minimum flux in the CoG
+        idx_max = np.argmax(fluxes)     # Position of the peak
+        idx_min = np.argmin(fluxes)     # Position of the minimum
+        f_final = fluxes[-1]            # Flux value at largest aperture
+        num_points = len(fluxes)        # Number of points in the curve
+        tail_fluxes = fluxes[idx_max:]  # Flux range from the peak to the end
+        diffs = np.diff(fluxes)         # Differences between consecutive fluxes
+        neg_fraction = np.sum(diffs < 0) / len(diffs)   # Fraction of aperture steps adding negative flux
+        pos_fraction = np.sum(diffs > 0) / len(diffs)   # Fraction of aperture steps adding positive flux
+        
+        # Quality Flagging Logic
+        # ---------------------------------------------------------
+        
+        # If the curve is significantly negative at the end AND the majority of steps are negative, 
+        # it's likely an oversubtraction issue
+        is_deeply_negative = f_min < -3.0 * flux_err_jy
+        is_consistently_falling = neg_fraction > 0.80
+        if f_final < 0 and is_deeply_negative and is_consistently_falling:
+            return "OVERSUB", 1
 
-        gid = aperture_params["meta"]["id"]
-        err_map = aperture_params["err"]
-        err_map = np.nan_to_num(err_map, nan=0.0, posinf=0.0, neginf=0.0)
-        pixel_area_sr = aperture_params["meta"]["pixel_area_sr"]
-        conv = 1e6 * pixel_area_sr
-        
-        # Extract fixed geometry from the small/original aperture
-        x, y = aperture_params["x"], aperture_params["y"]
-        theta = aperture_params["theta"]
-        b_over_a = aperture_params["b"] / aperture_params["a"]
-        
-        
-        # DYNAMIC DATA SELECTION: Use PSF if provided, otherwise use masked science data
-        if psf_data is not None:
-            cog_data = psf_data
-            # Make sure the aperture is centred on the PSF
-            x, y = centroid_com(psf_data)
-            is_psf = True
-        else:
-            kill_mask = bkg_results["kill_mask"]
-            cog_data = bkg_results["subtracted"].copy()
-            cog_data[kill_mask] = 0.0
-            is_psf = False
-        
-        # Plot and save single filter images
-        if cog_dir:
-            plt.imshow(cog_data, origin='lower', cmap='viridis')
-            plt.title(f"{filt}: Neighbors Zeroed, Target Intact")
-            
-            fname = os.path.join(cog_dir, f"{filt}_masked.png")
-            plt.savefig(fname, dpi=200, bbox_inches='tight')
-            plt.close()
-        
-        cog_results = []
+        # If peak is at the end AND the growth in the last 3 steps is still high
+        is_highly_positive = f_max > 3.0 * flux_err_jy
+        is_consistently_rising = pos_fraction > 0.80
+        last_growth = (fluxes[-1] - fluxes[-4]) / fluxes[-1] if fluxes[-1] > 0 else 0
+        if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising and is_highly_positive:
+            return "UNDERSUB", 2
 
-        # 2. Loop over radii to create the Curve of Growth
-        for a_val in radii:
-            # Scale b proportionally to maintain the galaxy's shape
-            effective_a = a_val * 4 if is_psf else a_val
-            effective_b = effective_a * b_over_a
-            temp_ap = EllipticalAperture((x, y), a=effective_a, b=effective_b, theta=theta)
-            
-            # A. Sum Flux
-            phot_table = aperture_photometry(cog_data, temp_ap, method='exact')
-            raw_flux_mjysr = phot_table['aperture_sum'][0]
-            
-            # B. Error Propagation (Skip for PSF as it has no detector noise)
-            if not is_psf:
-                err_map = np.nan_to_num(aperture_params["err"], nan=0.0, posinf=0.0, neginf=0.0)
-                ap_mask = temp_ap.to_mask(method='exact')
-                det_var = np.nansum(ap_mask.multiply(err_map**2))
-                bkg_err_mjysr = bkg_results["rms"] * np.sqrt(temp_ap.area)
-                total_err_jy = np.sqrt(det_var + bkg_err_mjysr**2) * conv
-            else:
-                total_err_jy = 0.0
-            
-            # C. Store measurements for this radius
-            cog_results.append({
-                "radius_a": a_val,
-                "area_pix": temp_ap.area,
-                "flux_jy": raw_flux_mjysr * conv if not is_psf else raw_flux_mjysr,
-                "flux_err_jy": total_err_jy * conv
-            })
-
-        return cog_results
+        # The dip & bump (background gradient/stripe)
+        tail_fluxes_peak = fluxes[idx_max:]        
+        f_min_after_peak = np.min(tail_fluxes_peak)
+        depth_absolute = f_max - f_min_after_peak
+        is_significant_dip = depth_absolute > (3.0 * flux_err_jy)
+        depth_fraction = depth_absolute / f_max if f_max > 0 else 0
+        
+        # 20% loss after peak is highly unphysical
+        if idx_max != len(fluxes)-1 and depth_fraction > 0.20 and is_significant_dip:  
+            return "ARTEFACT", 3
+        
+        # Clean data
+        return "CLEAN", 0
     
-    def get_filter_column_template(self, filt):
+    
+    def _get_filter_column_template(self, filt):
         """Defines the standard set of columns for any single MIRI band."""
         return {
             # --- Photometry Results ---
@@ -1140,9 +1094,8 @@ class MIRIPipeline:
             f"{filt}_bkg": np.nan,
             f"{filt}_bkg_err": np.nan,
             
-            # --- Quality Control (QC) Flags ---
-            #f"{filt}_qc_level": "UNKNOWN",   # CLEAN, WARNING, or CRITICAL
-            #f"{filt}_qc_reasons": "",       # e.g., "HighSkew|ExtremeTails"
+            # --- Quality Control (QC) Flag ---
+            f"{filt}_qc": 0,
             
             # --- Aperture Geometry ---
             f"{filt}_ap_x": np.nan,
@@ -1150,7 +1103,7 @@ class MIRIPipeline:
             f"{filt}_ap_theta": np.nan,
         }
 
-    def pre_scan_filters(self):
+    def _pre_scan_filters(self):
         """
         Crawls the cutouts directory to identify all MIRI filters available in the dataset.
         """
@@ -1170,96 +1123,40 @@ class MIRIPipeline:
         return sorted_filters
     
 
-    def apply_quality_flagging(self, bkg_residuals):
-        """
-        Performs a multi-variate statistical audit of the background.
-        Returns: (str) Level, (str) Reason String, (dict) Raw Metrics
-        """
-        if len(bkg_residuals) < 200:
-            return "WARNING", "InsufficientPixels", {}
-        
-        if len(bkg_residuals) < 50:
-            return "CRITICAL", "InsufficientPixels", {}
+    
 
-        # --- A. Basic Moments ---
-        res_skew = skew(bkg_residuals)
-        res_kurt = kurtosis(bkg_residuals, fisher=True)
-        
-        # --- B. Robust RMS Ratio (Clipped vs MAD) ---
-        std_val = np.std(bkg_residuals)
-        # MAD scaled to match 1-sigma for a Gaussian
-        mad = np.median(np.abs(bkg_residuals - np.median(bkg_residuals)))
-        robust_std = 1.4826 * mad
-        std_ratio = std_val / robust_std if robust_std > 0 else 1.0
-
-        # --- C. Extreme Tail Fraction (>5-sigma) ---
-        # Note: We use robust_std for the threshold to avoid the outliers masking themselves
-        tail_threshold = 5 * robust_std
-        outliers = np.abs(bkg_residuals) > tail_threshold
-        tail_frac = np.mean(outliers)
-
-        # --- D. Signed Tail Imbalance (Directionality) ---
-        pos_tail = np.sum(bkg_residuals > tail_threshold)
-        neg_tail = np.sum(bkg_residuals < -tail_threshold)
-        
-        # Check for imbalance if we have enough total outliers to be significant
-        imbalance = 0
-        if (pos_tail + neg_tail) > 2:
-            imbalance = abs(pos_tail - neg_tail) / (pos_tail + neg_tail)
-
-        # --- E. Logic-based Flagging ---
-        reasons = []
-        
-        # Thresholds tuned for JWST/MIRI mosaics
-        if abs(res_skew) > 2.5:       reasons.append("HighSkew")
-        if res_kurt > 10.0:           reasons.append("HighKurtosis") # MIRI has high natural kurtosis
-        if std_ratio > 1.5:           reasons.append("NonGaussianWidth")
-        if tail_frac > 0.005:         reasons.append("ExtremeTails")
-        if imbalance > 0.7:           reasons.append("AsymmetricTails")
-
-        # Classification
-        if len(reasons) >= 2 or "AsymmetricTails" in reasons:
-            level = "CRITICAL"
-        elif len(reasons) == 1:
-            level = "WARNING"
-        else:
-            level = "CLEAN"
-
-        return level, "|".join(reasons), {
-            "skew": res_skew, 
-            "kurtosis": res_kurt,
-            "std_ratio": std_ratio, 
-            "tail_frac": tail_frac,
-            "imbalance": imbalance
-        }
-
-    def run_photometry(self, write_to, rescale=True, plot_mosaics=False, plot_psf=False):
+    def run_photometry(self, 
+                       rescale=True,        # Whether to rescale the apertures
+                       save_mosaic=False,   # Whether to save the background diagnostic mosaic
+                       plot_psf=False,      # Whether to plot the PSF with the aperture overlay
+                       save_cog=False,      # Whether to save the Curve of Growth plots
+                       snr_thresh=3.0,      # Relevant for the detection plot
+                       plot_matrix=False
+                       ):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
         
         # Stylised ASCII Header
         print("\n" + "="*60)
-        print("""
+        print(r"""
  ____           _    ____              _ _             _ 
 |  _ \ ___   __| |  / ___|__ _ _ __ __| (_)_ __   __ _| |
 | |_) / _ \ / _` | | |   / _` | '__/ _` | | '_ \ / _` | |
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v3.0")
+        print("                 JWST MIRI PIPELINE v1.0.1")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
         # Pre-scan for catalogue visualisation
-        all_filters = self.pre_scan_filters()
+        all_filters = self._pre_scan_filters()
 
         if rescale == False:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
         
         all_rows = []
-        
-        bkg_floor = []
         
         stored_ids = 0
         
@@ -1268,78 +1165,79 @@ class MIRIPipeline:
             files = self.find_files(target_id)
             if not files: 
                 continue
-            print("\n")
-            print(f"========== Processing galaxy ID {target_id} ==========")
+            
+            print(f"Processing galaxy ID {target_id}...")
+            
+            galaxy_cog_dict = {}
             
             # Base identity for the galaxy
             galaxy_row = {
                 "ID": target_id,
                 "MIRI_ap_a": np.nan,
                 "MIRI_ap_b": np.nan,
-                "MIRI_ap_npix": np.nan,
-                #"Flag_Com": target_id in self.quality_config["has_companion"]
+                "MIRI_ap_npix": np.nan
             }
             
             # Pre-populate with columns for all filters ALREADY discovered
             for filt in all_filters:
-                galaxy_row.update(self.get_filter_column_template(filt))
+                galaxy_row.update(self._get_filter_column_template(filt))
             
             # Track if we've stored general aperture yet
             ap_geometry_stored = False
             
             for filt, file in files.items():
-                print(f"{filt}:")
                 
                 try:
-                    # Perform the photometry steps:
-                    
-                    # 1. Prepare the apertures for MIRI
+                                        
+                    # --- 1. Prepare the apertures for MIRI ---
                     ap_params = self.prepare_aperture(file, rescale=rescale)
                     
-                    # 2. Create background model
-                    bkg_res = self.estimate_background(ap_params)
+                    # --- 2. Create and subtract background model ---
+                    bkg_dict = self.estimate_background(ap_params)
                     
-                    if plot_mosaics is True:
-                        self.plot_background_diagnostic(ap_params, bkg_res)
+                    if save_mosaic is True:
+                        self.plot_background_diagnostic(ap_params, bkg_dict)
                     
-                    # 3. Measure fluxes
-                    measurements = self.measure_flux(ap_params, bkg_res)
+                    # --- 3. Measure fluxes ---
+                    flux_dict = self.measure_flux(ap_params, bkg_dict)
                     
-                    # 4. Compute PSF correction
+                    qc_flag, qc_identifier = self._apply_quality_flagging(flux_dict)              
+                    galaxy_cog_dict[filt] = flux_dict
+                    galaxy_cog_dict[filt]["qc_flag"] = qc_flag
+
+                    # Ensure that the aperture params are available for the plotter
+                    if "ap_params" not in galaxy_cog_dict:
+                        galaxy_cog_dict["ap_params"] = ap_params                
+                    
+                    # --- 5. Compute PSF correction ---
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
-                    # Get (uncorrected) aperture fluxes
-                    apflux = measurements["flux_jy"]                    
-                    apflux_err = measurements["flux_err_jy"]
+                    # --- 6. Group all results and correct them for the PSF ---
+                    apflux = flux_dict["flux_jy"]                    
+                    apflux_err = flux_dict["flux_err_jy"]
+                    apflux_errnominal = flux_dict["nominal_err_jy"]
                     
-                    # Get PSF-corrected fluxes
-                    flux_corr = measurements["flux_jy"] * psf_corr 
-                    flux_err_corr = measurements["flux_err_jy"] * psf_corr
+                    flux_corr = flux_dict["flux_jy"] * psf_corr 
+                    flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     
-                    # --- Convert fluxes into AB magnitudes ---
+                    # Quick check of SNR for the user 
+                    snr = flux_corr / flux_err_corr if flux_err_corr > 0 else 0
+                    
+                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {snr:.2f} | QC = {qc_flag} ({qc_identifier})")
+                    
+                    # --- 7. Convert fluxes into AB magnitudes ---
                     if flux_corr > 0:
                         # constant is 8.90 for Jy and 23.90 for µJy
                         ab_mag = -2.5 * np.log10(flux_corr) + 8.90
                     else:
                         ab_mag = np.nan
-
                     
-                    # Get nominal flux error (from ERR extension)
-                    apflux_errnominal = measurements["nominal_err_jy"]
-                    
-                    # Get local bkg estimates (median + error)
-                    n_pix = measurements["area_pix"]
-                    local_bkg = measurements["bkg_median_jy"] * n_pix
-                    bkg_err = measurements["bkg_err_jy"]
-                    
-                    bkg_floor.append(measurements["median_bkg_res_jy"])
-                    
-                    # Get quality flagging
-                    quality_level = bkg_res["quality_level"]
-                    quality_reasons = bkg_res["quality_reasons"]
-                    quality_metrics = bkg_res["quality_metrics"]
-                    
-                    # --- Store photometric measurements ---
+                    # 8. --- Get background estimates ---
+                    n_pix = flux_dict["n_pix"]
+                    local_bkg = flux_dict["bkg_flux_jy"]
+                    bkg_err = flux_dict["bkg_err_jy"]
+                                        
+                    # --- 9. Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
                     galaxy_row[f"{filt}_abmag"] = ab_mag
@@ -1348,20 +1246,19 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_apflux_errnominal"] = apflux_errnominal
                     galaxy_row[f"{filt}_apcorr"] = psf_corr
                     
-                    # --- Store background statistics ---
+                    # --- 10. Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
-                    # --- Store quality flags ---
-                    #galaxy_row[f"{filt}_qc_level"] = quality_level
-                    #galaxy_row[f"{filt}_qc_reasons"] = quality_reasons
+                    # --- 11. Store quality flag ---
+                    galaxy_row[f"{filt}_qc"] = qc_identifier
                     
-                    # --- Store aperture geometry ---
+                    # --- 12. Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
                     galaxy_row[f"{filt}_ap_x"] = float(ap_params["x"])
                     galaxy_row[f"{filt}_ap_y"] = float(ap_params["y"])
                     
-                    # --- Store "Scalar" values once ---
+                    # --- 13. Store "Scalar" values once ---
                     if not ap_geometry_stored:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
@@ -1371,40 +1268,48 @@ class MIRIPipeline:
                 except Exception as e:
                     print(f"Error processing {target_id} in {filt}: {e}")
             
+            # Optionally save curve of growth plots
+            if save_cog:
+                self._plot_cog(galaxy_cog_dict)    
+            
             stored_ids += 1
             
             # Only add the row if we actually measured something
             if len(galaxy_row) > 1:
                 all_rows.append(galaxy_row)
-
-        print(f"\nMedian local background across {stored_ids} analysed galaxies: ", np.median(bkg_floor)*1e6, "µJy")
-
-        # Convert to DataFrame and save to file
+                
+        # --- 14. Convert to DataFrame and save to file ---
         df = pd.DataFrame(all_rows)
         
-        self.save_catalogue(df, write_to)
+        # --- 15. Save the catalogue with proper masking ---
+        self._save_catalogue(df)
         
-        # Continue by creating detection statistics and storing them in a separate directory
+        # --- 16. Plot galaxy filter matrix ---
+        if plot_matrix is True:
+            # MIRI Coverage
+            self.plot_galaxy_filter_matrix()
+            
+            # MIRI Detections based on SNR threshold
+            self.plot_galaxy_filter_matrix(snr_thresh=snr_thresh)
+        
+        # --- 17. Final message ---
+        print("-" * 40)
+        print(f"✅ FINAL SUMMARY: {stored_ids} galaxies processed")
+        print(f"🛰️  Instrument: JWST/MIRI")
+        print(f"📊 Quality Control: CoG Active")
+        print("-" * 40)
+        print("🎉 Success! Your photometric heart can continue beating peacefully now ❤️‍🩹.")
         
         
-        
-        
-        
-        
-                    
-    def save_catalogue(self, df, base_filename):
+    def _save_catalogue(self, df):
         """Save photometric catalogue with explicit Astropy masking."""
 
         # ---------- CSV ----------
-        csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
-        os.makedirs(csv_dir, exist_ok=True)
-        csv_path = os.path.join(csv_dir, f"{base_filename}.csv")
+        csv_path = os.path.join(self.csv_dir, f"{self.table_name}.csv")
         df.to_csv(csv_path, index=False)
 
         # ---------- FITS ----------
-        fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")
-        os.makedirs(fits_dir, exist_ok=True)
-        self.table_path = os.path.join(fits_dir, f"{base_filename}.fits")
+        table_path = os.path.join(self.fits_dir, f"{self.table_name}.fits")
 
         table = Table()
 
@@ -1429,7 +1334,7 @@ class MIRIPipeline:
                 table[col_name] = np.array(df[col_name].tolist())
 
         table.write(
-            self.table_path,
+            table_path,
             format="fits",
             overwrite=True,
             name="MIRI_PHOTOMETRY"
@@ -1437,9 +1342,133 @@ class MIRIPipeline:
 
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
 
-# ==================================================================================================
-# ====================== END OF PHOTOMETRY - START OF ANALYSIS =====================================
-# ==================================================================================================
+
+    def plot_galaxy_filter_matrix(self, snr_thresh=None, cols=3):
+        """
+        Visualise which galaxies are observed and detected in each band.
+
+        Parameters:
+        -----------
+        snr_thresh : float or None
+            If set, only observations with SNR above this threshold will be coloured.
+             If None, all observations will be coloured regardless of SNR.
+        cols : int
+            Number of subplot columns.
+        """
+        
+        if os.path.exists(self.table_path) is False:
+            print("❌ Error: Photometric table not found. Please run photometry first.")
+            return
+        
+        table = Table.read(self.table_path, format="fits")
+        
+        all_bands = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
+        
+        print("Plotting observation heat map for the following filters:\n", all_bands)
+        
+        pastel_colours = {
+            "F770W": "#a6cee3",
+            "F1000W": "#b2df8a",
+            "F1800W": "#fdbf6f",
+            "F2100W": "#fb9a99",
+        }
+
+        # Safety check so the code doesn't crash if other filters are added in the future
+        for band in all_bands:
+            if band not in pastel_colours:
+                pastel_colours[band] = "#cccccc"  # Default grey for unknown bands
+        
+        galaxy_ids = [str(gid) for gid in table["ID"]]
+        sorted_ids = sorted(galaxy_ids, key=lambda x: int(x))
+        num_galaxies = len(galaxy_ids)
+        chunk_size = (num_galaxies + 3) // cols
+        chunks = [sorted_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)]
+
+        cell_size = 0.6
+        num_filters = len(all_bands)
+        num_rows = chunk_size
+        fig_width = cell_size * num_filters * cols
+        fig_height = cell_size * num_rows * 0.7
+
+        fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
+        axes = axes[0]
+
+        # Create a mapping for quick row lookup
+        table_id_to_idx = {str(row["ID"]): i for i, row in enumerate(table)}
+
+        for ax, g_ids in zip(axes, chunks):
+            matrix = np.zeros((len(g_ids), num_filters), dtype=int)
+            
+            y_labels = []
+            for i, gid in enumerate(g_ids):
+                
+                #Extract galaxy row from the photometric table
+                row_idx = table_id_to_idx[gid]
+                row = table[row_idx]
+                
+                # Create y-labels
+                label = gid
+                y_labels.append(label)
+                available_filters = [
+                    filt for filt in all_bands 
+                    if f"{filt}_flux" in table.colnames and not table[f"{filt}_flux"].mask[row_idx]
+                ]
+                
+                for j, filt in enumerate(all_bands):
+                    
+                    if filt in available_filters:
+                        # Check for Signal-to-noise and quality flag
+                        flux_jy = row[f"{filt}_flux"]
+                        flux_err_jy = row[f"{filt}_flux_err"]
+                        qc_id = row[f"{filt}_qc"]
+
+                        # Determine color (checking for artefacts)
+                        base_colour = pastel_colours.get(filt, "#grey")
+
+                        if qc_id > 0:   # Artefact or background-subtraction issue
+                            rgb = np.array(mcolors.to_rgb(base_colour))
+                            darker_rgb = np.clip(rgb * 0.7, 0, 1)
+                            colour = darker_rgb
+                        else:
+                            colour = base_colour
+
+                        if snr_thresh is not None:
+                            snr = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
+                            if snr >= snr_thresh:
+                                ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+                        else:
+                            ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+
+            ax.set_xlim(0, num_filters)
+            ax.set_ylim(len(g_ids), 0)
+            ax.set_xticks(np.arange(num_filters) + 0.5)
+            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=13)
+            ax.set_yticks(np.arange(len(g_ids)) + 0.5)
+            ax.set_yticklabels(y_labels, fontsize=13)
+
+            # Add horizontal grid lines
+            for y in np.arange(len(g_ids)):
+                ax.axhline(y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10)
+
+            # Vertical lines at column boundaries
+            for x in np.arange(num_filters + 1):
+                ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
+        
+        if snr_thresh is not None:
+            plt.suptitle(f"MIRI Detections", fontsize=24, y=0.99)
+            figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
+        else:
+            plt.suptitle(f"MIRI Coverage", fontsize=24, y=0.99)
+            figname = os.path.join(self.detection_dir, f"miri_obs.png")
+            
+        plt.tight_layout()
+        fig_path = os.path.join(self.detection_dir, figname)
+        plt.savefig(fig_path, dpi=150)
+        plt.show()
+        
+        print(f"\n💾 Saved observation matrix to: {fig_path}\n")
+
+
 
     @staticmethod
     def compare_aperture_statistics(table_small_path, table_big_path, rescale_config_path=None, 
@@ -1653,114 +1682,6 @@ class MIRIPipeline:
         plt.show()
         plt.close()
 
-
-    def run_cog_analysis(self, gid, radii, cog_dir, overplot_psf=False):
-        """Function to perform Curve of Growth analysis for extended sources"""
-
-        # Find files associated with galaxy ID
-        files = self.find_files(gid)
-        
-        if files is None:
-            return None
-        
-        if len(files) < 2:
-            return None
-        
-        # Define output directory
-        cog_dir = os.path.join(self.output_dir, "apertures", cog_dir)
-        os.makedirs(cog_dir, exist_ok=True)
-        
-        cog_results = {}
-        cog_results_psf = {}
-        
-        for filt, file in files.items():
-            try:
-                # 1. Prepare the apertures for MIRI
-                ap_params = self.prepare_aperture(file, rescale=True)
-                
-                # 2. Create background model
-                bkg_res = self.estimate_background(ap_params)
-                
-                # 3. Measure fluxes by performing Curve of Growth (CoG) analysis
-                measurements = self.measure_flux_cog(ap_params, bkg_res, radii)
-            
-                cog_results[filt] = measurements
-                cog_results["meta"] = ap_params
-            
-                if overplot_psf:
-                    psf_path = os.path.join(self.psf_dir, f"PSF_MIRI_{filt}.fits")
-                    with fits.open(psf_path) as psf_hdul:
-                        psf_data = psf_hdul[3].data
-                    measurements_psf = self.measure_flux_cog(ap_params, bkg_res, radii, psf_data=psf_data)
-
-                    cog_results_psf[filt] = measurements_psf
-                    cog_results_psf["meta"] = ap_params
-                    
-            except Exception as e:
-                print(f"Error processing {gid} in {filt}: {e}")
-                
-        # Plotting Logic
-        if not cog_results:
-            return
-        
-        plt.figure(figsize=(8, 5))
-        
-        # --- AUTOMATED COLOUR LOGIC ---
-        # Setup normalisation based on MIRI wavelength range (5 to 26 microns)
-        norm = mcolors.Normalize(vmin=5.6, vmax=25.5)
-        colormap = cm.get_cmap('jet')
-        
-        # Track available filters to avoid plotting the 'meta' key
-        available_filters = [f for f in cog_results.keys() if f != "meta"]
-        ap_meta = cog_results["meta"]
-        
-        # Sort filters by wavelength so the legend looks organized
-        available_filters.sort(key=lambda x: self.wavelength_map.get(x, 0))
-
-        for filt in available_filters:
-            w_val = self.wavelength_map.get(filt, 15.0)
-            line_color = colormap(norm(w_val))
-            
-            if overplot_psf:
-                # Use normalised flux for direct shape comparison
-                galaxy_flux = [r['flux_jy'] for r in cog_results[filt]]
-                psf_flux = [r['flux_jy'] for r in cog_results_psf[filt]]
-                
-                y_galaxy = galaxy_flux / np.max(galaxy_flux)
-                y_psf = psf_flux / np.max(psf_flux)
-                
-                plt.plot(radii, y_galaxy, label=f'{filt}', color=line_color, 
-                        marker='o', markersize=3, lw=2, alpha=0.9)
-                plt.plot(radii, y_psf, color=line_color, 
-                        linestyle='--', lw=1.5, alpha=0.7)
-                plt.ylabel("Normalised Cumulative Flux")
-            else:
-                # Use absolute units if not overplotting
-                y_galaxy = [r['flux_jy'] * 1e6 for r in cog_results[filt]]
-                plt.plot(radii, y_galaxy, label=filt, color=line_color, 
-                        marker='o', markersize=3, lw=2, alpha=0.9)
-                plt.ylabel("Cumulative Flux [µJy]")
-
-        # Use 'a' for Big Aperture and your previous 'a' (before +8) for Small
-        # Adjust these keys based on how you stored them in prepare_aperture
-        small_limit = ap_meta["a_orig"]
-        big_limit = ap_meta["a"]
-
-        plt.axvline(small_limit, color='orange', linestyle='--', label='Small Aperture Limit', alpha=0.8)
-        plt.axvline(big_limit, color='dodgerblue', linestyle='--', label='Big Aperture Limit', alpha=0.8)
-        
-        plt.xlabel("Semi-major axis (pixels)")
-        plt.ylabel("Cumulative Flux [µJy]")
-        plt.title(f"Curve of Growth (CoG) Analysis: {gid}")
-        plt.legend()
-        plt.grid(alpha=0.2)
-        
-        fname = f"{gid}_cog_psf.png" if overplot_psf else f"{gid}_cog.png"
-        save_path = os.path.join(cog_dir, fname)
-        plt.savefig(save_path, dpi=200, bbox_inches='tight')
-        plt.close() # Close figure to free memory
-        
-        return cog_results
     
     @staticmethod
     def get_detection_stats(table_path, out_dir, snr=3.0):
@@ -1801,146 +1722,78 @@ class MIRIPipeline:
             
         return nondetections
             
+    
+
     @staticmethod
-    def plot_galaxy_filter_matrix(
-        table_path, fig_path, title=None, nondetections=None, cols=4
-    ):
+    def empirical_aperture_rms(img, aperture_params, n_random=200, valid_frac=0.8):
         """
-        Visualise which galaxies are observed and detected in which filters,
-        but using a dictionary of *non-detections* instead of detections.
+        Estimate RMS by placing random elliptical apertures on the image.
 
-        Parameters:
-        -----------
-        table_path : str
-            Path to the FITS file.
-        fig_path : str
-            Path to the output file.
-        title : str, optional
-            Title of the plot.
-        nondetections : dict, optional
-            Dictionary mapping filter names to lists of galaxy IDs that were NOT detected.
-        cols : int
-            Number of subplot columns.
+        Parameters
+        ----------
+        img : 2D array
+            Background-subtracted + masked cutout image.
+        aperture_params : dict
+            Dictionary with keys ['a', 'b', 'theta', 'x_center', 'y_center'].
+        n_random : int
+            Number of random apertures to place.
+        valid_frac : float
+            Minimum fraction of aperture pixels that must be valid (not NaN)
+        Returns
+        -------
+        rms : float
+            Empirical RMS of aperture fluxes.
         """
-        table = Table.read(table_path, format="fits")
-        table.info()
-        filter_order = ["F770W", "F1000W", "F1800W", "F2100W"]
-        pastel_colours = {
-            "F770W": "#a6cee3",
-            "F1000W": "#b2df8a",
-            "F1800W": "#fdbf6f",
-            "F2100W": "#fb9a99",
-        }
+        ny, nx = img.shape
+        aperturesums = []
+        attempts = 0
+        max_attempts = n_random * 20
 
-        galaxy_ids = [str(gid) for gid in table["ID"]]
-        num_galaxies = len(galaxy_ids)
-        chunk_size = (num_galaxies + 3) // cols
-        chunks = [
-            galaxy_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)
-        ]
+        # aperture shape (scale only, will move centres + vary theta)
+        a = aperture_params["a"]
+        b = aperture_params["b"]
+        theta_ref = aperture_params["theta"]
+        x0, y0 = aperture_params["x"], aperture_params["y"]
 
-        print(f"Number of unique IDs in table: {len(set(str(row['ID']) for row in table))}")
-        print(f"Number of IDs in galaxy_ids: {len(galaxy_ids)}")
-        print(f"Chunks: {[len(c) for c in chunks]}")
+        while len(aperturesums) < n_random and attempts < max_attempts:
+            attempts += 1
 
-        cell_size = 0.5
-        num_cols = len(filter_order)
-        num_rows = chunk_size
-        fig_width = cell_size * num_cols * cols
-        fig_height = cell_size * num_rows * 0.7
+            # random centre inside image (avoid edges)
+            x = random.uniform(a + 2, nx - a - 2)
+            y = random.uniform(b + 2, ny - b - 2)
 
-        fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
-        axes = axes[0]
+            # skip if centre falls on masked pixel
+            if np.isnan(img[int(y), int(x)]):
+                continue
 
-        for ax, g_ids in zip(axes, chunks):
-            matrix = np.zeros((len(g_ids), len(filter_order)), dtype=int)
-            g_index_map = {gid: i for i, gid in enumerate(g_ids)}
-            table_id_to_row = {str(row["ID"]): ii for ii, row in enumerate(table)}
+            # random angle variation (around reference theta)
+            theta = random.uniform(0, 2 * np.pi)
 
-            for row in table:
-                gid = str(row["ID"])
-                if gid not in g_index_map:
-                    continue
-                g_ii = g_index_map[gid]
-                filters = row["Filters"]
-                if isinstance(filters, (list, np.ndarray)):
-                    filters = [
-                        f.decode() if isinstance(f, bytes) else str(f) for f in filters
-                    ]
-                else:
-                    filters = [f.strip() for f in str(filters).split(",") if f.strip()]
+            aperture = EllipticalAperture((x, y), a, b, theta)
+            aperture_mask = aperture.to_mask(method="exact")
+            aperture_data = aperture_mask.multiply(img)
+            aperture_data_mask = aperture_mask.data
 
-                for filt in filters:
-                    if filt in filter_order:
-                        f_ii = filter_order.index(filt)
+            # Accept apertures with sufficient valid pixels
+            n_valid = np.sum(np.isfinite(aperture_data[aperture_data_mask > 0]))
+            n_total = np.sum(aperture_data_mask > 0)
+            frac_valid = n_valid / n_total if n_total > 0 else 0
+            if frac_valid < valid_frac:
+                continue
 
-                        # Inverted logic:
-                        # Galaxy is marked if it's covered AND not in nondetections for that filter
-                        if nondetections is None or int(gid) not in nondetections.get(
-                            filt, []
-                        ):
-                            matrix[g_ii, f_ii] = 1
+            phot_table = aperture_photometry(img, aperture, method="exact")
+            flux = phot_table["aperture_sum"][0]
 
-            # Draw rectangles
-            for i in range(matrix.shape[0]):
-                for j in range(matrix.shape[1]):
-                    if matrix[i, j] == 1:
-                        base_colour = pastel_colours[filter_order[j]]
-                        gid = g_ids[i]
-                        row = table[table_id_to_row[gid]]
+            if n_valid > 0:
+                flux *= n_total / n_valid  # scale correction
 
-                        flag_art_array = row["Flag_Art"]
-                        flag_art = False
-                        if flag_art_array is not None and len(flag_art_array) == len(
-                            filter_order
-                        ):
-                            flag_art = flag_art_array[j]
+            if np.isfinite(flux):
+                aperturesums.append(flux)
 
-                        if flag_art:
-                            rgb = np.array(mcolors.to_rgb(base_colour))
-                            darker_rgb = np.clip(rgb * 0.7, 0, 1)
-                            colour = darker_rgb
-                        else:
-                            colour = base_colour
-
-                        ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
-
-            # Labels with asterisk for companions
-            y_labels = []
-            for i, gid in enumerate(g_ids):
-                row = table[table_id_to_row[gid]]
-                label = gid
-                if row["Flag_Com"] == True:
-                    label += "*"
-                y_labels.append(label)
-
-            ax.set_xlim(0, len(filter_order))
-            ax.set_ylim(len(g_ids), 0)
-            ax.set_xticks(np.arange(len(filter_order)) + 0.5)
-            ax.set_xticklabels(filter_order, rotation=45, ha="right", fontsize=11)
-            ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-            ax.set_yticklabels(y_labels, fontsize=11)
-
-            # Add horizontal grid lines
-            for y in np.arange(len(g_ids)):
-                ax.axhline(
-                    y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10
-                )
-
-            # Vertical lines at column boundaries
-            for x in np.arange(len(filter_order) + 1):
-                ax.axvline(
-                    x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10
-                )
-
-            print(f"Plotting {len(g_ids)} galaxies in this panel")
-
-        total_plotted = sum(len(c) for c in chunks)
-        print(f"Total plotted galaxies: {total_plotted}")
-
-        # plt.suptitle(title, fontsize=28)
-        plt.tight_layout()
-        os.makedirs(os.path.dirname(fig_path), exist_ok=True)
-        plt.savefig(fig_path, dpi=150)
-        plt.show()
- 
+        if len(aperturesums) < max(10, n_random // 4):
+            # fallback: pixel rms scaled to aperture area
+            print("         ⚠️ Too few valid random apertures, using propagated errors")
+            return None
+        
+        return median_abs_deviation(aperturesums, scale='normal')
+            

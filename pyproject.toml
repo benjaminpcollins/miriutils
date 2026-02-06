@@ -10,7 +10,7 @@ authors = [
 ]
 description = "Custom Python library for processing and analyzing JWST/MIRI data"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "BSD-3-Clause"}
 classifiers = [
     "Programming Language :: Python :: 3",
