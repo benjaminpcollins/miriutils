@@ -118,11 +118,15 @@ warnings.filterwarnings('ignore', category=NoDetectionsWarning)
 
 # --- Standalone Utility Functions ---
 class MIRIPipeline:
-    def __init__(self, ids_to_process, cutouts_dir, photometry_dir, nircam_dir, aperture_table, psf_dir=None, scaling_exceptions_file=None):
-        
-        # Load aperture table
-        self.master_table = Table.read(aperture_table)
-        self.table_path = None  # To be overwritten in save_catalogue()
+    def __init__(self, 
+                 table_name,
+                 ids_to_process, 
+                 cutouts_dir, 
+                 photometry_dir, 
+                 nircam_dir, 
+                 aperture_table, 
+                 psf_dir=None, 
+                 scaling_exceptions_file=None):
         
         self.all_ids = ids_to_process
         
@@ -144,6 +148,17 @@ class MIRIPipeline:
         self.output_dir = photometry_dir
         self.nircam_dir = nircam_dir        
         
+        # Load aperture table
+        self.master_table = Table.read(aperture_table)
+        
+        # Output directories for the photometry tables (both CSV and FITS)
+        self.csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
+        self.fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")   
+        
+        # Specify table path
+        self.table_path = os.path.join(self.fits_dir, f"{table_name}.fits")
+        self.table_name = table_name
+        
         # Default PSF directory if none provided
         if psf_dir is None:
             self.psf_dir = os.path.join(self.output_dir, "psfs")
@@ -157,9 +172,9 @@ class MIRIPipeline:
         self.phot_table_dir = os.path.join(self.output_dir, "phot_tables")
         self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
         self.vis_dir = os.path.join(self.output_dir, "vis_data")
-        self.detection_dir = os.path.join(self.output_dir, "vis_data")
+        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
         
-        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir]:
+        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir, self.csv_dir, self.fits_dir]:
             os.makedirs(dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
@@ -677,7 +692,7 @@ class MIRIPipeline:
             "median": background_median,
             "median_res": np.median(res_vals),
             "rms": background_rms,
-            "emp_rms": emp_rms if emp_rms is not None else np.nan,
+            "emp_rms": emp_rms if emp_rms is not None else 0.0,
             "data": data,
             "bkg_plane": background_plane,
             "subtracted": data_bkgsub,
@@ -899,11 +914,7 @@ class MIRIPipeline:
         flux_jy = raw_flux_mjysr * conv
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
         total_err_jy = total_err_mjysr * conv
-        
-        if np.isnan(emp_rms):
-            emp_rms_jy = np.nan  # Handle NaN case for empirical RMS
-        else:
-            emp_rms_jy = emp_rms * conv
+        emp_rms_jy = emp_rms * conv
             
         # This is the "Nominal" error in Jy
         nominal_err_jy = np.sqrt(detector_variance) * conv
@@ -958,11 +969,7 @@ class MIRIPipeline:
         return {
             # Science fluxes and uncertainties
             "flux_jy": flux_jy,
-            "flux_err_jy": total_err_jy if np.isnan(emp_rms_jy) else emp_rms_jy,
-            
-            # Signal-to-noise ratios (standard & empirical)
-            "snr": flux_jy / total_err_jy if total_err_jy > 0 else 0,
-            "emp_snr": flux_jy / emp_rms_jy if not np.isnan(emp_rms_jy) else np.nan,
+            "flux_err_jy": max(total_err_jy, emp_rms_jy), # Use propagated error if it's smaller than the empirical RMS
             
             # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
@@ -1050,8 +1057,6 @@ class MIRIPipeline:
         # Actual flux of the observation
         flux_jy = flux_dict["flux_jy"]          # Measured flux
         flux_err_jy = flux_dict["flux_err_jy"]  # Propagated error
-        emp_rms_jy = flux_dict["emp_rms_jy"]    # Empirical RMS
-        emp_snr = flux_dict["emp_snr"]          # Empirical SNR
         
         # Extract CoG-fluxes
         fluxes = np.array(flux_dict["cog_fluxes"])
@@ -1074,13 +1079,13 @@ class MIRIPipeline:
         
         # If the curve is significantly negative at the end AND the majority of steps are negative, 
         # it's likely an oversubtraction issue
-        is_deeply_negative = f_min < -3.0 * emp_rms_jy
+        is_deeply_negative = f_min < -3.0 * flux_err_jy
         is_consistently_falling = neg_fraction > 0.80
         if f_final < 0 and is_deeply_negative and is_consistently_falling:
             return "OVERSUB", 1
 
         # If peak is at the end AND the growth in the last 3 steps is still high
-        is_highly_positive = f_max > 3.0 * emp_rms_jy
+        is_highly_positive = f_max > 3.0 * flux_err_jy
         is_consistently_rising = pos_fraction > 0.80
         last_growth = (fluxes[-1] - fluxes[-4]) / fluxes[-1] if fluxes[-1] > 0 else 0
         if idx_max >= num_points - 4 and last_growth > 0.05 and is_consistently_rising and is_highly_positive:
@@ -1090,7 +1095,7 @@ class MIRIPipeline:
         tail_fluxes_peak = fluxes[idx_max:]        
         f_min_after_peak = np.min(tail_fluxes_peak)
         depth_absolute = f_max - f_min_after_peak
-        is_significant_dip = depth_absolute > (3.0 * emp_rms_jy)
+        is_significant_dip = depth_absolute > (3.0 * flux_err_jy)
         depth_fraction = depth_absolute / f_max if f_max > 0 else 0
         
         # 20% loss after peak is highly unphysical
@@ -1116,7 +1121,6 @@ class MIRIPipeline:
             # --- Background Statistics (Annulus) ---
             f"{filt}_bkg": np.nan,
             f"{filt}_bkg_err": np.nan,
-            f"{filt}_emp_rms": np.nan,
             
             # --- Quality Control (QC) Flag ---
             f"{filt}_qc": 0,
@@ -1150,11 +1154,11 @@ class MIRIPipeline:
     
 
     def run_photometry(self, 
-                       write_to,            # Where to save the final photometry table (CSV and FITS)
                        rescale=True,        # Whether to rescale the apertures
                        save_mosaic=False,   # Whether to save the background diagnostic mosaic
                        plot_psf=False,      # Whether to plot the PSF with the aperture overlay
-                       save_cog=False       # Whether to save the Curve of Growth plots
+                       save_cog=False,      # Whether to save the Curve of Growth plots
+                       snr_thresh=3.0       # Relevant for the detection plot
                        ):
         """
         Function to do the heavy lifting. Runs the entire photometry
@@ -1301,27 +1305,38 @@ class MIRIPipeline:
             if len(galaxy_row) > 1:
                 all_rows.append(galaxy_row)
                 
-        # --- 7. Convert to DataFrame and save to file ---
+        # --- 14. Convert to DataFrame and save to file ---
         df = pd.DataFrame(all_rows)
         
-        self._save_catalogue(df, write_to)
+        # --- 15. Save the catalogue with proper masking ---
+        self._save_catalogue(df)
         
-        # Continue by creating detection statistics and storing them in a separate directory
+        # --- 16. Plot galaxy filter matrix ---
+        
+        # MIRI Coverage
+        self.plot_galaxy_filter_matrix()
+        
+        # MIRI Detections based on SNR threshold
+        self.plot_galaxy_filter_matrix(snr_thresh=snr_thresh)
+        
+        # --- 17. Final message ---
+        print("-" * 40)
+        print(f"✅ FINAL SUMMARY: {len(stored_ids)} galaxies processed")
+        print(f"🛰️  Instrument: JWST/MIRI")
+        print(f"📊 Quality Control: CoG Active")
+        print("-" * 40)
+        print("🎉 Success! Your photometric heart can continue beating peacefully now ❤️‍🩹.")
         
         
-    def _save_catalogue(self, df, base_filename):
+    def _save_catalogue(self, df):
         """Save photometric catalogue with explicit Astropy masking."""
 
         # ---------- CSV ----------
-        csv_dir = os.path.join(self.output_dir, "phot_tables", "csv")
-        os.makedirs(csv_dir, exist_ok=True)
-        csv_path = os.path.join(csv_dir, f"{base_filename}.csv")
+        csv_path = os.path.join(self.csv_dir, f"{self.table_name}.csv")
         df.to_csv(csv_path, index=False)
 
         # ---------- FITS ----------
-        fits_dir = os.path.join(self.output_dir, "phot_tables", "fits")
-        os.makedirs(fits_dir, exist_ok=True)
-        self.table_path = os.path.join(fits_dir, f"{base_filename}.fits")
+        table_path = os.path.join(self.fits_dir, f"{self.table_name}.fits")
 
         table = Table()
 
@@ -1346,13 +1361,140 @@ class MIRIPipeline:
                 table[col_name] = np.array(df[col_name].tolist())
 
         table.write(
-            self.table_path,
+            table_path,
             format="fits",
             overwrite=True,
             name="MIRI_PHOTOMETRY"
         )
 
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
+
+
+    def plot_galaxy_filter_matrix(self, snr_thresh=None, cols=3):
+        """
+        Visualise which galaxies are observed and detected in each band.
+
+        Parameters:
+        -----------
+        snr_thresh : float or None
+            If set, only observations with SNR above this threshold will be coloured.
+             If None, all observations will be coloured regardless of SNR.
+        cols : int
+            Number of subplot columns.
+        """
+        
+        if os.path.exists(self.table_path) is False:
+            print("❌ Error: Photometric table not found. Please run photometry first.")
+            return
+        
+        table = Table.read(self.table_path, format="fits")
+        
+        all_bands = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
+        
+        print("Plotting observation heat map for the following filters:\n", all_bands)
+        
+        pastel_colours = {
+            "F770W": "#a6cee3",
+            "F1000W": "#b2df8a",
+            "F1800W": "#fdbf6f",
+            "F2100W": "#fb9a99",
+        }
+
+        # Safety check so the code doesn't crash if other filters are added in the future
+        for band in all_bands:
+            if band not in pastel_colours:
+                pastel_colours[band] = "#cccccc"  # Default grey for unknown bands
+        
+        galaxy_ids = [str(gid) for gid in table["ID"]]
+        sorted_ids = sorted(galaxy_ids, key=lambda x: int(x))
+        num_galaxies = len(galaxy_ids)
+        chunk_size = (num_galaxies + 3) // cols
+        chunks = [sorted_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)]
+
+        cell_size = 0.6
+        num_filters = len(all_bands)
+        num_rows = chunk_size
+        fig_width = cell_size * num_filters * cols
+        fig_height = cell_size * num_rows * 0.7
+
+        fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
+        axes = axes[0]
+
+        # Create a mapping for quick row lookup
+        table_id_to_idx = {str(row["ID"]): i for i, row in enumerate(table)}
+
+        for ax, g_ids in zip(axes, chunks):
+            matrix = np.zeros((len(g_ids), num_filters), dtype=int)
+            
+            y_labels = []
+            for i, gid in enumerate(g_ids):
+                
+                #Extract galaxy row from the photometric table
+                row_idx = table_id_to_idx[gid]
+                row = table[row_idx]
+                
+                # Create y-labels
+                label = gid
+                y_labels.append(label)
+                available_filters = [
+                    filt for filt in all_bands 
+                    if f"{filt}_flux" in table.colnames and not table[f"{filt}_flux"].mask[row_idx]
+                ]
+                
+                for j, filt in enumerate(all_bands):
+                    
+                    if filt in available_filters:
+                        # Check for Signal-to-noise and quality flag
+                        flux_jy = row[f"{filt}_flux"]
+                        flux_err_jy = row[f"{filt}_flux_err"]
+                        qc_id = row[f"{filt}_qc"]
+
+                        # Determine color (checking for artefacts)
+                        base_colour = pastel_colours.get(filt, "#grey")
+
+                        if qc_id > 0:   # Artefact or background-subtraction issue
+                            rgb = np.array(mcolors.to_rgb(base_colour))
+                            darker_rgb = np.clip(rgb * 0.7, 0, 1)
+                            colour = darker_rgb
+                        else:
+                            colour = base_colour
+
+                        if snr_thresh is not None:
+                            snr = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
+                            if snr >= snr_thresh:
+                                ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+                        else:
+                            ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
+
+            ax.set_xlim(0, num_filters)
+            ax.set_ylim(len(g_ids), 0)
+            ax.set_xticks(np.arange(num_filters) + 0.5)
+            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=13)
+            ax.set_yticks(np.arange(len(g_ids)) + 0.5)
+            ax.set_yticklabels(y_labels, fontsize=13)
+
+            # Add horizontal grid lines
+            for y in np.arange(len(g_ids)):
+                ax.axhline(y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10)
+
+            # Vertical lines at column boundaries
+            for x in np.arange(num_filters + 1):
+                ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
+        
+        if snr_thresh is not None:
+            plt.suptitle(f"MIRI Detections", fontsize=24, y=0.99)
+            figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
+        else:
+            plt.suptitle(f"MIRI Coverage", fontsize=24, y=0.99)
+            figname = os.path.join(self.detection_dir, f"miri_obs.png")
+            
+        plt.tight_layout()
+        fig_path = os.path.join(self.detection_dir, figname)
+        plt.savefig(fig_path, dpi=150)
+        plt.show()
+        
+        print(f"\n💾 Saved observation matrix to: {fig_path}\n")
+
 
 
     @staticmethod
@@ -1677,139 +1819,11 @@ class MIRIPipeline:
 
         if len(aperturesums) < max(10, n_random // 4):
             # fallback: pixel rms scaled to aperture area
-            print("📉 Too few valid random apertures, using pixel RMS fallback")
+            print("         ⚠️ Too few valid random apertures, using propagated errors")
             return None
         
         return median_abs_deviation(aperturesums, scale='normal')
             
-            
-    @staticmethod
-    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, detection_plot=False, cols=3):
-        """
-        Visualise which galaxies are observed and detected in which filters,
-        but using a dictionary of *non-detections* instead of detections.
-
-        Parameters:
-        -----------
-        table_path : str
-            Path to the FITS file.
-        fig_path : str
-            Path to the output file.
-        title : str, optional
-            Title of the plot.
-        cols : int
-            Number of subplot columns.
-        """
-        table = Table.read(table_path, format="fits")
-        table.info()
-        
-        all_bands = [c.replace('_qc', '') for c in table.colnames if c.endswith('_qc')]
-        
-        print("Plotting observation heat map for the following filters:\n", all_bands)
-        
-        pastel_colours = {
-            "F770W": "#a6cee3",
-            "F1000W": "#b2df8a",
-            "F1800W": "#fdbf6f",
-            "F2100W": "#fb9a99",
-        }
-
-        galaxy_ids = [str(gid) for gid in table["ID"]]
-        sorted_ids = sorted(galaxy_ids, key=lambda x: int(x))
-        num_galaxies = len(galaxy_ids)
-        chunk_size = (num_galaxies + 3) // cols
-        chunks = [sorted_ids[i : i + chunk_size] for i in range(0, num_galaxies, chunk_size)]
-
-        print(f"Number of unique IDs in the table: {len(set(str(row['ID']) for row in table))}")
-        print(f"Number of IDs in galaxy_ids: {len(galaxy_ids)}")
-        print(f"Chunks: {[len(c) for c in chunks]}")
-
-        cell_size = 0.6
-        num_filters = len(all_bands)
-        num_rows = chunk_size
-        fig_width = cell_size * num_filters * cols
-        fig_height = cell_size * num_rows * 0.7
-
-        fig, axes = plt.subplots(1, cols, figsize=(fig_width, fig_height), squeeze=False)
-        axes = axes[0]
-
-        # Create a mapping for quick row lookup
-        table_id_to_idx = {str(row["ID"]): i for i, row in enumerate(table)}
-
-        for ax, g_ids in zip(axes, chunks):
-            matrix = np.zeros((len(g_ids), num_filters), dtype=int)
-            
-            y_labels = []
-            for i, gid in enumerate(g_ids):
-                
-                #Extract galaxy row from the photometric table
-                row_idx = table_id_to_idx[gid]
-                row = table[row_idx]
-                
-                # Create y-labels
-                label = gid
-                y_labels.append(label)
-                available_filters = [
-                    filt for filt in all_bands 
-                    if f"{filt}_flux" in table.colnames and not table[f"{filt}_flux"].mask[row_idx]
-                ]
-                
-                for j, filt in enumerate(all_bands):
-                    
-                    if filt in available_filters:
-                        # Check for Signal-to-noise and quality flag
-                        flux_jy = row[f"{filt}_flux"]
-                        flux_err_jy = row[f"{filt}_flux_err"]
-                        emp_rms_jy = row[f"{filt}_emp_rms"]
-                        qc_id = row[f"{filt}_qc"]
-
-                        # Determine color (checking for artefacts)
-                        base_colour = pastel_colours.get(filt, "#grey")
-
-                        if qc_id > 0:   # Artefact or background-subtraction issue
-                            rgb = np.array(mcolors.to_rgb(base_colour))
-                            darker_rgb = np.clip(rgb * 0.7, 0, 1)
-                            colour = darker_rgb
-                        else:
-                            colour = base_colour
-
-                        if detection_plot:
-                            snr_prop = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
-                            snr_emp = flux_jy / emp_rms_jy if emp_rms_jy > 0 else 0
-                            if snr_prop >= 3:
-                                
-                                if snr_emp > 0 and snr_emp < 3:
-                                    print(f"ID {gid} ({filt}): Passed Prop ({snr_prop:.1f}) but FAILED Emp ({snr_emp:.1f})")
-                                ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
-                        
-                        else:
-                            ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
-
-            ax.set_xlim(0, num_filters)
-            ax.set_ylim(len(g_ids), 0)
-            ax.set_xticks(np.arange(num_filters) + 0.5)
-            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=12)
-            ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-            ax.set_yticklabels(y_labels, fontsize=12)
-
-            # Add horizontal grid lines
-            for y in np.arange(len(g_ids)):
-                ax.axhline(y=y, color="grey", linestyle="-", linewidth=0.3, alpha=0.5, zorder=10)
-
-            # Vertical lines at column boundaries
-            for x in np.arange(num_filters + 1):
-                ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
-
-            print(f"Plotting {len(g_ids)} galaxies in this panel")
-
-        total_plotted = sum(len(c) for c in chunks)
-        print(f"Total plotted galaxies: {total_plotted}")
-        if title:
-            plt.suptitle(title, fontsize=20, y=0.99)
-        plt.tight_layout()
-        os.makedirs(os.path.dirname(fig_path), exist_ok=True)
-        plt.savefig(fig_path, dpi=150)
-        plt.show()
 
 
     @staticmethod  
