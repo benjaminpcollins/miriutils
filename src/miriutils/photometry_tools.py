@@ -484,6 +484,7 @@ class MIRIPipeline:
         filt = aperture_params["meta"]["filter"]
         is_long_wl = True if self.wavelength_map[filt] > 14.0 else False
         
+        img_h, img_w = data.shape
         yi, xi = np.indices(data.shape)
 
         # 1. Create an two source masks (buffer around the aperture)
@@ -491,7 +492,7 @@ class MIRIPipeline:
         source_mask = source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
         
         # The large source mask prevents the target's own light from biasing the background
-        a_in, b_in = a + 8, b + 8
+        a_in, b_in = a + img_h//10, b + img_h//10
         bkg_source_ap = EllipticalAperture((x_cen, y_cen), a=a_in, b=b_in, theta=theta)
         source_mask_large = bkg_source_ap.to_mask(method='center').to_image(data.shape).astype(bool)
 
@@ -597,9 +598,11 @@ class MIRIPipeline:
             n_random=n_random
             )        
 
+        # Reset kill mask for the CoG analysis
+        kill_mask[source_mask_large] = False
+        
         # Define elliptical annulus for local background estimate 
         # Set dynamic outer radius based on image bounds to prevent crashes
-        img_h, img_w = data.shape
         dist_to_edge = min(x_cen, img_w - x_cen, y_cen, img_h - y_cen)
         a_out = dist_to_edge - 2    # 2 pixel buffer at the image boundaries
         b_out = a_out * 0.9 # Maintain aspect ratio
