@@ -641,7 +641,6 @@ class MIRIPipeline:
                    else aperture_params.get("theta")),
         }
         
-        
         # Save visualisation data to .h5 file
         if save_vis:
             vis_dir = self.vis_dir
@@ -959,7 +958,7 @@ class MIRIPipeline:
         return {
             # Science fluxes and uncertainties
             "flux_jy": flux_jy,
-            "flux_err_jy": total_err_jy,
+            "flux_err_jy": total_err_jy if np.isnan(emp_rms_jy) else emp_rms_jy,
             
             # Signal-to-noise ratios (standard & empirical)
             "snr": flux_jy / total_err_jy if total_err_jy > 0 else 0,
@@ -968,7 +967,6 @@ class MIRIPipeline:
             # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
             "bkg_flux_jy": bkg_flux_jy,
-            "emp_rms_jy": emp_rms_jy,
             "bkg_median_jy": bkg_median_jy,
             "bkg_err_jy": bkg_err_jy,
             "median_bkg_res_jy": median_bkg_res_jy,
@@ -1151,8 +1149,13 @@ class MIRIPipeline:
 
     
 
-    def run_photometry(self, write_to, rescale=True, save_mosaic=False, plot_psf=False, 
-                       radii=np.linspace(2,25,25), save_cog=False):
+    def run_photometry(self, 
+                       write_to,            # Where to save the final photometry table (CSV and FITS)
+                       rescale=True,        # Whether to rescale the apertures
+                       save_mosaic=False,   # Whether to save the background diagnostic mosaic
+                       plot_psf=False,      # Whether to plot the PSF with the aperture overlay
+                       save_cog=False       # Whether to save the Curve of Growth plots
+                       ):
         """
         Function to do the heavy lifting. Runs the entire photometry
         """
@@ -1208,8 +1211,7 @@ class MIRIPipeline:
             for filt, file in files.items():
                 
                 try:
-                    # Perform the photometry steps:
-                    
+                                        
                     # --- 1. Prepare the apertures for MIRI ---
                     ap_params = self.prepare_aperture(file, rescale=rescale)
                     
@@ -1233,63 +1235,53 @@ class MIRIPipeline:
                     # --- 5. Compute PSF correction ---
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
-                    # --- 6. Group all results and add them to the row
-                    # Get (uncorrected) aperture fluxes
+                    # --- 6. Group all results and correct them for the PSF ---
                     apflux = flux_dict["flux_jy"]                    
                     apflux_err = flux_dict["flux_err_jy"]
+                    apflux_errnominal = flux_dict["nominal_err_jy"]
                     
-                    # Get PSF-corrected fluxes
                     flux_corr = flux_dict["flux_jy"] * psf_corr 
                     flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     
-                    if np.isnan(flux_dict["emp_rms_jy"]):
-                        emp_flux_err_corr = np.nan
-                    else:
-                        emp_flux_err_corr = flux_dict["emp_rms_jy"] * psf_corr
-                                        
-                    snr_prop = flux_corr / flux_err_corr if flux_err_corr > 0 else 0
-                    snr_emp = flux_corr / emp_flux_err_corr if emp_flux_err_corr > 0 else snr_prop
+                    # Quick check of SNR for the user 
+                    snr = flux_corr / flux_err_corr if flux_err_corr > 0 else 0
                     
-                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {snr_emp:.2f} | QC = {qc_flag} ({qc_identifier})")
+                    print(f"  - {filt}: Flux = {flux_corr*1e6:.3f} µJy | SNR = {snr:.2f} | QC = {qc_flag} ({qc_identifier})")
                     
-                    # Convert fluxes into AB magnitudes
+                    # --- 7. Convert fluxes into AB magnitudes ---
                     if flux_corr > 0:
                         # constant is 8.90 for Jy and 23.90 for µJy
                         ab_mag = -2.5 * np.log10(flux_corr) + 8.90
                     else:
                         ab_mag = np.nan
-
-                    # Get nominal flux error (from ERR extension)
-                    apflux_errnominal = flux_dict["nominal_err_jy"]
                     
-                    # Get local bkg estimates (median + error)
+                    # 8. --- Get background estimates ---
                     n_pix = flux_dict["n_pix"]
                     local_bkg = flux_dict["bkg_flux_jy"]
                     bkg_err = flux_dict["bkg_err_jy"]
                                         
-                    # --- Store photometric measurements ---
+                    # --- 9. Store photometric measurements ---
                     galaxy_row[f"{filt}_flux"] = flux_corr
                     galaxy_row[f"{filt}_flux_err"] = flux_err_corr
-                    galaxy_row[f"{filt}_emp_rms"] = emp_flux_err_corr
                     galaxy_row[f"{filt}_abmag"] = ab_mag
                     galaxy_row[f"{filt}_apflux"] = apflux
                     galaxy_row[f"{filt}_apflux_err"] = apflux_err
                     galaxy_row[f"{filt}_apflux_errnominal"] = apflux_errnominal
                     galaxy_row[f"{filt}_apcorr"] = psf_corr
                     
-                    # --- Store background statistics ---
+                    # --- 10. Store background statistics ---
                     galaxy_row[f"{filt}_bkg"] = local_bkg
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
-                    # --- Store quality flag ---
+                    # --- 11. Store quality flag ---
                     galaxy_row[f"{filt}_qc"] = qc_identifier
                     
-                    # --- Store aperture geometry ---
+                    # --- 12. Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
                     galaxy_row[f"{filt}_ap_x"] = float(ap_params["x"])
                     galaxy_row[f"{filt}_ap_y"] = float(ap_params["y"])
                     
-                    # --- Store "Scalar" values once ---
+                    # --- 13. Store "Scalar" values once ---
                     if not ap_geometry_stored:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
@@ -1784,10 +1776,10 @@ class MIRIPipeline:
                         if detection_plot:
                             snr_prop = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
                             snr_emp = flux_jy / emp_rms_jy if emp_rms_jy > 0 else 0
-                            if snr_prop >= 5:
-                                if snr_emp < 3:
+                            if snr_prop >= 3:
+                                
+                                if snr_emp > 0 and snr_emp < 3:
                                     print(f"ID {gid} ({filt}): Passed Prop ({snr_prop:.1f}) but FAILED Emp ({snr_emp:.1f})")
-                            if snr_prop >= 5 and snr_emp >= 3:
                                 ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
                         
                         else:
