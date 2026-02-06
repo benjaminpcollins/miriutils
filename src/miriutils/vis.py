@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "astropy",
 #     "matplotlib",
@@ -49,8 +49,8 @@ Example Usage:
 
 
 Author: Benjamin P. Collins
-Date: Jan 2026
-Version: 1.0.1
+Date: Feb 2026
+Version: 2.0.0
 """
 
 import os

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = [
 #     "astropy",
 #     "matplotlib",
@@ -72,6 +72,7 @@ Example usage:
 
     # Run full survey photometry and store FITS and CSV format output tables
     pipeline.run_photometry()
+
 
 Author: Benjamin P. Collins
 Date: Feb 2026
