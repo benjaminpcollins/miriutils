@@ -4,7 +4,6 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "astropy",
-#     "h5py",
 #     "matplotlib",
 #     "numpy",
 #     "pandas",
@@ -42,7 +41,9 @@ Key Capabilities:
     - Provides functions for visualising systematics introduced due to the
       choice of aperture sizes for MIRI.
     - Includes tools for Curve of Growth (CoG) analysis to compare the 
-      physical values to PSF model predictions
+      physical values to PSF model predictions and identify potential detector
+      artefacts
+    - Creates heat map plots of observations and detections across all MIRI bands
 
 Workflow:
 ---------
@@ -51,6 +52,7 @@ Workflow:
     3. Performs exact aperture photometry and background estimation.
     4. Calculates band-specific PSF corrections on an oversampled grid.
     5. Exports a dual-format (FITS/CSV) catalogue with standardised columns.
+    6. Creates heat map plots for observation and detection statistics across all MIRI bands.
 
 Example usage:
 --------------
@@ -60,6 +62,7 @@ Example usage:
     
     # Initialise the pipeline
     pipeline = MiriPipeline(
+        table_name="Phot_Table_MIRI",
         all_ids=ids_to_process,
         cutout_dir="./data/cutouts",
         output_dir="./miri_photometry",
@@ -68,12 +71,11 @@ Example usage:
     )
 
     # Run full survey photometry and store FITS and CSV format output tables
-    pipeline.run_photometry(write_to="Phot_Table_MIRI")
-    
+    pipeline.run_photometry()
 
 Author: Benjamin P. Collins
-Date: Jan 2026
-Version: 1.0.1
+Date: Feb 2026
+Version: 2.0.0
 """
 
 import os
@@ -85,7 +87,6 @@ import random
 
 import numpy as np
 import pandas as pd
-import h5py
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
