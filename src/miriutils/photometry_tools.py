@@ -581,7 +581,7 @@ class MIRIPipeline:
         # Create mask for CoG analysis
         non_sky_mask = ~fit_mask
         kill_mask = non_sky_mask.copy()
-        kill_mask[source_mask_large] = False
+        kill_mask[source_mask_large] = True # THIS DEFINITELY HAS TO BE TRUE TO EXCLUDE THE SOURCE!!!
         
         # Final Plane Generation
         background_plane = alpha * xi + beta * yi + gamma
@@ -1680,7 +1680,7 @@ class MIRIPipeline:
             
             
     @staticmethod
-    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, snr_thresh=None, cols=3):
+    def plot_galaxy_filter_matrix(table_path, fig_path, title=None, detection_plot=False, cols=3):
         """
         Visualise which galaxies are observed and detected in which filters,
         but using a dictionary of *non-detections* instead of detections.
@@ -1749,7 +1749,7 @@ class MIRIPipeline:
                     filt for filt in all_bands 
                     if f"{filt}_flux" in table.colnames and not table[f"{filt}_flux"].mask[row_idx]
                 ]
-                print(gid, available_filters)
+                
                 for j, filt in enumerate(all_bands):
                     
                     if filt in available_filters:
@@ -1769,9 +1769,13 @@ class MIRIPipeline:
                         else:
                             colour = base_colour
 
-                        if snr_thresh:
-                            snr = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
-                            if snr >= snr_thresh:
+                        if detection_plot:
+                            snr_prop = flux_jy / flux_err_jy if flux_err_jy > 0 else 0
+                            snr_emp = flux_jy / emp_rms_jy if emp_rms_jy > 0 else 0
+                            if snr_prop >= 5:
+                                if snr_emp < 3:
+                                    print(f"ID {gid} ({filt}): Passed Prop ({snr_prop:.1f}) but FAILED Emp ({snr_emp:.1f})")
+                            if snr_prop >= 5 and snr_emp >= 3:
                                 ax.add_patch(plt.Rectangle((j, i), 1, 1, color=colour))
                         
                         else:
