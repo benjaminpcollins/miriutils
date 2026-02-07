@@ -76,7 +76,7 @@ Example usage:
 
 Author: Benjamin P. Collins
 Date: Feb 2026
-Version: 2.0.0
+Version: 2.0.1
 """
 
 import os
@@ -887,7 +887,9 @@ class MIRIPipeline:
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
         total_err_jy = total_err_mjysr * conv
         emp_rms_jy = emp_rms * conv
-            
+        
+        print("Emp_RMS:", emp_rms_jy, "Propagated Error:",total_err_jy)
+        
         # This is the "Nominal" error in Jy
         nominal_err_jy = np.sqrt(detector_variance) * conv
         
@@ -941,7 +943,7 @@ class MIRIPipeline:
         return {
             # Science fluxes and uncertainties
             "flux_jy": flux_jy,
-            "flux_err_jy": max(total_err_jy, emp_rms_jy), # Use propagated error if it's smaller than the empirical RMS
+            "flux_err_jy": max(total_err_jy, emp_rms_jy), # Use propagated error if it's bigger than the empirical RMS
             
             # Background statistics and aperture area (just to be sure)
             "n_pix": source_ap.area,
@@ -1146,7 +1148,7 @@ class MIRIPipeline:
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v1.0.1")
+        print("                 JWST MIRI PIPELINE v2.0.1")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         

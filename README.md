@@ -1,8 +1,8 @@
 # miriutils
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18378612.svg)](https://doi.org/10.5281/zenodo.18378612)
+[![DOI](https://doi.org/10.5281/zenodo.18378611.svg)](https://doi.org/10.5281/zenodo.18378611)
 [![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
 **miriutils** is a Python library designed for high-fidelity processing, astrometric alignment, and photometric analysis of JWST/MIRI data. Originally developed for the Blue Jay survey, it provides a streamlined pipeline to move from fully calibrated product level 3 mosaics to publication-ready photometric catalogues for JWST/MIRI.
 
