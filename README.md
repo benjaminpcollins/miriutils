@@ -1,6 +1,6 @@
 # miriutils
 
-[![DOI](https://doi.org/10.5281/zenodo.18378611.svg)](https://doi.org/10.5281/zenodo.18378611)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18378611.svg)](https://doi.org/10.5281/zenodo.18378611)
 [![License](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 
