@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miriutils"
-version = "1.0.1"
+version = "2.0.1"
 authors = [
   { name="Benjamin Philip Collins", email="benjamin.p.collins@icloud.com" },
 ]
-description = "Custom Python library for processing and analyzing JWST/MIRI data"
+description = "Custom Python library for processing and analysing JWST/MIRI data"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "BSD-3-Clause"}
@@ -29,7 +29,6 @@ dependencies = [
     "seaborn",
     "reproject",
     "stpsf",
-    "h5py",
 ]
 
 [tool.setuptools.packages.find]
@@ -37,4 +36,3 @@ where = ["src"]
 
 [project.urls]
 "Homepage" = "https://github.com/benjaminpcollins/miriutils"
-"Bug Tracker" = "https://github.com/benjaminpcollins/miriutils/issues"

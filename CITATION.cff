@@ -22,19 +22,17 @@ abstract: >-
   The package provides a streamlined workflow through the
   following core components:
 
-
   - Cutout Production: miricut.py includes the CutoutManager
   class which handles file selection, coordinate matching of
   sources and cutout production in a straightforward way,
   preserving all relevant FITS extensions of the original
   mosaics.
 
-   - RGB Image Visualisation: All tools related to the creation of RGB composite images are stored in vis.py with a fallback on NIRCam/F444W images when multiple MIRI bands are not available
+  - RGB Image Visualisation: All tools related to the creation of RGB composite images are stored in vis.py with a fallback on NIRCam/F444W images when multiple MIRI bands are not available
 
   - Astrometric Calibration: The astrometry_utils.py module
   provides specialised tools for precise coordinate
   alignment and header updates.
-
 
   - Photometry & Pipeline Management: Centered around the
   MIRIPipeline class and photometry_tools.py, it automates
@@ -46,5 +44,5 @@ keywords:
   - JWST/NIRCam
 license: BSD-3-Clause
 commit: 34de58a448a1cd5be56fa378ea17ca724373305b
-version: 1.0.1
-date-released: '2026-01-26'
+version: 2.0.1
+date-released: '2026-02-07'

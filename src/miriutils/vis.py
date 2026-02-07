@@ -50,7 +50,7 @@ Example Usage:
 
 Author: Benjamin P. Collins
 Date: Feb 2026
-Version: 2.0.0
+Version: 2.0.1
 """
 
 import os
