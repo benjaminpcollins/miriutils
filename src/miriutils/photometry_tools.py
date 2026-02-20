@@ -1345,7 +1345,7 @@ class MIRIPipeline:
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
 
 
-    def plot_galaxy_filter_matrix(self, snr_thresh=None, cols=3):
+    def plot_galaxy_filter_matrix(self, snr_thresh=None, figname=None, cols=3):
         """
         Visualise which galaxies are observed and detected in each band.
 
@@ -1354,8 +1354,10 @@ class MIRIPipeline:
         snr_thresh : float or None
             If set, only observations with SNR above this threshold will be coloured.
              If None, all observations will be coloured regardless of SNR.
-        cols : int
-            Number of subplot columns.
+        figname : str, optional
+            Optionally provide a name for the figure.
+        cols : int, optional
+            Number of subplot columns. Defaults to 3.
         """
         
         if os.path.exists(self.table_path) is False:
@@ -1444,9 +1446,9 @@ class MIRIPipeline:
             ax.set_xlim(0, num_filters)
             ax.set_ylim(len(g_ids), 0)
             ax.set_xticks(np.arange(num_filters) + 0.5)
-            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=13)
+            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=15)
             ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-            ax.set_yticklabels(y_labels, fontsize=13)
+            ax.set_yticklabels(y_labels, fontsize=15)
 
             # Add horizontal grid lines
             for y in np.arange(len(g_ids)):
@@ -1457,11 +1459,17 @@ class MIRIPipeline:
                 ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
         
         if snr_thresh is not None:
-            plt.suptitle(f"MIRI Detections", fontsize=24, y=0.99)
-            figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
+            plt.suptitle(f"MIRI Detections", fontsize=28, y=0.99)
+            if figname is not None:
+                figname = os.path.join(self.detection_dir, figname)
+            else:
+                figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
         else:
-            plt.suptitle(f"MIRI Coverage", fontsize=24, y=0.99)
-            figname = os.path.join(self.detection_dir, f"miri_obs.png")
+            plt.suptitle(f"MIRI Coverage", fontsize=28, y=0.99)
+            if figname is not None:
+                figname = os.path.join(self.detection_dir, figname)
+            else:
+                figname = os.path.join(self.detection_dir, f"miri_obs.png")
             
         plt.tight_layout()
         fig_path = os.path.join(self.detection_dir, figname)
