@@ -171,13 +171,12 @@ class MIRIPipeline:
         
         self.aperture_dir = None
         self.mosaic_dir = None
+        self.cog_dir = None
+        self.detection_dir = None
+
         self.phot_table_dir = os.path.join(self.output_dir, "phot_tables")
-        self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
-        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
-        
-        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir, self.csv_dir, self.fits_dir]:
-            if dir:
-                os.makedirs(dir, exist_ok=True)
+        os.makedirs(self.csv_dir, exist_ok=True)
+        os.makedirs(self.fits_dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
         if scaling_exceptions_file is None:
@@ -188,7 +187,10 @@ class MIRIPipeline:
         
         self.scaling_exceptions_path = scaling_exceptions
         self.scaling_exceptions = self._initialise_scaling_config()
-
+        
+        # Placeholder for adding a custom scaling factor to the fluxes if needed
+        self.flux_scaling_factor = 1.0
+        self.added_flux_error = 0.0
 
     def _initialise_scaling_config(self):
         """Creates a template CSV if missing; otherwise loads existing values."""
@@ -886,16 +888,29 @@ class MIRIPipeline:
         # Background modelling uncertainty already calculated in estimate_background
         bkg_err_mjysr = bkg_results["rms"] * np.sqrt(source_ap.area)
         
-        # Combine in quadrature
+        # Combine in quadrature (Detector + Background Modelling)
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
+        
+        # --- NEW SCALING AND ERROR PADDING LOGIC ---
+        # 1. Apply the empirical scaling factor (e.g. 1.182)
+        flux_scaled_mjysr = raw_flux_mjysr * self.flux_scaling_factor
+        
+        # 2. Add the Intrinsic Scatter (MAD) in quadrature to the error
+        # This accounts for the ~11% uncertainty in the "extendedness" correction
+        # We use the scaled flux as the base for the systematic error component
+        intrinsic_scatter = 0.110  # This matches your MAD result
+        systematic_err_mjysr = flux_scaled_mjysr * intrinsic_scatter
+        
+        # Update the total error budget
+        total_err_scaled_mjysr = np.sqrt(total_err_mjysr**2 + systematic_err_mjysr**2)
         
         # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
         conv = 1e6 * pixel_area_sr
         
         # Unit Conversion (MJy/sr -> Jy)
-        flux_jy = raw_flux_mjysr * conv
+        flux_jy = flux_scaled_mjysr * conv
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
-        total_err_jy = total_err_mjysr * conv
+        total_err_jy = total_err_scaled_mjysr * conv
         emp_rms_jy = emp_rms * conv
         
         print("Emp_RMS:", emp_rms_jy, "Propagated Error:",total_err_jy)
@@ -972,6 +987,9 @@ class MIRIPipeline:
     def _plot_cog(self, cog_dict):
         """Function to perform Curve of Growth analysis for extended sources"""
 
+        self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
+        os.makedirs(self.cog_dir, exist_ok=True)
+
         plt.figure(figsize=(8, 5))
         
         # --- AUTOMATED COLOUR LOGIC ---
@@ -1023,7 +1041,6 @@ class MIRIPipeline:
         plt.grid(alpha=0.2)
         
         # Save file to cog directory
-        os.makedirs(self.cog_dir, exist_ok=True)
         fname = f"{gid}_cog_psf.png"
         save_path = os.path.join(self.cog_dir, fname)
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
@@ -1107,7 +1124,8 @@ class MIRIPipeline:
             f"{filt}_bkg_err": np.nan,
             
             # --- Quality Control (QC) Flag ---
-            f"{filt}_qc": 0,
+            f"{filt}_qc_flag": 0,
+            f"{filt}_ap_flag": 0,
             
             # --- Aperture Geometry ---
             f"{filt}_ap_x": np.nan,
@@ -1145,7 +1163,7 @@ class MIRIPipeline:
                        snr_thresh=3.0,              # Relevant for the detection plot
                        plot_matrix=False,
                        plot_apertures=False,
-                       flux_scaling_factor=1.0
+                       flux_scaling_factor=None
                        ):
         """
         Function to do the heavy lifting. Runs the entire photometry
@@ -1169,6 +1187,11 @@ class MIRIPipeline:
 
         if rescale_apertures == False:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
+        
+        if flux_scaling_factor is not None and flux_scaling_factor != 1.0:
+            print(f"⚠️ Attention: Rescaling fluxes by a user-specified factor of {flux_scaling_factor} (default is 1.0)")
+            self.flux_scaling_factor = flux_scaling_factor[0]
+            self.added_flux_error = flux_scaling_factor[1]
         
         all_rows = []
         
@@ -1230,12 +1253,12 @@ class MIRIPipeline:
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
                     # --- 6. Group all results and correct them for the PSF ---
-                    apflux = flux_dict["flux_jy"] * flux_scaling_factor            
-                    apflux_err = flux_dict["flux_err_jy"] * flux_scaling_factor
-                    apflux_errnominal = flux_dict["nominal_err_jy"] * flux_scaling_factor
+                    apflux = flux_dict["flux_jy"]            
+                    apflux_err = flux_dict["flux_err_jy"]
+                    apflux_errnominal = flux_dict["nominal_err_jy"]
                     
-                    flux_corr = flux_dict["flux_jy"] * psf_corr * flux_scaling_factor
-                    flux_err_corr = flux_dict["flux_err_jy"] * psf_corr * flux_scaling_factor
+                    flux_corr = flux_dict["flux_jy"] * psf_corr
+                    flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     
                     # Quick check of SNR for the user 
                     snr = flux_corr / flux_err_corr if flux_err_corr > 0 else 0
@@ -1269,6 +1292,8 @@ class MIRIPipeline:
                     
                     # --- 11. Store quality flag ---
                     galaxy_row[f"{filt}_qc"] = qc_identifier
+                    if ap_params["multiplier"] < 2.0:
+                        galaxy_row[f"{filt}_ap_flag"] = 1  # Flag for small aperture multiplier
                     
                     # --- 12. Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
@@ -1374,6 +1399,9 @@ class MIRIPipeline:
         cols : int, optional
             Number of subplot columns. Defaults to 3.
         """
+        
+        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
+        os.makedirs(self.detection_dir, exist_ok=True)
         
         if os.path.exists(self.table_path) is False:
             print("❌ Error: Photometric table not found. Please run photometry first.")
