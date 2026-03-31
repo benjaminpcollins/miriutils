@@ -75,8 +75,8 @@ Example usage:
 
 
 Author: Benjamin P. Collins
-Date: Feb 2026
-Version: 2.0.1
+Date: April 2026
+Version: 2.1.0
 """
 
 import os
@@ -1178,7 +1178,7 @@ class MIRIPipeline:
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v2.0.1")
+        print("                 JWST MIRI PIPELINE v2.1.0")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
