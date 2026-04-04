@@ -1189,9 +1189,10 @@ class MIRIPipeline:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
         
         if flux_scaling_factor is not None and flux_scaling_factor != 1.0:
-            print(f"⚠️ Attention: Rescaling fluxes by a user-specified factor of {flux_scaling_factor} (default is 1.0)")
             self.flux_scaling_factor = flux_scaling_factor[0]
             self.added_flux_error = flux_scaling_factor[1]
+            print(f"⚠️ Attention: Rescaling fluxes by a user-specified factor of {self.flux_scaling_factor} (default is 1.0)")
+            print(f"      Errors are padded with an additional systematic component of {self.added_flux_error*100:.1f}% to account for extended source uncertainties.")
         
         all_rows = []
         
@@ -1212,7 +1213,8 @@ class MIRIPipeline:
                 "ID": target_id,
                 "MIRI_ap_a": np.nan,
                 "MIRI_ap_b": np.nan,
-                "MIRI_ap_npix": np.nan
+                "MIRI_ap_npix": np.nan, 
+                "MIRI_ap_flag": 0
             }
             
             # Pre-populate with columns for all filters ALREADY discovered
@@ -1291,9 +1293,7 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
                     # --- 11. Store quality flag ---
-                    galaxy_row[f"{filt}_qc"] = qc_identifier
-                    if ap_params["multiplier"] < 2.0:
-                        galaxy_row[f"{filt}_ap_flag"] = 1  # Flag for small aperture multiplier
+                    galaxy_row[f"{filt}_qc_flag"] = qc_identifier
                     
                     # --- 12. Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
@@ -1305,6 +1305,8 @@ class MIRIPipeline:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
                         galaxy_row["MIRI_ap_npix"] = n_pix
+                        if ap_params["multiplier"] < 2.0:
+                            galaxy_row[f"{filt}_ap_flag"] = 1  # Flag for small aperture multiplier
                         ap_geometry_stored = True
             
                 except Exception as e:
