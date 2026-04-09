@@ -49,8 +49,8 @@ Example Usage:
 
 
 Author: Benjamin P. Collins
-Date: Feb 2026
-Version: 2.0.1
+Date: April 2026
+Version: 2.1.0
 """
 
 import os
@@ -173,26 +173,31 @@ class RGBComposer:
         with fits.open(ref_path) as hdul:
             # load WCS from SCI extension of a reference MIRI cutout
             ref_wcs = WCS(hdul['SCI'].header, naxis=2)
+            data = hdul['SCI'].data
             
-            # This is the RA/Dec of the galaxy (anchored by the produce_cutouts function)
-            sky_center = ref_wcs.wcs.crval
-            
-            # Define pixel scale of the final images
-            pix_scale_deg = np.sqrt(np.abs(np.linalg.det(ref_wcs.pixel_scale_matrix)))
+            # Get sky center FIRST, before modifying anything
+            native_center_pix = [data.shape[1] / 2.0, data.shape[0] / 2.0]
+            sky_center = ref_wcs.all_pix2world([native_center_pix], 0)[0]  # <-- use pixel transform, not crval
+
+            # Get pixel scale cleanly via a small offset
+            c1 = ref_wcs.all_pix2world([[data.shape[1]/2.0, data.shape[0]/2.0]], 0)[0]
+            c2 = ref_wcs.all_pix2world([[data.shape[1]/2.0 + 1, data.shape[0]/2.0]], 0)[0]
+            pix_scale_deg = np.sqrt(((c2[0]-c1[0])*np.cos(np.radians(c1[1])))**2 + (c2[1]-c1[1])**2)
             pix_scale_arcsec = pix_scale_deg * 3600.0
-            
+        
         # Define the size of the final RGB image
         crop_pix = int(crop_size_arcsec / pix_scale_arcsec)
         
         # Define the centre for CRPIX (0-based centre of the new box)
         # Attention: FITS images start with CRPIX=1 at the first pixel
-        center_f = (crop_pix - 1) / 2.0 
+        center_f = (crop_pix - 1) / 2.0
 
         # Build Target WCS from scratch and provide the necessary information
         target_wcs = WCS(naxis=2)
         target_wcs.wcs.crval = sky_center      # Pin galaxy RA/Dec to...
         target_wcs.wcs.crpix = [center_f + 1, center_f + 1] # ...the center of the box (accounting for 1-based)
         target_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        target_wcs.wcs.cunit = ['deg', 'deg']
         
         # Standard North-up: CDELT1 is negative (RA increases to the left)
         target_wcs.wcs.cdelt = [-pix_scale_deg, pix_scale_deg]
@@ -200,7 +205,8 @@ class RGBComposer:
         # Manually make the image point North-up
         # If not rotating, copy the original PC matrix to keep the same angle
         target_wcs.wcs.pc = [[1, 0], [0, 1]] if rotate_north else ref_wcs.wcs.pc
-
+        target_wcs.wcs.set()
+        
         processed_arrays = {}
 
         # Reproject directly into the small 3x3" box
@@ -226,11 +232,16 @@ class RGBComposer:
                 # reproject_interp needs an object with a .header and .data
                 temp_hdu = fits.ImageHDU(data=clean_data, header=h['SCI'].header)
                 
+                target_wcs.array_shape = (crop_pix, crop_pix)
+                
+                # This is where the error occurs!
                 data, _ = reproject_interp(
                     temp_hdu, 
                     target_wcs, 
                     shape_out=(crop_pix, crop_pix)
                 )
+                
+                
                 processed_arrays[chan] = data
         
         return processed_arrays, target_wcs
@@ -263,11 +274,11 @@ class RGBComposer:
         return rgb_image
 
     
-    def save_stamp(self, galaxy_id, rgb_array, recipe, output_name=None):
+    def save_stamp(self, output_name, rgb_array, recipe, show_plot=False):
         """
         Plots the RGB image and adds a legend based on the filters used.
         """
-        fig, ax = plt.subplots(figsize=(8, 8), facecolor="black")
+        fig, ax = plt.subplots(figsize=(6, 6), facecolor="black")
         
         # Display the image
         ax.imshow(rgb_array, origin='lower')
@@ -318,10 +329,10 @@ class RGBComposer:
         # Draw a simple white line for 1 arcsecond
         ax.plot([0.8, 0.8 + final_bar_length], [0.05, 0.05], 
                 transform=ax.transAxes, color='white', lw=2)
-        ax.text(0.8, 0.07, '0.5"', transform=ax.transAxes, color='white', ha='center')
+        ax.text(0.8 + 0.5*final_bar_length, 0.07, '0.5"', transform=ax.transAxes, color='white', ha='center')
         
         # Save the result
-        output_path = os.path.join(self.output_dir, output_name if output_name else f"{galaxy_id}_rgb.png")        
+        output_path = os.path.join(self.output_dir, output_name)
         
         # IMPORTANT: bbox_extra_artists ensures the legend is included in the save
         plt.savefig(output_path, 
@@ -331,6 +342,9 @@ class RGBComposer:
                     facecolor='black',
                     bbox_extra_artists=(leg,))        
         
+        if show_plot:
+            plt.show()
+        
         plt.close()
         
-        print(f"Saved labeled stamp to {output_path}")
+        print(f"Saved labelled stamp to {output_path}")
