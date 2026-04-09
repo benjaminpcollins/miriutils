@@ -21,7 +21,7 @@ Classes:
 
 Core Functionalities:
 ---------------------
-    - Dual-stage quality control: Global NaN ratio and Central Circular Mask (2" radius).
+    - Dual-stage quality control: Global NaN ratio and Central Circular Mask.
     - Intelligent Directory I/O: Automatic folder nesting and selective cleanup.
     - Visualisation: Orientation-aware PNG previews with N-E and X-Y compasses.
     - Flexible Overwrite Logic: User-defined control over existing file handling.
@@ -53,10 +53,9 @@ Example Usage:
         for filt in filters:
         cm.run_survey(survey, filt, size_arcsec=8.0, png=True, overwrite=True)
 
-
 Author: Benjamin P. Collins
-Date: Feb 2026
-Version: 2.0.1
+Date: April 2026
+Version: 2.1.0
 """
 
 import os
@@ -88,7 +87,7 @@ class CutoutManager:
             self.ras = cat_data['ra']
             self.decs = cat_data['dec']
         
-        # Easy to expand for NIRCam or HST later
+        # Easy to expand for other instruments with different pixel scales
         self.scales = {
             "MIRI": 0.11092,
             "NIRCAM_LW": 0.063,
@@ -97,7 +96,7 @@ class CutoutManager:
         self.pixel_scale = self.scales.get(instrument, 0.1)
 
     def _get_paths(self, survey, filter_name):
-        """Standardizes your folder structure across all projects."""
+        """Standardises the folder structure across all projects."""
         filter_dir = os.path.join(self.base_dir, survey, filter_name.upper())
         paths = {
             'fits': os.path.join(filter_dir, 'fits'),
@@ -111,7 +110,7 @@ class CutoutManager:
         """
         Performs quality check using a global threshold and a circular central mask.
         """
-        # 1. Global Check (Total NaNs in the whole 8x8" frame)
+        # 1. Global Check (Total NaNs in the whole frame)
         if np.isnan(data).sum() / data.size > global_thresh:
             return False
         
@@ -408,13 +407,9 @@ class CutoutManager:
             w = WCS(header)
 
         # 1. Get the 'North' direction in pixel space
-        # We look at how the sky coordinates change at the center of the image
-        res = w.pixel_scale_matrix
-        
-        # The 'CD' or 'PC' matrix components
         # cd[1,1] is change in Dec with Y, cd[0,1] is change in RA with Y
         # This is the most robust way to find "Up" in celestial terms
-        cd = res
+        cd = w.pixel_scale_matrix
         
         # Calculate the angle of North relative to the Y-axis (Up)
         # This automatically handles the PC matrix, scaling, and parity
