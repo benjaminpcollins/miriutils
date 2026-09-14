@@ -92,6 +92,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
 import matplotlib.cm as cm
+import matplotlib.ticker as ticker
 from scipy.stats import skew, kurtosis, median_abs_deviation
 
 import astropy.units as u
@@ -702,30 +703,38 @@ class MIRIPipeline:
         annulus = bkg_dict["annulus"]
         
         # Create the figure
-        fig, axes = plt.subplots(2, 2, figsize=(10, 9), constrained_layout=True)
+        fig, axes = plt.subplots(2, 2, figsize=(8, 7), constrained_layout=True, sharex=True, sharey=True)
         ax1, ax2, ax3, ax4 = axes.flatten()
 
         # --- 1. Original Data ---
         v1_min, v1_max = np.nanpercentile(data, [2, 98])
         im1 = ax1.imshow(data, origin="lower", cmap="magma", vmin=v1_min, vmax=v1_max)
-        source_ap.plot(ax=ax1, color='dodgerblue', lw=2, label="Aperture")
-        ax1.set_title(f"Original Data ({filt})")
-        #plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        source_ap.plot(ax=ax1, color='blue', lw=2, label="Aperture")
+        ax1.set_title(f"Original Data")
+        ax1.legend(loc='upper right', fontsize=10)
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar1.formatter = ticker.FormatStrFormatter('%.2f')
+        cbar1.update_ticks()
 
         # --- 2. 2D Background Plane ---
         v2_min, v2_max = np.nanpercentile(plane, [2, 98])
         im2 = ax2.imshow(plane, origin="lower", cmap="magma", vmin=v2_min, vmax=v2_max)
-        ax2.set_title("Fitted Background Plane")
-        #plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        ax2.set_title("Background Plane Fit")
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar2.formatter = ticker.FormatStrFormatter('%.3f')
+        cbar2.update_ticks()
 
         # --- 3. Subtracted Data + Annulus ---
         v3_min, v3_max = np.nanpercentile(subtracted, [5, 95])
-        im3 = ax3.imshow(subtracted, origin="lower", cmap="magma", vmin=v3_min, vmax=v3_max)
-        source_ap.plot(ax=ax3, color='dodgerblue', lw=2)
-        #annulus.plot(ax=ax3, color='yellow', lw=1.5, ls='--', label="Annulus")
-        ax3.set_title("Bkg-Subtracted")
-        #ax3.legend(loc='upper right', fontsize=8)
-        #plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        im3 = ax3.imshow(subtracted, origin="lower", cmap="coolwarm", vmin=v3_min, vmax=v3_max)
+        source_ap.plot(ax=ax3, color='blue', lw=2)
+        ax3.set_title("Residuals (Data - Plane)")
+        cbar3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        cbar3.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar3.formatter = ticker.FormatStrFormatter('%.2f')
+        cbar3.update_ticks()
 
         # --- 4. Mask/Region Visualisation ---
         mask_vis = bkg_dict["mask_vis"]
@@ -740,7 +749,8 @@ class MIRIPipeline:
                     lw=1.2, 
                     ls='-', 
                     alpha=0.9, 
-                    label="Annulus")
+                    label="Annulus"
+                    )
 
         # 2. Create the transparent fill by calling .plot again with fill=True
         # This avoids the "no attribute" errors entirely
@@ -753,16 +763,22 @@ class MIRIPipeline:
         cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2], fraction=0.046, pad=0.04)
         cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Source"])
 
+        ax1.set_ylabel("Pixels", fontsize=12)
+        ax3.set_ylabel("Pixels", fontsize=12)
+        ax3.set_xlabel("Pixels", fontsize=12)
+        ax4.set_xlabel("Pixels", fontsize=12)
+
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         plt.legend()
     
         # Default directory structure
         filt_dir = os.path.join(self.mosaic_dir, filt)
         os.makedirs(filt_dir, exist_ok=True)
+        plt.show()
         save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
-        plt.savefig(save_path, bbox_inches='tight', dpi=200)
+        #plt.savefig(save_path, bbox_inches='tight', dpi=200)
         plt.close(fig)
         
     
