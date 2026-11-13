@@ -56,7 +56,7 @@ Workflow:
 
 Example usage:
 --------------
-    from miri_utils import MiriPipeline
+    from miriutils import MiriPipeline
 
     ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
     

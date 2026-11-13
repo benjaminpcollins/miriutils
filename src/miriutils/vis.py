@@ -31,7 +31,7 @@ Key Capabilities:
 
 Example Usage:
 --------------
-    from miri_utils.vis import RGBComposer
+    from miriutils.vis import RGBComposer
 
     # Initialise the composer
     composer = RGBComposer(miri_dir="./miri_fits", 
