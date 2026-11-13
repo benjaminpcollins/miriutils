@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miriutils"
-version = "2.0.1"
+version = "2.1.0"
 authors = [
-  { name="Benjamin Philip Collins", email="benjamin.p.collins@icloud.com" },
+  { name="Benjamin Philip Collins", email="bcollins@das.uchile.cl" },
 ]
 description = "Custom Python library for processing and analysing JWST/MIRI data"
 readme = "README.md"
