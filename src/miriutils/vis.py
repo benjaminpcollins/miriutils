@@ -49,7 +49,7 @@ Example Usage:
 
 
 Author: Benjamin P. Collins
-Date: April 2026
+Date: Nov. 2026
 Version: 2.1.0
 """
 

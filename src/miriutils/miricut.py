@@ -54,7 +54,7 @@ Example Usage:
         cm.run_survey(survey, filt, size_arcsec=8.0, png=True, overwrite=True)
 
 Author: Benjamin P. Collins
-Date: April 2026
+Date: Nov. 2026
 Version: 2.1.0
 """
 
