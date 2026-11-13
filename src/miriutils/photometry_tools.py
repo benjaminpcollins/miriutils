@@ -56,7 +56,7 @@ Workflow:
 
 Example usage:
 --------------
-    from miri_utils import MiriPipeline
+    from miriutils import MiriPipeline
 
     ids_to_process = [7102, 11202, 16874]   # int of galaxy IDs to process
     
@@ -75,8 +75,8 @@ Example usage:
 
 
 Author: Benjamin P. Collins
-Date: Feb 2026
-Version: 2.0.1
+Date: Nov. 2026
+Version: 2.1.0
 """
 
 import os
@@ -92,6 +92,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LogNorm
 import matplotlib.cm as cm
+import matplotlib.ticker as ticker
 from scipy.stats import skew, kurtosis, median_abs_deviation
 
 import astropy.units as u
@@ -128,7 +129,7 @@ class MIRIPipeline:
                  nircam_dir, 
                  aperture_table, 
                  psf_dir=None, 
-                 scaling_exceptions_file=None):
+                 scaling_exceptions_file="scaling_config.csv"):
         
         self.all_ids = ids_to_process
         
@@ -169,24 +170,28 @@ class MIRIPipeline:
             self.psf_dir = psf_dir
             print(f"Found PSF directory {self.psf_dir}")
         
-        self.aperture_dir = os.path.join(self.output_dir, "apertures")
-        self.mosaic_dir = os.path.join(self.output_dir, "mosaic_plots")
+        self.aperture_dir = None
+        self.mosaic_dir = None
+        self.cog_dir = None
+        self.detection_dir = None
+
         self.phot_table_dir = os.path.join(self.output_dir, "phot_tables")
-        self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
-        self.vis_dir = os.path.join(self.output_dir, "vis_data")
-        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
-        
-        for dir in [self.aperture_dir, self.phot_table_dir, self.detection_dir, self.csv_dir, self.fits_dir]:
-            os.makedirs(dir, exist_ok=True)
+        os.makedirs(self.csv_dir, exist_ok=True)
+        os.makedirs(self.fits_dir, exist_ok=True)
         
         # 2. Handle Scaling Exceptions File
         if scaling_exceptions_file is None:
             # Default name in the output directory if none provided
-            scaling_exceptions_file = os.path.join(self.output_dir, "scaling_config.csv")
-
-        self.scaling_exceptions_path = scaling_exceptions_file
+            scaling_exceptions = os.path.join(self.output_dir, "scaling_config.csv")
+        else:
+            scaling_exceptions = os.path.join(self.output_dir, scaling_exceptions_file)
+        
+        self.scaling_exceptions_path = scaling_exceptions
         self.scaling_exceptions = self._initialise_scaling_config()
-
+        
+        # Placeholder for adding a custom scaling factor to the fluxes if needed
+        self.flux_scaling_factor = 1.0
+        self.added_flux_error = 0.0
 
     def _initialise_scaling_config(self):
         """Creates a template CSV if missing; otherwise loads existing values."""
@@ -433,20 +438,25 @@ class MIRIPipeline:
             "data": data_miri, 
             "err": err_miri,
             "meta": meta,
+            "multiplier": multiplier
             #"pixel_conversion": pixel_conversion
         }
     
-    def plot_apertures_multiband(self, results_list):
+    def plot_apertures_multiband(self, ap_params):
         """
         results_list: A list of dictionaries returned by prepare_aperture for ONE galaxy.
         """
+        
+        self.aperture_dir = os.path.join(self.output_dir, "apertures")
+        os.makedirs(self.aperture_dir, exist_ok=True)
+        
         # Sort by wavelength: Extract the number from 'F770W', 'F1000W', etc.
         # This ensures F770W comes before F1000W
-        results_list.sort(key=lambda x: int(''.join(filter(str.isdigit, x['meta']['filter']))))
-        n_bands = len(results_list)
+        ap_params.sort(key=lambda x: int(''.join(filter(str.isdigit, x['meta']['filter']))))
+        n_bands = len(ap_params)
         fig, axes = plt.subplots(1, n_bands, figsize=(4 * n_bands, 4), squeeze=False)
         
-        for i, params in enumerate(results_list):
+        for i, params in enumerate(ap_params):
             ax = axes[0, i]
             data = params["data"]
             filt = params["meta"]["filter"]
@@ -477,11 +487,10 @@ class MIRIPipeline:
             ax.set_title(f"{filt} | {survey_obs}")
             ax.axis('off')
         
-        galaxy_id = results_list[0]['id']
+        galaxy_id = ap_params[0]['id']
         
         plt.suptitle(f"Galaxy ID: {galaxy_id}", fontsize=14)
-        aperture_dir = self.aperture_dir
-        out_path = os.path.join(aperture_dir, f"{galaxy_id}_all.png")
+        out_path = os.path.join(self.aperture_dir, f"{galaxy_id}_all.png")
         plt.savefig(out_path, bbox_inches='tight', dpi=150)
         plt.close()
         
@@ -678,6 +687,10 @@ class MIRIPipeline:
         """
         Creates a 2x2 diagnostic mosaic to verify background modeling.
         """
+        
+        # Initialise mosaic directory
+        self.mosaic_dir = os.path.join(self.output_dir, "mosaic_plots")
+        
         data = aperture_params["data"]
         gid = aperture_params["id"]
         filt = aperture_params["meta"]["filter"]
@@ -690,30 +703,38 @@ class MIRIPipeline:
         annulus = bkg_dict["annulus"]
         
         # Create the figure
-        fig, axes = plt.subplots(2, 2, figsize=(10, 9), constrained_layout=True)
+        fig, axes = plt.subplots(2, 2, figsize=(8, 7), constrained_layout=True, sharex=True, sharey=True)
         ax1, ax2, ax3, ax4 = axes.flatten()
 
         # --- 1. Original Data ---
         v1_min, v1_max = np.nanpercentile(data, [2, 98])
         im1 = ax1.imshow(data, origin="lower", cmap="magma", vmin=v1_min, vmax=v1_max)
-        source_ap.plot(ax=ax1, color='dodgerblue', lw=2, label="Aperture")
-        ax1.set_title(f"Original Data ({filt})")
-        #plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        source_ap.plot(ax=ax1, color='blue', lw=2, label="Aperture")
+        ax1.set_title(f"Original Data")
+        ax1.legend(loc='upper right', fontsize=10)
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar1.formatter = ticker.FormatStrFormatter('%.2f')
+        cbar1.update_ticks()
 
         # --- 2. 2D Background Plane ---
         v2_min, v2_max = np.nanpercentile(plane, [2, 98])
         im2 = ax2.imshow(plane, origin="lower", cmap="magma", vmin=v2_min, vmax=v2_max)
-        ax2.set_title("Fitted Background Plane")
-        #plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        ax2.set_title("Background Plane Fit")
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cbar2.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar2.formatter = ticker.FormatStrFormatter('%.3f')
+        cbar2.update_ticks()
 
         # --- 3. Subtracted Data + Annulus ---
         v3_min, v3_max = np.nanpercentile(subtracted, [5, 95])
-        im3 = ax3.imshow(subtracted, origin="lower", cmap="magma", vmin=v3_min, vmax=v3_max)
-        source_ap.plot(ax=ax3, color='dodgerblue', lw=2)
-        #annulus.plot(ax=ax3, color='yellow', lw=1.5, ls='--', label="Annulus")
-        ax3.set_title("Bkg-Subtracted")
-        #ax3.legend(loc='upper right', fontsize=8)
-        #plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        im3 = ax3.imshow(subtracted, origin="lower", cmap="coolwarm", vmin=v3_min, vmax=v3_max)
+        source_ap.plot(ax=ax3, color='blue', lw=2)
+        ax3.set_title("Residuals (Data - Plane)")
+        cbar3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+        cbar3.set_label(r'$\mathrm{MJy\,sr^{-1}}$', fontsize=12)
+        cbar3.formatter = ticker.FormatStrFormatter('%.2f')
+        cbar3.update_ticks()
 
         # --- 4. Mask/Region Visualisation ---
         mask_vis = bkg_dict["mask_vis"]
@@ -728,7 +749,8 @@ class MIRIPipeline:
                     lw=1.2, 
                     ls='-', 
                     alpha=0.9, 
-                    label="Annulus")
+                    label="Annulus"
+                    )
 
         # 2. Create the transparent fill by calling .plot again with fill=True
         # This avoids the "no attribute" errors entirely
@@ -741,16 +763,22 @@ class MIRIPipeline:
         cbar = plt.colorbar(im4, ax=ax4, ticks=[0, 1, 2], fraction=0.046, pad=0.04)
         cbar.set_ticklabels(["Excluded/NaN", "Fit Region", "Source"])
 
+        ax1.set_ylabel("Pixels", fontsize=12)
+        ax3.set_ylabel("Pixels", fontsize=12)
+        ax3.set_xlabel("Pixels", fontsize=12)
+        ax4.set_xlabel("Pixels", fontsize=12)
+
         plt.suptitle(f"Background Model: Galaxy {gid} | {filt} | {survey_obs}", fontsize=14)
         plt.legend()
     
         # Default directory structure
         filt_dir = os.path.join(self.mosaic_dir, filt)
         os.makedirs(filt_dir, exist_ok=True)
+        plt.show()
         save_path = os.path.join(filt_dir, f"{gid}_bkg.png")
 
         # 2. Save the figure (do this BEFORE close)
-        plt.savefig(save_path, bbox_inches='tight', dpi=200)
+        #plt.savefig(save_path, bbox_inches='tight', dpi=200)
         plt.close(fig)
         
     
@@ -876,16 +904,29 @@ class MIRIPipeline:
         # Background modelling uncertainty already calculated in estimate_background
         bkg_err_mjysr = bkg_results["rms"] * np.sqrt(source_ap.area)
         
-        # Combine in quadrature
+        # Combine in quadrature (Detector + Background Modelling)
         total_err_mjysr = np.sqrt(detector_variance + bkg_err_mjysr**2)
+        
+        # --- NEW SCALING AND ERROR PADDING LOGIC ---
+        # 1. Apply the empirical scaling factor (e.g. 1.182)
+        flux_scaled_mjysr = raw_flux_mjysr * self.flux_scaling_factor
+        
+        # 2. Add the Intrinsic Scatter (MAD) in quadrature to the error
+        # This accounts for the ~11% uncertainty in the "extendedness" correction
+        # We use the scaled flux as the base for the systematic error component
+        intrinsic_scatter = 0.110  # This matches your MAD result
+        systematic_err_mjysr = flux_scaled_mjysr * intrinsic_scatter
+        
+        # Update the total error budget
+        total_err_scaled_mjysr = np.sqrt(total_err_mjysr**2 + systematic_err_mjysr**2)
         
         # Conversion = 1e6 (to Jy) * pixel_area_sr (to strip sr)
         conv = 1e6 * pixel_area_sr
         
         # Unit Conversion (MJy/sr -> Jy)
-        flux_jy = raw_flux_mjysr * conv
+        flux_jy = flux_scaled_mjysr * conv
         bkg_flux_jy = raw_bkg_flux_mjysr * conv
-        total_err_jy = total_err_mjysr * conv
+        total_err_jy = total_err_scaled_mjysr * conv
         emp_rms_jy = emp_rms * conv
         
         print("Emp_RMS:", emp_rms_jy, "Propagated Error:",total_err_jy)
@@ -962,6 +1003,9 @@ class MIRIPipeline:
     def _plot_cog(self, cog_dict):
         """Function to perform Curve of Growth analysis for extended sources"""
 
+        self.cog_dir = os.path.join(self.output_dir, "curve_of_growth")
+        os.makedirs(self.cog_dir, exist_ok=True)
+
         plt.figure(figsize=(8, 5))
         
         # --- AUTOMATED COLOUR LOGIC ---
@@ -1013,7 +1057,6 @@ class MIRIPipeline:
         plt.grid(alpha=0.2)
         
         # Save file to cog directory
-        os.makedirs(self.cog_dir, exist_ok=True)
         fname = f"{gid}_cog_psf.png"
         save_path = os.path.join(self.cog_dir, fname)
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
@@ -1097,7 +1140,8 @@ class MIRIPipeline:
             f"{filt}_bkg_err": np.nan,
             
             # --- Quality Control (QC) Flag ---
-            f"{filt}_qc": 0,
+            f"{filt}_qc_flag": 0,
+            f"{filt}_ap_flag": 0,
             
             # --- Aperture Geometry ---
             f"{filt}_ap_x": np.nan,
@@ -1128,12 +1172,14 @@ class MIRIPipeline:
     
 
     def run_photometry(self, 
-                       rescale=True,        # Whether to rescale the apertures
-                       save_mosaic=False,   # Whether to save the background diagnostic mosaic
-                       plot_psf=False,      # Whether to plot the PSF with the aperture overlay
-                       save_cog=False,      # Whether to save the Curve of Growth plots
-                       snr_thresh=3.0,      # Relevant for the detection plot
-                       plot_matrix=False
+                       rescale_apertures=True,      # Whether to rescale the apertures
+                       save_mosaic=False,           # Whether to save the background diagnostic mosaic
+                       plot_psf=False,              # Whether to plot the PSF with the aperture overlay
+                       save_cog=False,              # Whether to save the Curve of Growth plots
+                       snr_thresh=3.0,              # Relevant for the detection plot
+                       plot_matrix=False,
+                       plot_apertures=False,
+                       flux_scaling_factor=None
                        ):
         """
         Function to do the heavy lifting. Runs the entire photometry
@@ -1148,15 +1194,21 @@ class MIRIPipeline:
 |  _ <  __/| (_| | | |__| (_| | | | (_| | | | | | (_| | |
 |_| \_\___| \__,_|  \____\__,_|_|  \__,_|_|_| |_|\__,_|_|
         """)
-        print("                 JWST MIRI PIPELINE v2.0.1")
+        print("                 JWST MIRI PIPELINE v2.1.0")
         print("                 MIRI Photometry for JWST")
         print("="*60)
         
         # Pre-scan for catalogue visualisation
         all_filters = self._pre_scan_filters()
 
-        if rescale == False:
+        if rescale_apertures == False:
             print("⚠️ Processing photometry with original aperture sizes based on NIRCam/F444W...")
+        
+        if flux_scaling_factor is not None and flux_scaling_factor != 1.0:
+            self.flux_scaling_factor = flux_scaling_factor[0]
+            self.added_flux_error = flux_scaling_factor[1]
+            print(f"⚠️ Attention: Rescaling fluxes by a user-specified factor of {self.flux_scaling_factor} (default is 1.0)")
+            print(f"      Errors are padded with an additional systematic component of {self.added_flux_error*100:.1f}% to account for extended source uncertainties.")
         
         all_rows = []
         
@@ -1177,7 +1229,8 @@ class MIRIPipeline:
                 "ID": target_id,
                 "MIRI_ap_a": np.nan,
                 "MIRI_ap_b": np.nan,
-                "MIRI_ap_npix": np.nan
+                "MIRI_ap_npix": np.nan, 
+                "MIRI_ap_flag": 0
             }
             
             # Pre-populate with columns for all filters ALREADY discovered
@@ -1192,7 +1245,10 @@ class MIRIPipeline:
                 try:
                                         
                     # --- 1. Prepare the apertures for MIRI ---
-                    ap_params = self.prepare_aperture(file, rescale=rescale)
+                    ap_params = self.prepare_aperture(file, rescale=rescale_apertures)                      
+                    
+                    if plot_apertures is True:
+                        self.plot_apertures_multiband(ap_params)
                     
                     # --- 2. Create and subtract background model ---
                     bkg_dict = self.estimate_background(ap_params)
@@ -1215,11 +1271,11 @@ class MIRIPipeline:
                     psf_corr = self.calculate_psf_corr(ap_params, show_plot=plot_psf)
                     
                     # --- 6. Group all results and correct them for the PSF ---
-                    apflux = flux_dict["flux_jy"]                    
+                    apflux = flux_dict["flux_jy"]            
                     apflux_err = flux_dict["flux_err_jy"]
                     apflux_errnominal = flux_dict["nominal_err_jy"]
                     
-                    flux_corr = flux_dict["flux_jy"] * psf_corr 
+                    flux_corr = flux_dict["flux_jy"] * psf_corr
                     flux_err_corr = flux_dict["flux_err_jy"] * psf_corr
                     
                     # Quick check of SNR for the user 
@@ -1253,7 +1309,7 @@ class MIRIPipeline:
                     galaxy_row[f"{filt}_bkg_err"] = bkg_err
                     
                     # --- 11. Store quality flag ---
-                    galaxy_row[f"{filt}_qc"] = qc_identifier
+                    galaxy_row[f"{filt}_qc_flag"] = qc_identifier
                     
                     # --- 12. Store aperture geometry ---
                     galaxy_row[f"{filt}_ap_theta"] = float(np.degrees(ap_params["theta"].value))
@@ -1265,6 +1321,8 @@ class MIRIPipeline:
                         galaxy_row["MIRI_ap_a"] = ap_params["a"]
                         galaxy_row["MIRI_ap_b"] = ap_params["b"]
                         galaxy_row["MIRI_ap_npix"] = n_pix
+                        if ap_params["multiplier"] < 2.0:
+                            galaxy_row[f"{filt}_ap_flag"] = 1  # Flag for small aperture multiplier
                         ap_geometry_stored = True
             
                 except Exception as e:
@@ -1297,7 +1355,7 @@ class MIRIPipeline:
         # --- 17. Final message ---
         print("-" * 40)
         print(f"✅ FINAL SUMMARY: {stored_ids} galaxies processed")
-        print(f"🛰️  Instrument: JWST/MIRI")
+        print(f"🛰️ Instrument: JWST/MIRI")
         print(f"📊 Quality Control: CoG Active")
         print("-" * 40)
         print("🎉 Success! Your photometric heart can continue beating peacefully now ❤️‍🩹.")
@@ -1345,7 +1403,7 @@ class MIRIPipeline:
         print(f"\n💾 Saving photometric catalogue to:\n1. {csv_path}\n2. {self.table_path}")
 
 
-    def plot_galaxy_filter_matrix(self, snr_thresh=None, cols=3):
+    def plot_galaxy_filter_matrix(self, snr_thresh=None, figname=None, cols=3):
         """
         Visualise which galaxies are observed and detected in each band.
 
@@ -1354,9 +1412,14 @@ class MIRIPipeline:
         snr_thresh : float or None
             If set, only observations with SNR above this threshold will be coloured.
              If None, all observations will be coloured regardless of SNR.
-        cols : int
-            Number of subplot columns.
+        figname : str, optional
+            Optionally provide a name for the figure.
+        cols : int, optional
+            Number of subplot columns. Defaults to 3.
         """
+        
+        self.detection_dir = os.path.join(self.output_dir, "detection_plots")
+        os.makedirs(self.detection_dir, exist_ok=True)
         
         if os.path.exists(self.table_path) is False:
             print("❌ Error: Photometric table not found. Please run photometry first.")
@@ -1381,6 +1444,7 @@ class MIRIPipeline:
                 pastel_colours[band] = "#cccccc"  # Default grey for unknown bands
         
         galaxy_ids = [str(gid) for gid in table["ID"]]
+        
         sorted_ids = sorted(galaxy_ids, key=lambda x: int(x))
         num_galaxies = len(galaxy_ids)
         chunk_size = (num_galaxies + 3) // cols
@@ -1444,9 +1508,9 @@ class MIRIPipeline:
             ax.set_xlim(0, num_filters)
             ax.set_ylim(len(g_ids), 0)
             ax.set_xticks(np.arange(num_filters) + 0.5)
-            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=13)
+            ax.set_xticklabels(all_bands, rotation=45, ha="right", fontsize=15)
             ax.set_yticks(np.arange(len(g_ids)) + 0.5)
-            ax.set_yticklabels(y_labels, fontsize=13)
+            ax.set_yticklabels(y_labels, fontsize=15)
 
             # Add horizontal grid lines
             for y in np.arange(len(g_ids)):
@@ -1457,11 +1521,17 @@ class MIRIPipeline:
                 ax.axvline(x=x, color="grey", linestyle="-", linewidth=0.4, alpha=0.6, zorder=10)
         
         if snr_thresh is not None:
-            plt.suptitle(f"MIRI Detections", fontsize=24, y=0.99)
-            figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
+            plt.suptitle(f"MIRI Detections (SNR > {snr_thresh})", fontsize=28, y=0.99)
+            if figname is not None:
+                figname = os.path.join(self.detection_dir, figname)
+            else:
+                figname = os.path.join(self.detection_dir, f"miri_obs_snr_{snr_thresh}.png")
         else:
-            plt.suptitle(f"MIRI Coverage", fontsize=24, y=0.99)
-            figname = os.path.join(self.detection_dir, f"miri_obs.png")
+            plt.suptitle("MIRI Observations", fontsize=28, y=0.99)
+            if figname is not None:
+                figname = os.path.join(self.detection_dir, figname)
+            else:
+                figname = os.path.join(self.detection_dir, f"miri_obs.png")
             
         plt.tight_layout()
         fig_path = os.path.join(self.detection_dir, figname)

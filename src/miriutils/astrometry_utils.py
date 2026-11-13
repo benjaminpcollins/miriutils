@@ -73,8 +73,8 @@ Example Usage:
 
 
 Author: Benjamin P. Collins
-Date: Feb 2026
-Version: 2.0.1
+Date: Nov. 2026
+Version: 2.1.0
 """
 
 import os

@@ -10,11 +10,13 @@ type: software
 authors:
   - given-names: Benjamin Philip
     family-names: Collins
-    email: benjamin.p.collins@icloud.com
+    email: bcollins@das.uchile.cl
     orcid: 'https://orcid.org/0009-0005-9328-6283'
     affiliation: >-
       Dipartimento di Fisica e Astronomia, Università di
       Bologna, Bologna, Italy
+      Departamento de Astronomía, Universidad de Chile, 
+      Camino El Observatorio 1515, Las Condes, Santiago, Chile
 repository-code: 'https://github.com/benjaminpcollins/miriutils'
 abstract: >-
   miriutils is a Python library designed for the processing
@@ -44,5 +46,5 @@ keywords:
   - JWST/NIRCam
 license: BSD-3-Clause
 commit: 34de58a448a1cd5be56fa378ea17ca724373305b
-version: 2.0.1
-date-released: '2026-02-07'
+version: 2.1.0
+date-released: '2026-11-13'
